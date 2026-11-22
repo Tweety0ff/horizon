@@ -343,23 +343,42 @@ pub fn par_chunks_mut_on<T: Send>(
     lanes: usize,
     f: impl Fn(&mut [T]) + Send + Sync,
 ) {
+    par_chunks_mut_on_with(items, chunk, lanes, || (), |slice, ()| f(slice));
+}
+
+/// `par_chunks_mut_on` with state made once per participating worker and reused
+/// for every chunk that worker takes. The state is also made once on the caller;
+/// callers can keep scratch buffers here instead of allocating one per chunk.
+pub fn par_chunks_mut_on_with<T: Send, S: Send>(
+    items: &mut [T],
+    chunk: usize,
+    lanes: usize,
+    init: impl Fn() -> S + Send + Sync,
+    f: impl Fn(&mut [T], &mut S) + Send + Sync,
+) {
     let chunk = chunk.max(1);
     let count = items.len().div_ceil(chunk);
+    if count == 0 {
+        return;
+    }
     if lanes <= 1 || count < 2 {
+        let mut state = init();
         for slice in items.chunks_mut(chunk) {
-            f(slice);
+            f(slice, &mut state);
         }
         return;
     }
     // A thread takes a chunk whole; the lock is only held while a chunk is taken, never while
     // it runs: the chunk is popped in a statement of its own, so the guard is gone before `f`
-    // (a guard in a `while let` scrutinee would live through the loop body).
+    // (a guard in a `while let` scrutinee would live through the loop body). State is local
+    // to this worker invocation and survives all the chunks it takes.
     let pending = Mutex::new(items.chunks_mut(chunk).collect::<Vec<_>>());
     let work = || {
+        let mut state = init();
         loop {
             let next = pending.lock().unwrap_or_else(PoisonError::into_inner).pop();
             let Some(slice) = next else { break };
-            f(slice);
+            f(slice, &mut state);
         }
     };
     pool().in_place_scope(|s| {
@@ -505,6 +524,33 @@ mod tests {
             });
             assert_eq!(items, (0..n as u64).map(|x| x * 3 + 1).collect::<Vec<_>>());
         }
+    }
+
+    /// Each participating worker initializes scratch once and reuses it across chunks.
+    #[test]
+    fn chunk_worker_state_is_reused() {
+        let initialized = AtomicUsize::new(0);
+        let reused = AtomicUsize::new(0);
+        let mut items: Vec<usize> = (0..64).collect();
+        par_chunks_mut_on_with(
+            &mut items,
+            1,
+            4,
+            || {
+                initialized.fetch_add(1, Ordering::SeqCst);
+                0usize
+            },
+            |part, state| {
+                if *state > 0 {
+                    reused.fetch_add(1, Ordering::SeqCst);
+                }
+                *state += 1;
+                part[0] += 1;
+            },
+        );
+        assert_eq!(initialized.load(Ordering::SeqCst), 4);
+        assert_eq!(reused.load(Ordering::SeqCst), 60);
+        assert_eq!(items, vec![1; 64]);
     }
 
     /// Chunks really run at the same time: one waits (bounded, so a serial run fails instead of
