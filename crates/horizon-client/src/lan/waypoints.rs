@@ -337,6 +337,8 @@ pub struct Waypoints {
     gone_scratch: Vec<u128>,
     view_scratch: HashMap<u128, View>,
     updates_scratch: HashMap<u128, OnceLock<Option<Arc<Encoded>>>>,
+    /// Per-receiver packet vectors, drained into the returned batch and reused next tick.
+    job_out_scratch: Vec<Vec<(u32, Sent)>>,
     own_scratch: HashMap<u128, u32>,
     #[cfg(test)]
     force_dense_for_test: bool,
@@ -1125,6 +1127,7 @@ impl Waypoints {
             row: Row,
             out: Vec<(u32, Sent)>,
         }
+        let mut job_outs = std::mem::take(&mut self.job_out_scratch);
         let mut jobs: Vec<Job> = self
             .players
             .iter()
@@ -1135,13 +1138,19 @@ impl Waypoints {
                     .filter(|m| m.receives && !self.players.contains(&m.uuid))
                     .map(|m| (m.uuid, false)),
             )
-            .map(|(receiver, listed)| Job {
-                receiver,
-                listed,
-                view: t.view.get(&receiver).copied(),
-                row: self.connections.remove(&receiver).unwrap_or_default(),
-                // A receiver is sent a few dozen in a crowd: no growing by doubling.
-                out: Vec::with_capacity(64),
+            .map(|(receiver, listed)| {
+                let mut out = job_outs
+                    .pop()
+                    .unwrap_or_else(|| Vec::with_capacity(64));
+                out.clear();
+                Job {
+                    receiver,
+                    listed,
+                    view: t.view.get(&receiver).copied(),
+                    row: self.connections.remove(&receiver).unwrap_or_default(),
+                    // A receiver is sent a few dozen in a crowd: no growing by doubling.
+                    out,
+                }
             })
             .collect();
         // The transmitters as the rows meet them: player, number, block, and the update packet.
@@ -1329,10 +1338,12 @@ impl Waypoints {
                 }
         });
         t.out.reserve(jobs.iter().map(|j| j.out.len()).sum());
-        for job in jobs {
-            t.out.extend(job.out);
+        for mut job in jobs {
+            t.out.extend(job.out.drain(..));
             self.connections.insert(job.receiver, job.row);
+            job_outs.push(job.out);
         }
+        self.job_out_scratch = job_outs;
         self.move_scratch = moves;
         self.slot_scratch = slot;
         self.move_of_scratch = move_of;
