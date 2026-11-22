@@ -4756,6 +4756,17 @@ mod tests {
     /// them again; a column next to one that can't be lit whole keeps its
     /// edits in the frame.
     #[test]
+    fn whole_relight_in_place_keeps_the_inline_edit_buffer() {
+        let mut positions = vec![(3, 70, 4), (15, 64, 15), (16, 80, 0), (31, 64, 9)];
+        let capacity = positions.capacity();
+        let columns = whole_relight_columns_in_place(&mut positions, |x, z| (x, z) != (2, 1));
+        assert_eq!(positions, vec![(16, 80, 0), (31, 64, 9)]);
+        assert_eq!(positions.capacity(), capacity);
+        assert_eq!(columns.len(), 9);
+        assert!(columns.contains(&(-1, -1)) && columns.contains(&(1, 1)));
+    }
+
+    #[test]
     fn whole_relights_cover_the_edited_columns_and_their_neighbours() {
         // Blocks in columns (0, 0) and (1, 0).
         let positions = vec![(3, 70, 4), (15, 64, 15), (16, 80, 0), (31, 64, 9)];
