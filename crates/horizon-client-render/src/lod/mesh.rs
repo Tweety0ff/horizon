@@ -23,6 +23,10 @@ pub(super) struct EdgeColumn<'a> {
     pub unknown: bool,
 }
 
+/// Most LOD tile edges have only one or two neighbours. Keep those on the
+/// stack; spill only for unusually fragmented adaptive-LOD boundaries.
+pub(super) type EdgeColumns<'a> = smallvec::SmallVec<[EdgeColumn<'a>; 4]>;
+
 #[derive(Clone, Copy)]
 enum Tint {
     None,
@@ -99,7 +103,7 @@ impl Mesher {
         covered: &FxHashSet<(i32, i32)>,
         covered_bounds: Option<[i32; 4]>,
         context: &WorkerContext,
-        neighbors: &[Vec<EdgeColumn<'_>>; 4],
+        neighbors: &[EdgeColumns<'_>; 4],
         finer: &[TileKey],
     ) -> SectionMesh {
         let (c, b) = (covered, covered_bounds);
@@ -512,8 +516,8 @@ fn mesh_columns_with_edges<L: Look>(
     // The heightmap columns are built here and borrowed like the tile's own.
     let heightmap_columns: Vec<Spans>;
     let heightmap_refs: Vec<&[Span]>;
-    let heightmap_edges: [Vec<Spans>; 4];
-    let heightmap_neighbors: [Vec<EdgeColumn<'_>>; 4];
+    let heightmap_edges: [smallvec::SmallVec<[Spans; 4]>; 4];
+    let heightmap_neighbors: [EdgeColumns<'_>; 4];
     let (columns, neighbors) = if key.level >= HEIGHTMAP_LEVEL {
         let [ox, _, oz] = key.origin();
         let mut fluid = |span: &Span| material(span, Direction::Up, [ox, oz]).fluid != 0;
@@ -960,7 +964,12 @@ mod refinement_tests {
                 spans: empty.spans.as_slice(),
                 unknown,
             };
-            let neighbors = [Vec::new(), vec![edge], Vec::new(), Vec::new()];
+            let neighbors = [
+                smallvec::SmallVec::new(),
+                smallvec::smallvec![edge],
+                smallvec::SmallVec::new(),
+                smallvec::SmallVec::new(),
+            ];
             let mesh = mesh_columns_with_edges::<()>(
                 key,
                 &columns,
@@ -1022,7 +1031,7 @@ impl FilledSpans<'_> {
 /// full-detail or finer terrain), count as open; those cells keep their gaps.
 fn fill_buried_gaps<'a>(
     columns: &'a [&'a [Span]],
-    neighbors: &'a [Vec<EdgeColumn<'a>>; 4],
+    neighbors: &'a [EdgeColumns<'a>; 4],
     stride: i32,
     whole: impl Fn(usize, usize) -> bool,
     mut fluid: impl FnMut(&Span) -> bool,
@@ -1984,7 +1993,12 @@ mod tests {
             spans: hill_column.spans.as_slice(),
             unknown: false,
         };
-        let neighbors = [vec![hill()], vec![hill()], vec![hill()], vec![hill()]];
+        let neighbors = [
+            smallvec::smallvec![hill()],
+            smallvec::smallvec![hill()],
+            smallvec::smallvec![hill()],
+            smallvec::smallvec![hill()],
+        ];
         let fill = |columns: &[Column]| -> Vec<Vec<Span>> {
             let columns: Vec<&[Span]> = columns.iter().map(|c| c.spans.as_slice()).collect();
             fill_buried_gaps(&columns, &neighbors, 1, |_, _| true, |_| false)
@@ -2119,8 +2133,8 @@ mod tests {
             z: -1,
             level: 1,
         };
-        let mut neighbors: [Vec<EdgeColumn<'_>>; 4] = std::array::from_fn(|_| {
-            vec![EdgeColumn {
+        let mut neighbors: [EdgeColumns<'_>; 4] = std::array::from_fn(|_| {
+            smallvec::smallvec![EdgeColumn {
                 start: 0,
                 end: 32,
                 spans: columns[0].spans.as_slice(),
@@ -2133,7 +2147,7 @@ mod tests {
             surface: None,
             spans: vec![span(0, 8, 1)].into(),
         };
-        neighbors[0] = vec![
+        neighbors[0] = smallvec::smallvec![
             EdgeColumn {
                 start: 0,
                 end: 1,
