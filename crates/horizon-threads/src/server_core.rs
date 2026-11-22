@@ -223,8 +223,10 @@ pub fn take() -> Option<ServerCore> {
     }
     let (cores, allowed) = os::topology()?;
     let plan = plan(&cores, &allowed)?;
-    // A lazily initialized pool must not size itself from the server's temporary pin.
+    // Lazily initialized worker budgets must use the process affinity before this thread
+    // is pinned to the server core, not the server thread's temporary two-CPU mask.
     let _ = crate::worker_count();
+    let _ = crate::usable_cores();
     let core = begin(plan)?;
     *active = Some(core.plan.clone());
     GENERATION.fetch_add(1, Ordering::Relaxed);
