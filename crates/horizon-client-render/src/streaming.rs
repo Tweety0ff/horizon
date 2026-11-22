@@ -680,6 +680,9 @@ pub struct Streaming {
     generation_batch_scratch: Vec<(i64, i32, i32)>,
     /// Block positions used by incremental relighting and replay.
     light_positions_scratch: Vec<(i32, i32, i32)>,
+    /// Columns used to partition large edit batches for worker relighting.
+    light_touched_scratch: FxHashSet<(i32, i32)>,
+    light_whole_scratch: FxHashSet<(i32, i32)>,
     sequence: u64,
     pub center: (i32, i32),
     /// The view distance around `center`; below 0, no area there (a dedicated
@@ -1345,6 +1348,8 @@ impl Streaming {
             mesh_columns_scratch: Vec::new(),
             generation_batch_scratch: Vec::new(),
             light_positions_scratch: Vec::new(),
+            light_touched_scratch: FxHashSet::default(),
+            light_whole_scratch: FxHashSet::default(),
             sequence: 0,
             center: (0, 0),
             radius: 8,
@@ -2597,14 +2602,20 @@ impl Streaming {
     /// frame: those in columns that can't be lit whole yet (the edge of the
     /// loaded area).
     fn relight_on_workers(
-        &self,
+        &mut self,
         world: &mut World,
         positions: &mut Vec<(i32, i32, i32)>,
     ) {
-        let columns = whole_relight_columns_in_place(positions, |x, z| {
+        let mut touched = std::mem::take(&mut self.light_touched_scratch);
+        let mut whole = std::mem::take(&mut self.light_whole_scratch);
+        partition_whole_relight_columns(positions, &mut touched, &mut whole, |x, z| {
             self.lit.contains(&(x, z)) && self.light_region_ready(world, x, z)
         });
-        world.dirty_light.extend(columns);
+        world.dirty_light.extend(whole.iter().flat_map(|&(x, z)| {
+            (-1..=1).flat_map(move |dz| (-1..=1).map(move |dx| (x + dx, z + dz)))
+        }));
+        self.light_touched_scratch = touched;
+        self.light_whole_scratch = whole;
     }
     /// A light job computed from blocks older than some edits: redo those
     /// edits on top of its result.
@@ -3711,23 +3722,36 @@ const INLINE_RELIGHT_MAX: usize = 4096;
 /// edits to relight in place. An edited column is lit whole with its
 /// neighbours (light reaches 15 blocks, never past the next column) when all
 /// nine are `ready` to be lit whole; otherwise its edits stay in place.
+fn partition_whole_relight_columns(
+    positions: &mut Vec<(i32, i32, i32)>,
+    touched: &mut FxHashSet<(i32, i32)>,
+    whole: &mut FxHashSet<(i32, i32)>,
+    ready: impl Fn(i32, i32) -> bool,
+) {
+    let around =
+        |(x, z): (i32, i32)| (-1..=1).flat_map(move |dz| (-1..=1).map(move |dx| (x + dx, z + dz)));
+    touched.clear();
+    touched.extend(positions.iter().map(|&(x, _, z)| (x >> 4, z >> 4)));
+    whole.clear();
+    whole.extend(
+        touched
+            .iter()
+            .copied()
+            .filter(|&column| around(column).all(|(x, z)| ready(x, z))),
+    );
+    positions.retain(|&(x, _, z)| !whole.contains(&(x >> 4, z >> 4)));
+}
 fn whole_relight_columns_in_place(
     positions: &mut Vec<(i32, i32, i32)>,
     ready: impl Fn(i32, i32) -> bool,
 ) -> FxHashSet<(i32, i32)> {
-    let around =
-        |(x, z): (i32, i32)| (-1..=1).flat_map(move |dz| (-1..=1).map(move |dx| (x + dx, z + dz)));
-    let touched: FxHashSet<(i32, i32)> = positions
+    let mut touched = FxHashSet::default();
+    let mut whole = FxHashSet::default();
+    partition_whole_relight_columns(positions, &mut touched, &mut whole, ready);
+    whole
         .iter()
-        .map(|&(x, _, z)| (x >> 4, z >> 4))
-        .collect();
-    let whole: FxHashSet<(i32, i32)> = touched
-        .into_iter()
-        .filter(|&column| around(column).all(|(x, z)| ready(x, z)))
-        .collect();
-    let columns = whole.iter().flat_map(|&column| around(column)).collect();
-    positions.retain(|&(x, _, z)| !whole.contains(&(x >> 4, z >> 4)));
-    columns
+        .flat_map(|&(x, z)| (-1..=1).flat_map(move |dz| (-1..=1).map(move |dx| (x + dx, z + dz))))
+        .collect()
 }
 fn whole_relight_columns(
     mut positions: Vec<(i32, i32, i32)>,
