@@ -2606,6 +2606,28 @@ mod tests {
         gone: Vec<[f64; 3]>,
     }
 
+    #[test]
+    fn serial_pairing_packets_reuse_their_buffer() {
+        let mut level = Entities::default();
+        let mut clients = Clients::new();
+        let mut first = state(0.0);
+        first.id = 7;
+        first.uuid = 7;
+        clients.tick(&mut level, &[&first]);
+        let capacity = level.pairing_packets.capacity();
+        assert!(capacity > 0, "pairing should populate the reusable packet buffer");
+
+        let mut second = state(1.0);
+        second.id = 8;
+        second.uuid = 8;
+        clients.tick(&mut level, &[&first, &second]);
+        assert_eq!(
+            level.pairing_packets.capacity(),
+            capacity,
+            "the next newly tracked entity should reuse the same buffer"
+        );
+    }
+
     impl Clients {
         fn new() -> Self {
             Self {
