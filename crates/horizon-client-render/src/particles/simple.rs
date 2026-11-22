@@ -159,7 +159,9 @@ impl ParticleEngine {
         }
         let sets = &self.set_sprites;
         let per = particles.len().div_ceil(self.parallel_threads);
-        let mut handled = vec![Simple::No; particles.len()];
+        let mut handled = std::mem::take(&mut self.simple_handled);
+        handled.resize(particles.len(), Simple::No);
+        handled.fill(Simple::No);
         let pool = particle_pool(self.parallel_threads);
         pool.in_place_scope(|scope| {
             let run = |part: &mut [Particle], done: &mut [Simple], level: &ParticleLevel| {
@@ -179,11 +181,12 @@ impl ParticleEngine {
                 run(part, done, level);
             }
         });
-        for (p, done) in particles.iter_mut().zip(handled) {
+        for (p, done) in particles.iter_mut().zip(handled.iter().copied()) {
             match done {
                 Simple::No => self.tick_particle(p, level),
                 simple => self.finish_simple(p, simple),
             }
         }
+        self.simple_handled = handled;
     }
 }
