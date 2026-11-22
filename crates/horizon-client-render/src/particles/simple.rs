@@ -26,12 +26,10 @@ fn particle_pool(lanes: usize) -> Arc<rayon::ThreadPool> {
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if current
-        .as_ref()
-        .is_none_or(|(count, _)| *count != helpers)
-    {
+    if current.as_ref().is_none_or(|(count, _)| *count != helpers) {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(helpers)
+            .start_handler(|_| horizon_threads::server_core::leave_reserved())
             .thread_name(|i| format!("particle-tick-{i}"))
             .build()
             .expect("particle tick worker pool");
