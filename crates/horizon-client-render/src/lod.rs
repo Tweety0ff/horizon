@@ -1966,6 +1966,9 @@ pub struct Lod {
     reduced_detail: bool,
     pending: FxHashSet<TileKey>,
     detail_masks: FxHashMap<TileKey, [u64; 4]>,
+    /// Reused candidates and deduplication set for periodic near-detail requests.
+    detail_request_keys_scratch: Vec<TileKey>,
+    detail_request_chunks_scratch: FxHashSet<(i32, i32)>,
     detail_request_pending: bool,
     /// Detail and visited summaries past a frame's [`DETAIL_BUDGET`], applied
     /// on the frames after it. Bounded by what the worker sends: a detail
@@ -2412,6 +2415,8 @@ impl Lod {
             plan: Plan::default(),
             pending: FxHashSet::default(),
             detail_masks: FxHashMap::default(),
+            detail_request_keys_scratch: Vec::new(),
+            detail_request_chunks_scratch: FxHashSet::default(),
             detail_request_pending: false,
             detail_backlog: std::collections::VecDeque::new(),
             refreshes: 0,
@@ -3214,14 +3219,16 @@ impl Lod {
             return;
         }
         self.detail_request_at = std::time::Instant::now();
-        let mut keys: Vec<_> = self
-            .active
-            .iter()
-            .filter(|key| {
-                self.wants_detail(key) && self.detail_masks.get(key) != Some(&[u64::MAX; 4])
-            })
-            .copied()
-            .collect();
+        let mut keys = std::mem::take(&mut self.detail_request_keys_scratch);
+        keys.clear();
+        keys.extend(
+            self.active
+                .iter()
+                .filter(|key| {
+                    self.wants_detail(key) && self.detail_masks.get(key) != Some(&[u64::MAX; 4])
+                })
+                .copied(),
+        );
         // Retiring fine columns are empty stand-ins, excluded from `active`
         // while their normal meshes still cover the gap. Request their detail
         // explicitly: neither the active-tile requests nor sampling an already
@@ -3233,8 +3240,9 @@ impl Lod {
             &self.detail_masks,
         ));
         keys.sort_unstable_by_key(|key| (key.distance(camera), *key));
-        let mut chunks = FxHashSet::default();
-        for key in keys {
+        let mut chunks_seen = std::mem::take(&mut self.detail_request_chunks_scratch);
+        chunks_seen.clear();
+        for &key in &keys {
             let [ox, _, oz] = key.origin();
             let stride = key.size() / 16;
             let mask = self.detail_masks.get(&key).copied().unwrap_or_default();
@@ -3248,15 +3256,17 @@ impl Lod {
                     if self.full.contains(&chunk) {
                         self.detail_masks.entry(key).or_default()[index / 64] |= 1 << (index % 64);
                     } else {
-                        chunks.insert(chunk);
+                        chunks_seen.insert(chunk);
                     }
                 }
             }
-            if chunks.len() >= DETAIL_REQUEST {
+            if chunks_seen.len() >= DETAIL_REQUEST {
                 break;
             }
         }
-        let mut chunks: Vec<_> = chunks.into_iter().collect();
+        let mut chunks: Vec<_> = chunks_seen.drain().collect();
+        self.detail_request_keys_scratch = keys;
+        self.detail_request_chunks_scratch = chunks_seen;
         chunks.sort_unstable_by_key(|&(x, z)| {
             let dx = i64::from(x * 16 + 8 - camera[0]);
             let dz = i64::from(z * 16 + 8 - camera[1]);
@@ -6556,6 +6566,41 @@ mod tests {
                 && lod.covered_changes_scratch.capacity() >= capacities.2
                 && lod.covered_standins_scratch.capacity() >= capacities.3,
             "the next coverage change reuses all four work buffers"
+        );
+    }
+
+    #[test]
+    fn detail_request_reuses_candidate_and_chunk_buffers() {
+        let mut lod = Lod::scheduler_for_test();
+        lod.active = (0..DETAIL_REQUEST as i32 + 8)
+            .map(|x| TileKey { x, z: 0, level: 0 })
+            .collect();
+        lod.covered.insert((0, 0));
+        lod.full.insert((0, 0));
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        lod.detail_request_at = long_ago;
+        lod.request_detail([0, 0]);
+        let first = match lod.shared.jobs.lock().unwrap().pop_front() {
+            Some(Job::RequestDetail { chunks, .. }) => chunks,
+            other => panic!("expected detail request, got {other:?}"),
+        };
+        let capacities = (
+            lod.detail_request_keys_scratch.capacity(),
+            lod.detail_request_chunks_scratch.capacity(),
+        );
+        assert!(capacities.0 > 0 && capacities.1 > 0);
+        lod.detail_request_pending = false;
+        lod.detail_request_at = long_ago;
+        lod.request_detail([0, 0]);
+        let second = match lod.shared.jobs.lock().unwrap().pop_front() {
+            Some(Job::RequestDetail { chunks, .. }) => chunks,
+            other => panic!("expected repeated detail request, got {other:?}"),
+        };
+        assert_eq!(second, first, "request order must remain stable");
+        assert!(
+            lod.detail_request_keys_scratch.capacity() >= capacities.0
+                && lod.detail_request_chunks_scratch.capacity() >= capacities.1,
+            "periodic detail requests reuse both scratch buffers"
         );
     }
 
