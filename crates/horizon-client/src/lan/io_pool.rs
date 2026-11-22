@@ -1029,6 +1029,21 @@ mod tests {
     }
 
     #[test]
+    fn single_body_enqueue_preserves_order_and_refunds_when_closed() {
+        let pending = Arc::new(AtomicUsize::new(0));
+        let outbox = Outbox::new(pending.clone(), false).unwrap();
+        let first = body(1, 8);
+        let second = body(2, 12);
+        for bytes in [first.clone(), second.clone()] {
+            pending.fetch_add(charge(bytes.capacity()), Ordering::Relaxed);
+            outbox.send_one(Body::from(bytes), None);
+        }
+        assert_eq!(outbox.queued_contents(), [first, second]);
+        assert!(pending.load(Ordering::Relaxed) > 0);
+        outbox.closed();
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+    }
+    #[test]
     #[ignore = "daily"]
     fn a_socket_carries_packets_both_ways_in_order_then_disconnects() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
