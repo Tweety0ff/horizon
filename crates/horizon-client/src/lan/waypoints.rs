@@ -341,6 +341,8 @@ pub struct Waypoints {
     job_out_scratch: Vec<Vec<(u32, Sent)>>,
     /// Receiver work records, retaining the job-list allocation between movement ticks.
     jobs_scratch: Vec<MoveJob>,
+    /// Per-waypoint snapshots for this tick; own the source data, not Player references.
+    sources_scratch: Vec<Option<Src>>,
     own_scratch: HashMap<u128, u32>,
     #[cfg(test)]
     force_dense_for_test: bool,
@@ -511,7 +513,7 @@ impl Shared<'_> {
     /// records alone: what [`Self::update_or_create`] would do for a block connection one block off
     /// that its source has not left the range of (`update`), done here. False: nothing was done.
     #[inline]
-    fn step(row: &mut Row, src: &Src, me: &Receiver, out: &mut Vec<(u32, Sent)>) -> bool {
+    fn step(&self, row: &mut Row, src: &Src, me: &Receiver, out: &mut Vec<(u32, Sent)>) -> bool {
         #[cfg(test)]
         if tests::NO_STEP.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
@@ -532,7 +534,10 @@ impl Shared<'_> {
         if !in_range {
             return false;
         }
-        let Some(e) = src.update() else {
+        let Some(&player) = self.players.get(&src.uuid) else {
+            return false;
+        };
+        let Some(e) = src.update(player) else {
             return false;
         };
         *last = s.record;
@@ -751,19 +756,18 @@ struct Receiver {
 
 /// A transmitter for the rows to read this tick: the pair check's record of it, and its update packet,
 /// encoded once for the receivers that meet it.
-struct Src<'a> {
+struct Src {
     source: Source,
-    player: &'a Player,
+    uuid: u128,
     shared: OnceLock<Option<Arc<Encoded>>>,
 }
 
-impl Src<'_> {
+impl Src {
     /// The update of its waypoint to the block it is at: what every connection to it that moves by a
     /// block is sent (their icon is the player's own, as `Waypoints::tick_with` sees to).
-    fn update(&self) -> Option<&Arc<Encoded>> {
+    fn update(&self, p: &Player) -> Option<&Arc<Encoded>> {
         self.shared
             .get_or_init(|| {
-                let p = self.player;
                 let packet = waypoint(
                     p.uuid,
                     waypoint_operation::UPDATE,
@@ -1160,17 +1164,15 @@ impl Waypoints {
             });
         }
         // The transmitters as the rows meet them: player, number, block, and the update packet.
-        let sources: Vec<Option<Src>> = self
-            .waypoints
-            .iter()
-            .map(|u| {
-                t.s.players.get(u).map(|&p| Src {
-                    source: Source::of(t.s.id(*u), p),
-                    player: p,
-                    shared: OnceLock::new(),
-                })
+        let mut sources = std::mem::take(&mut self.sources_scratch);
+        sources.clear();
+        sources.extend(self.waypoints.iter().map(|u| {
+            t.s.players.get(u).map(|&p| Src {
+                source: Source::of(t.s.id(*u), p),
+                uuid: *u,
+                shared: OnceLock::new(),
             })
-            .collect();
+        }));
         let mut slot = std::mem::take(&mut self.slot_scratch);
         slot.resize(self.next_id as usize, NONE);
         slot.fill(NONE);
@@ -1310,7 +1312,7 @@ impl Waypoints {
                                         || slot
                                             .get(m.source.id as usize)
                                             .and_then(|&i| sources.get(i as usize)?.as_ref())
-                                            .is_some_and(|src| Shared::step(to.row, src, me, to.out))
+                                            .is_some_and(|src| s.step(to.row, src, me, to.out))
                                 });
                                 if !done {
                                     s.update_or_create(&mut to, m.uuid);
@@ -1324,7 +1326,7 @@ impl Waypoints {
                                 let (source, known) = (waypoints[k as usize], &sources[k as usize]);
                                 if let (Some(src), Some(me)) = (known, &me)
                                     && (Shared::quiet(to.row, &src.source, me)
-                                        || Shared::step(to.row, src, me, to.out))
+                                        || s.step(to.row, src, me, to.out))
                                 {
                                     continue;
                                 }
@@ -1351,6 +1353,7 @@ impl Waypoints {
         }
         self.job_out_scratch = job_outs;
         self.jobs_scratch = jobs;
+        self.sources_scratch = sources;
         self.move_scratch = moves;
         self.slot_scratch = slot;
         self.move_of_scratch = move_of;
