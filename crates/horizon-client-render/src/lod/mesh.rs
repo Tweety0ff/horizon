@@ -911,6 +911,7 @@ mod refinement_tests {
             256
         ];
         let columns: Vec<&[Span]> = columns.iter().map(|c| c.spans.as_slice()).collect();
+        let finer_keys = [fine].into_iter().collect();
         let mesh = mesh_columns_with_edges::<()>(
             parent,
             &columns,
@@ -918,6 +919,7 @@ mod refinement_tests {
             None,
             &[Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             &[fine],
+            &finer_keys,
             |_, _, _| Material {
                 faces: [
                     Some(Paint {
@@ -1011,6 +1013,7 @@ mod refinement_tests {
                 None,
                 &neighbors,
                 &[],
+                &FxHashSet::default(),
                 |_, _, _| Material {
                     faces: [
                         Some(Paint {
@@ -1651,7 +1654,15 @@ mod tests {
         };
         let (no_edges, set) = (Default::default(), FxHashSet::default());
         let mesh = |levels: [u8; 2]| {
-            mesh_columns_with_edges::<()>(key, &refs, &set, None, &no_edges, &[], |s, _, _| {
+            mesh_columns_with_edges::<()>(
+                key,
+                &refs,
+                &set,
+                None,
+                &no_edges,
+                &[],
+                &FxHashSet::default(),
+                |s, _, _| {
                 painted(s, levels)
             })
         };
@@ -1768,6 +1779,7 @@ mod tests {
             None,
             &no_edges,
             &[],
+            &FxHashSet::default(),
             looked,
         );
         mesh.sort_solid();
@@ -1856,10 +1868,26 @@ mod tests {
         let refs: Vec<&[Span]> = columns.iter().map(|c| c.spans.as_slice()).collect();
         let no_edges = Default::default();
         let set = FxHashSet::default();
-        let plain_mesh =
-            mesh_columns_with_edges::<()>(key, &refs, &set, None, &no_edges, &[], plain);
-        let looked =
-            mesh_columns_with_edges::<[u32; 2]>(key, &refs, &set, None, &no_edges, &[], plain);
+        let plain_mesh = mesh_columns_with_edges::<()>(
+            key,
+            &refs,
+            &set,
+            None,
+            &no_edges,
+            &[],
+            &FxHashSet::default(),
+            plain,
+        );
+        let looked = mesh_columns_with_edges::<[u32; 2]>(
+            key,
+            &refs,
+            &set,
+            None,
+            &no_edges,
+            &[],
+            &FxHashSet::default(),
+            plain,
+        );
         assert!(plain_mesh.solid.len() > 80 && !plain_mesh.translucent.is_empty());
         for (a, b) in [
             (&plain_mesh.solid, &looked.solid),
@@ -2236,6 +2264,7 @@ mod tests {
             None,
             &neighbors,
             &[],
+            &FxHashSet::default(),
             material,
         );
         let walls: Vec<_> = mesh
