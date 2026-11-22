@@ -1014,6 +1014,8 @@ pub struct Entities {
     cells: cells::Cells,
     /// One entity's packets and their bodies, kept between entities.
     packets: Vec<play::Clientbound>,
+    /// Pairing packets are assembled only when a viewer starts tracking an entity.
+    pairing_packets: Vec<play::Clientbound>,
     bodies: Bodies,
     /// Tests: force the send strategy.
     #[cfg(test)]
@@ -1105,6 +1107,7 @@ impl Entities {
         viewers: &mut [Viewer],
         mut kind: impl FnMut(&str) -> Option<i32>,
     ) {
+        let mut pairing_packets = std::mem::take(&mut self.pairing_packets);
         for e in entities {
             if self.states.contains_key(&e.id) {
                 continue;
@@ -1152,9 +1155,9 @@ impl Entities {
                     continue;
                 };
                 let bodies = bodies.get_or_insert_with(|| {
-                    let mut packets = Vec::new();
-                    s.pairing(e, kind, riding, &mut packets);
-                    Bodies::of(&packets)
+                    pairing_packets.clear();
+                    s.pairing(e, kind, riding, &mut pairing_packets);
+                    Bodies::of(&pairing_packets)
                 });
                 v.out.extend(bodies.to(v).iter().cloned());
                 v.tracker.seen.insert(e.id, Arc::clone(&s.tracked));
@@ -1166,6 +1169,7 @@ impl Entities {
             }
             self.states.insert(e.id, s);
         }
+        self.pairing_packets = pairing_packets;
     }
 
     pub fn len(&self) -> usize {
@@ -1583,6 +1587,7 @@ impl Entities {
         viewers: &mut [Viewer],
         active: &[usize],
     ) {
+        let mut pairing_packets = std::mem::take(&mut self.pairing_packets);
         for &index in active {
             let e = entities[index];
             let s = self.states.at_mut(self.states.slot_of_index(index));
@@ -1631,9 +1636,9 @@ impl Entities {
                     && let Some(kind) = s.kind
                 {
                     let bodies = pairing.get_or_insert_with(|| {
-                        let mut packets = Vec::new();
-                        s.pairing(e, kind, riding, &mut packets);
-                        Bodies::of(&packets)
+                        pairing_packets.clear();
+                        s.pairing(e, kind, riding, &mut pairing_packets);
+                        Bodies::of(&pairing_packets)
                     });
                     v.out.extend(bodies.to(v).iter().cloned());
                     if synced && !self.packets.is_empty() {
@@ -1657,6 +1662,7 @@ impl Entities {
                 }
             }
         }
+        self.pairing_packets = pairing_packets;
     }
 
     /// [`Self::send_in_order`] in two steps on several threads, the same bytes in the same
