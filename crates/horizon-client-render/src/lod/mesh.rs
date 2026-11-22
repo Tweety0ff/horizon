@@ -1381,6 +1381,27 @@ fn emit_quad(mesh: &mut SectionMesh, grouped: (FaceKey, impl Look), rect: Rect, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_neighbor_edges_stay_in_inline_storage() {
+        let mut edges = EdgeColumns::new();
+        for index in 0..4 {
+            edges.push(EdgeColumn {
+                start: index,
+                end: index + 1,
+                spans: &[],
+                unknown: false,
+            });
+        }
+        assert!(!edges.spilled(), "four edge segments fit without a heap allocation");
+        edges.push(EdgeColumn {
+            start: 4,
+            end: 5,
+            spans: &[],
+            unknown: false,
+        });
+        assert!(edges.spilled(), "larger adaptive boundaries may grow safely");
+    }
     fn span(min: i16, max: i16, state: u32) -> Span {
         Span {
             min,
