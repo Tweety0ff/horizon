@@ -339,6 +339,8 @@ pub struct Waypoints {
     updates_scratch: HashMap<u128, OnceLock<Option<Arc<Encoded>>>>,
     /// Per-receiver packet vectors, drained into the returned batch and reused next tick.
     job_out_scratch: Vec<Vec<(u32, Sent)>>,
+    /// Receiver work records, retaining the job-list allocation between movement ticks.
+    jobs_scratch: Vec<MoveJob>,
     own_scratch: HashMap<u128, u32>,
     #[cfg(test)]
     force_dense_for_test: bool,
@@ -703,6 +705,16 @@ struct Move {
     new_view: View,
     /// It left the block it was in.
     block_changed: bool,
+}
+
+/// One receiver's mutable work in a movement sweep. Its row and output buffer
+/// return to the manager after each tick, so the job-list allocation can persist.
+struct MoveJob {
+    receiver: u128,
+    listed: bool,
+    view: View,
+    row: Row,
+    out: Vec<(u32, Sent)>,
 }
 
 /// A transmitter as the pair check reads it: its number, last-block record, position, range
@@ -1128,7 +1140,9 @@ impl Waypoints {
             out: Vec<(u32, Sent)>,
         }
         let mut job_outs = std::mem::take(&mut self.job_out_scratch);
-        let mut jobs: Vec<Job> = self
+        let mut jobs = std::mem::take(&mut self.jobs_scratch);
+        jobs.clear();
+        for (receiver, listed) in self
             .players
             .iter()
             .map(|&receiver| (receiver, true))
@@ -1138,21 +1152,20 @@ impl Waypoints {
                     .filter(|m| m.receives && !self.players.contains(&m.uuid))
                     .map(|m| (m.uuid, false)),
             )
-            .map(|(receiver, listed)| {
-                let mut out = job_outs
-                    .pop()
-                    .unwrap_or_else(|| Vec::with_capacity(64));
-                out.clear();
-                Job {
-                    receiver,
-                    listed,
-                    view: t.view.get(&receiver).copied(),
-                    row: self.connections.remove(&receiver).unwrap_or_default(),
-                    // A receiver is sent a few dozen in a crowd: no growing by doubling.
-                    out,
-                }
-            })
-            .collect();
+        {
+            let mut out = job_outs
+                .pop()
+                .unwrap_or_else(|| Vec::with_capacity(64));
+            out.clear();
+            jobs.push(MoveJob {
+                receiver,
+                listed,
+                view: t.view.get(&receiver).copied(),
+                row: self.connections.remove(&receiver).unwrap_or_default(),
+                // A receiver is sent a few dozen in a crowd: no growing by doubling.
+                out,
+            });
+        }
         // The transmitters as the rows meet them: player, number, block, and the update packet.
         let sources: Vec<Option<Src>> = self
             .waypoints
@@ -1344,6 +1357,7 @@ impl Waypoints {
             job_outs.push(job.out);
         }
         self.job_out_scratch = job_outs;
+        self.jobs_scratch = jobs;
         self.move_scratch = moves;
         self.slot_scratch = slot;
         self.move_of_scratch = move_of;
