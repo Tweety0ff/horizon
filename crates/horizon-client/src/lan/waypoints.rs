@@ -334,6 +334,7 @@ pub struct Waypoints {
     changed_slots_scratch: Vec<u32>,
     all_moves_scratch: Vec<u32>,
     all_slots_scratch: Vec<u32>,
+    gone_scratch: Vec<u128>,
     own_scratch: HashMap<u128, u32>,
     /// Which generation of the waypoints the rows' `watch` lists belong to: the transmitters, their
     /// numbers and the receivers change it.
@@ -952,19 +953,22 @@ impl Waypoints {
             }
         }
         // Players who left, and the ServerPlayer a respawn replaced.
-        let gone: Vec<u128> = self
-            .players
-            .iter()
-            .copied()
-            .filter(|uuid| !t.s.players.contains_key(uuid) || respawned.contains(uuid))
-            .collect();
-        for uuid in gone {
+        let mut gone = std::mem::take(&mut self.gone_scratch);
+        gone.clear();
+        gone.extend(
+            self.players
+                .iter()
+                .copied()
+                .filter(|uuid| !t.s.players.contains_key(uuid) || respawned.contains(uuid)),
+        );
+        for uuid in gone.drain(..) {
             self.remove_player(&mut t, uuid);
             self.memo.remove(&uuid);
             if !t.s.players.contains_key(&uuid) {
                 self.release(uuid);
             }
         }
+        self.gone_scratch = gone;
         if was == Some(true) && !locator_bar {
             self.break_all(&mut t);
         }
@@ -1414,6 +1418,24 @@ mod tests {
             ),
             capacities,
             "successive dense sweeps reuse both index buffers"
+        );
+    }
+
+    #[test]
+    fn departed_player_scratch_reuses_its_capacity() {
+        let mut waypoints = Waypoints::default();
+        let a = player(1, 10, [0.5, 100.0, 0.5]);
+        let b = player(2, 20, [5.5, 100.0, 0.5]);
+        let c = player(3, 30, [10.5, 100.0, 0.5]);
+        waypoints.tick(&[a.clone(), b.clone(), c], &[], true);
+        waypoints.tick(&[a.clone(), b.clone()], &[], true);
+        let capacity = waypoints.gone_scratch.capacity();
+        assert!(capacity > 0, "removing a player should populate the scratch list");
+        waypoints.tick(&[a], &[], true);
+        assert_eq!(
+            waypoints.gone_scratch.capacity(),
+            capacity,
+            "the next removal reuses the departed-player list"
         );
     }
 
