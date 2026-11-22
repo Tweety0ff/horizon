@@ -2020,6 +2020,9 @@ pub struct Lod {
     /// Tiles that left the selection. The renderer may only fade them out
     /// once every active tile overlapping them has its mesh, or a hole opens.
     removed_pending: FxHashSet<TileKey>,
+    /// Scratch for the ancestor blocking check and pending-key iteration.
+    release_blocked_scratch: FxHashSet<TileKey>,
+    release_pending_scratch: Vec<TileKey>,
     /// Released removals, returned to the renderer this update.
     removed: Vec<TileKey>,
     /// The columns left out: `full` and `retiring`.
@@ -2411,6 +2414,8 @@ impl Lod {
             meshed: FxHashSet::default(),
             unmeshed: FxHashSet::default(),
             removed_pending: FxHashSet::default(),
+            release_blocked_scratch: FxHashSet::default(),
+            release_pending_scratch: Vec::new(),
             stale: FxHashSet::default(),
             restale: FxHashSet::default(),
             removed: Vec::new(),
@@ -3721,7 +3726,11 @@ impl Lod {
         if self.removed_pending.is_empty() {
             return;
         }
-        let mut blocked = FxHashSet::default();
+        let mut blocked = std::mem::take(&mut self.release_blocked_scratch);
+        blocked.clear();
+        let mut pending = std::mem::take(&mut self.release_pending_scratch);
+        pending.clear();
+        pending.extend(self.removed_pending.iter().copied());
         for &removed in &self.removed_pending {
             let mut node = removed;
             loop {
@@ -3747,8 +3756,7 @@ impl Lod {
                 node = node.parent();
             }
         }
-        let pending: Vec<_> = self.removed_pending.iter().copied().collect();
-        for key in pending {
+        for key in pending.drain(..) {
             if self.active.contains(&key) || blocked.contains(&key) {
                 continue;
             }
@@ -3757,6 +3765,8 @@ impl Lod {
         }
         self.removed_pending
             .retain(|key| !self.active.contains(key));
+        self.release_blocked_scratch = blocked;
+        self.release_pending_scratch = pending;
     }
     /// Queues every dirty active tile with a shared immutable snapshot. One
     /// batch used to clone all maps and serialize the whole view on one worker.
@@ -6405,10 +6415,23 @@ mod tests {
             lod.removed().is_empty(),
             "removed before the replacement was meshed"
         );
+        let scratch_capacity = (
+            lod.release_blocked_scratch.capacity(),
+            lod.release_pending_scratch.capacity(),
+        );
+        assert!(scratch_capacity.0 > 0 && scratch_capacity.1 > 0);
         lod.meshed.insert(child);
         lod.unmeshed.remove(&child);
         lod.release_removed();
         assert_eq!(lod.removed(), [parent]);
+        assert_eq!(
+            (
+                lod.release_blocked_scratch.capacity(),
+                lod.release_pending_scratch.capacity(),
+            ),
+            scratch_capacity,
+            "the next release pass reuses both scratch allocations"
+        );
         // Out of range: nothing overlaps it, so it may fade out at once.
         let gone = TileKey {
             x: 100,
