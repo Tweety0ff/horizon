@@ -475,7 +475,7 @@ mod tests {
     use super::*;
 
     /// The server shares foreground tick work across performance cores only, leaving
-    /// one such core available for rendering and keeping a one-core CPU serial.
+    /// one such core available for rendering and keeping fewer than three cores serial.
     #[test]
     fn tick_lanes_leave_a_performance_core_for_rendering() {
         for (cores, lanes) in [(1, 1), (2, 1), (3, 2), (4, 3), (8, 7), (9, 8), (16, 8)] {
