@@ -628,7 +628,7 @@ fn mesh_columns_with_edges<L: Look>(
         }
     };
     let mut materials = smallvec::SmallVec::<[Material<L>; 4]>::new();
-    let prepared: Vec<smallvec::SmallVec<[Segment<'_, L>; 4]>> = filled
+    let prepared: Vec<smallvec::SmallVec<[Segment<'_, L>; 2]>> = filled
         .iter()
         .map(FilledSpans::as_slice)
         .chain(neighbors.iter().flatten().map(|edge| edge.spans))
