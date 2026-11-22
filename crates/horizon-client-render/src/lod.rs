@@ -2064,6 +2064,11 @@ pub struct Lod {
     returning: Vec<TileKey>,
     /// Reused list of the coarsest returning tiles being brought back this update.
     returning_now_scratch: Vec<TileKey>,
+    /// Reusable lists for the infrequent view-plan rebuild.
+    replan_gone_scratch: Vec<TileKey>,
+    replan_leaving_scratch: Vec<TileKey>,
+    replan_seam_scratch: Vec<TileKey>,
+    replan_standins_scratch: Vec<TileKey>,
     /// When the plan last asked kept tiles back (`RETURN_SEAM_WAIT`).
     returned_at: std::time::Instant,
     /// `LodSource::keeps_observed`: tiles sampled without an observed chunk
@@ -2447,6 +2452,10 @@ impl Lod {
             kept: kept::KeptTiles::new(kept::KEPT_FOR, kept::KEPT_BYTES),
             returning: Vec::new(),
             returning_now_scratch: Vec::new(),
+            replan_gone_scratch: Vec::new(),
+            replan_leaving_scratch: Vec::new(),
+            replan_seam_scratch: Vec::new(),
+            replan_standins_scratch: Vec::new(),
             returned_at: std::time::Instant::now(),
             keeps_observed,
         }
@@ -3324,48 +3333,60 @@ impl Lod {
         // A tile that leaves the range before it was drawn stops being
         // unknown to its neighbours (`Snapshot::planned_leaf`): they remesh
         // with walls against it, as against any terrain out of range.
-        let gone: Vec<_> = self
-            .plan
-            .nodes
-            .iter()
-            .filter(|key| !plan.nodes.contains(key) && !self.ready.contains_key(key))
-            .copied()
-            .collect();
+        let mut gone = std::mem::take(&mut self.replan_gone_scratch);
+        gone.clear();
+        gone.extend(
+            self.plan
+                .nodes
+                .iter()
+                .filter(|key| !plan.nodes.contains(key) && !self.ready.contains_key(key))
+                .copied(),
+        );
         self.plan = plan;
         self.kept.fit_to_view(self.plan.nodes.len());
         // Tiles leaving the plan are kept for a return, with their detail. Not
         // stale ones (their source has more), nor ones of cells a chunk wide or
         // less over the full-detail columns: never drawn there, they came back
         // as flat grey ground around the near terrain until it loaded.
-        let leaving: Vec<_> = self
-            .ready
-            .keys()
-            .filter(|key| !self.plan.nodes.contains(key))
-            .copied()
-            .collect();
-        for key in leaving {
+        let mut leaving = std::mem::take(&mut self.replan_leaving_scratch);
+        leaving.clear();
+        leaving.extend(
+            self.ready
+                .keys()
+                .filter(|key| !self.plan.nodes.contains(key))
+                .copied(),
+        );
+        for key in leaving.drain(..) {
             let columns = self.ready.remove(&key).unwrap();
             if !self.stale.contains(&key) && !self.over_covered(key) {
                 let mask = self.detail_masks.get(&key).copied();
                 self.kept.keep(key, columns, mask);
             }
         }
+        self.replan_leaving_scratch = leaving;
         self.kept.trim();
         // Those the plan wants again come back (`bring_back`) instead of being
         // sampled: a level at a time, coarsest first. Not at the seam with the
         // near chunks (`Plan::stands_in`), sampled first and fresh there: kept
         // ones drew grey ground and the near chunks' caves until they loaded.
-        let (returning, seam): (Vec<_>, Vec<_>) = self
-            .plan
-            .nodes
-            .iter()
-            .filter(|key| self.kept.contains(key) && !self.ready.contains_key(key))
-            .copied()
-            .partition(|key| self.plan.stands_in(*key));
-        for key in seam {
+        let mut returning = std::mem::take(&mut self.returning);
+        returning.clear();
+        let mut seam = std::mem::take(&mut self.replan_seam_scratch);
+        seam.clear();
+        for &key in &self.plan.nodes {
+            if self.kept.contains(&key) && !self.ready.contains_key(&key) {
+                if self.plan.stands_in(key) {
+                    seam.push(key);
+                } else {
+                    returning.push(key);
+                }
+            }
+        }
+        for key in seam.drain(..) {
             self.kept.take(&key);
         }
         self.returning = returning;
+        self.replan_seam_scratch = seam;
         self.returned_at = std::time::Instant::now();
         let nodes = &self.plan.nodes;
         self.mesh_samples.retain(|key| nodes.contains(key));
@@ -3378,7 +3399,8 @@ impl Lod {
         self.detail_masks
             .retain(|key, _| self.plan.nodes.contains(key));
         // Complete resident columns need no duplicate noise work.
-        let mut standins = Vec::new();
+        let mut standins = std::mem::take(&mut self.replan_standins_scratch);
+        standins.clear();
         let mut empty_standin: Option<Arc<TileColumns>> = None;
         for &key in &self.plan.by_level[0] {
             if self.covered.contains(&(key.x, key.z)) && !self.ready.contains_key(&key) {
@@ -3388,12 +3410,14 @@ impl Lod {
             }
         }
         self.rebuild_selection();
-        for key in standins {
+        for &key in &standins {
             self.refresh_path(key);
         }
-        for key in gone {
+        self.replan_standins_scratch = standins;
+        for key in gone.drain(..) {
             self.mark_side_neighbors_of(key);
         }
+        self.replan_gone_scratch = gone;
     }
     /// Whether a tile of cells a chunk wide or less lies over a covered column.
     fn over_covered(&self, key: TileKey) -> bool {
