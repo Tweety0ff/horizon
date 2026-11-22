@@ -656,6 +656,8 @@ pub struct Streaming {
     gone_scratch: Vec<(i32, i32)>,
     mesh_candidates_scratch: Vec<(i64, i32, i32, SectionMask)>,
     mesh_columns_scratch: Vec<((i32, i32), SectionMask)>,
+    /// The next bounded chunk-generation batch, reused as queue capacity opens.
+    generation_batch_scratch: Vec<(i64, i32, i32)>,
     sequence: u64,
     pub center: (i32, i32),
     /// The view distance around `center`; below 0, no area there (a dedicated
@@ -840,6 +842,20 @@ impl GenerationScan {
         input: GenerationInputs<'_>,
         capacity: usize,
     ) -> Option<Vec<(i64, i32, i32)>> {
+        let mut batch = Vec::new();
+        self.candidates_into(input, capacity, &mut batch)
+            .map(|()| batch)
+    }
+
+    /// Fills a caller-owned batch buffer, retaining its allocation between
+    /// streaming updates while preserving the same bounded, ordered result.
+    fn candidates_into(
+        &mut self,
+        input: GenerationInputs<'_>,
+        capacity: usize,
+        batch: &mut Vec<(i64, i32, i32)>,
+    ) -> Option<()> {
+        batch.clear();
         // Generation (load or proto), closest first, bounded in flight.
         let (margin, reach) = Ranges::margins(input.decorates);
         if input.remote
@@ -859,17 +875,18 @@ impl GenerationScan {
                 self.next += 1;
             }
             let room = capacity - input.generating.len();
-            let batch: Vec<_> = self.plan[self.next..]
-                .iter()
-                .filter(|c| missing(c))
-                .take(room)
-                .copied()
-                .collect();
+            batch.extend(
+                self.plan[self.next..]
+                    .iter()
+                    .filter(|c| missing(c))
+                    .take(room)
+                    .copied(),
+            );
             // Past the plan's end, the full scan below decides whether
             // anything is left (and remembers when nothing is).
             if !batch.is_empty() {
                 self.exhausted = false;
-                return Some(batch);
+                return Some(());
             }
         }
         {
@@ -955,8 +972,8 @@ impl GenerationScan {
             self.plan.clear();
             self.plan.extend_from_slice(&wanted);
             self.next = 0;
-            wanted.truncate(capacity - input.generating.len());
-            Some(wanted)
+            batch.extend(wanted.into_iter().take(capacity - input.generating.len()));
+            Some(())
         }
     }
 }
@@ -1290,6 +1307,7 @@ impl Streaming {
             gone_scratch: Vec::new(),
             mesh_candidates_scratch: Vec::new(),
             mesh_columns_scratch: Vec::new(),
+            generation_batch_scratch: Vec::new(),
             sequence: 0,
             center: (0, 0),
             radius: 8,
@@ -2468,12 +2486,18 @@ impl Streaming {
             decorates: self.decorates,
             remote: self.remote,
         };
-        if let Some(wanted) = self.generation_scan.candidates(input, workers * 3) {
-            for (_, x, z) in wanted {
+        let mut wanted = std::mem::take(&mut self.generation_batch_scratch);
+        if self
+            .generation_scan
+            .candidates_into(input, workers * 3, &mut wanted)
+            .is_some()
+        {
+            for &(_, x, z) in &wanted {
                 self.generating.insert((x, z));
                 self.submit(Some((x, z)), 0, Job::Generate(x, z));
             }
         }
+        self.generation_batch_scratch = wanted;
     }
     /// Relight block edits on lit chunks in place (vanilla's incremental light
     /// engine) instead of recomputing the 3x3 chunks around each edit.
