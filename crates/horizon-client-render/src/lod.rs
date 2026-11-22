@@ -6227,6 +6227,8 @@ mod tests {
         assert!(queued(&lod).is_empty());
         assert!(lod.pending.is_empty());
         assert!(observing(&lod));
+        let dropped_capacity = lod.dropped_samples_scratch.capacity();
+        assert!(dropped_capacity >= 16);
         lod.set_near_loading(false);
         lod.update([100_000., 64., 100_000.], 2, 64, none(), None);
         assert_eq!(queued(&lod), after);
@@ -6236,6 +6238,10 @@ mod tests {
         lod.set_near_loading(true);
         assert_eq!(queued(&lod), after[..SAMPLE_JOBS]);
         assert_eq!(pending(&lod), sorted(after[..SAMPLE_JOBS].to_vec()));
+        assert!(
+            lod.dropped_samples_scratch.capacity() >= dropped_capacity,
+            "a later near-loading transition reuses the dropped-job list"
+        );
     }
 
     #[test]
