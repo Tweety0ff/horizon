@@ -1016,6 +1016,8 @@ pub struct Entities {
     packets: Vec<play::Clientbound>,
     /// Pairing packets are assembled only when a viewer starts tracking an entity.
     pairing_packets: Vec<play::Clientbound>,
+    /// Reused depth-first traversal stack for vehicle/passenger trees.
+    passengers_scratch: Vec<i32>,
     bodies: Bodies,
     /// Tests: force the send strategy.
     #[cfg(test)]
@@ -1108,6 +1110,7 @@ impl Entities {
         mut kind: impl FnMut(&str) -> Option<i32>,
     ) {
         let mut pairing_packets = std::mem::take(&mut self.pairing_packets);
+        let mut passenger_stack = std::mem::take(&mut self.passengers_scratch);
         for e in entities {
             if self.states.contains_key(&e.id) {
                 continue;
@@ -1117,14 +1120,15 @@ impl Entities {
             // Pairing has already happened by the time the next pass runs.
             s.added = false;
             let mut range = s.range;
-            let mut pending = riding.passengers(e.id).to_vec();
-            while let Some(id) = pending.pop() {
+            passenger_stack.clear();
+            passenger_stack.extend_from_slice(riding.passengers(e.id));
+            while let Some(id) = passenger_stack.pop() {
                 if let Some(passenger) = self.states.get(&id) {
                     range = range.max(passenger.range);
                 } else if let Some(passenger) = entities.iter().find(|p| p.id == id) {
                     range = range.max(i32::from(tracking::settings(&passenger.kind).0));
                 }
-                pending.extend_from_slice(riding.passengers(id));
+                passenger_stack.extend_from_slice(riding.passengers(id));
             }
             let probe = Probe {
                 x: e.position[0],
@@ -1170,6 +1174,7 @@ impl Entities {
             self.states.insert(e.id, s);
         }
         self.pairing_packets = pairing_packets;
+        self.passengers_scratch = passenger_stack;
     }
 
     pub fn len(&self) -> usize {
@@ -1342,22 +1347,25 @@ impl Entities {
         self.states.end();
         // TrackedEntity.getEffectiveRange: a vehicle is tracked as far as its
         // widest indirect passenger, so a rider never leaves before its mount.
+        let mut passenger_stack = std::mem::take(&mut self.passengers_scratch);
         for (&vehicle, passengers) in &riding.passengers {
             let Some(own) = self.states.get(&vehicle).filter(|s| s.seen == now) else {
                 continue;
             };
             let (index, mut range) = (own.index, own.range);
-            let mut pending = passengers.clone();
-            while let Some(id) = pending.pop() {
+            passenger_stack.clear();
+            passenger_stack.extend_from_slice(passengers);
+            while let Some(id) = passenger_stack.pop() {
                 if let Some(s) = self.states.get(&id).filter(|s| s.seen == now) {
                     range = range.max(s.range);
                 }
-                pending.extend_from_slice(riding.passengers(id));
+                passenger_stack.extend_from_slice(riding.passengers(id));
             }
             self.probes[index].range = self
                 .range_percent
                 .map_or(range * 16, |p| p * (range * 16) / 100);
         }
+        self.passengers_scratch = passenger_stack;
         self.cells.update(
             now,
             &self.chunks,
@@ -1796,6 +1804,38 @@ mod send_bench;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn passenger_tree_traversal_reuses_its_stack() {
+        let mut entities_tracker = Entities::default();
+        let mut capacity = None;
+        for round in 0..2 {
+            let base = round * 100;
+            let mut entities: Vec<_> = (0..15)
+                .map(|index| {
+                    let mut entity = state(index as f64);
+                    entity.id = base + index;
+                    entity.uuid = (base + index) as u128;
+                    entity
+                })
+                .collect();
+            let mut riding = Riding::default();
+            for parent in 0..7 {
+                riding.add(base + parent, base + parent * 2 + 1);
+                riding.add(base + parent, base + parent * 2 + 2);
+            }
+            entities_tracker.pair_after_tick(&entities, &riding, &mut [], |_| None);
+            let now = entities_tracker.passengers_scratch.capacity();
+            assert!(now >= 2, "nested passenger traversal should reserve stack space");
+            if let Some(previous) = capacity {
+                assert_eq!(now, previous, "the next passenger tree reuses the stack");
+            } else {
+                capacity = Some(now);
+            }
+            // The states must remain available to the next call under distinct IDs.
+            entities.clear();
+        }
+    }
 
     #[test]
     fn encode_rounds_ties_toward_positive_infinity() {
