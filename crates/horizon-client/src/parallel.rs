@@ -8,9 +8,9 @@
 //! ([`after_tick`]) and never during one. `HORIZON_PARALLEL_TICK` wins over the setting, and is
 //! all a dedicated server follows (`server.toml`'s `parallel_tick`).
 use crate::graphics::ParallelTickMode;
+use rayon::prelude::*;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
-use rayon::prelude::*;
 
 /// `HORIZON_PARALLEL_TICK`, whatever the setting says: `0` keeps every tick serial, `1` turns the
 /// server tick's parallel phases on, and `verify` does too, also checking the phases that can be
