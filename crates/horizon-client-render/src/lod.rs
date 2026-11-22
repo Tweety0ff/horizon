@@ -4996,6 +4996,11 @@ mod tests {
         assert!(wanted.iter().all(|key| !lod.ready.contains_key(key)));
         lod.unmeshed.clear();
         lod.bring_back();
+        let returning_scratch_capacity = lod.returning_now_scratch.capacity();
+        assert!(
+            returning_scratch_capacity > 0,
+            "the coarsest returning batch populates the reusable scratch"
+        );
         for key in &wanted {
             assert_eq!(
                 lod.ready.contains_key(key),
@@ -5028,6 +5033,10 @@ mod tests {
                 .all(|key| lod.ready.get(key).is_some_and(|s| Arc::ptr_eq(s, &filled)))
         );
         assert!(lod.pending.iter().all(|key| seam.contains(key)));
+        assert!(
+            lod.returning_now_scratch.capacity() >= returning_scratch_capacity,
+            "later return batches keep the first scratch allocation"
+        );
     }
     #[test]
     fn only_detail_a_later_refresh_covers_is_dropped() {
