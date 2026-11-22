@@ -160,8 +160,8 @@ impl ParticleEngine {
         let sets = &self.set_sprites;
         let per = particles.len().div_ceil(self.parallel_threads);
         let mut handled = std::mem::take(&mut self.simple_handled);
+        // Every slot is overwritten by tick_simple before the results are read.
         handled.resize(particles.len(), Simple::No);
-        handled.fill(Simple::No);
         let pool = particle_pool(self.parallel_threads);
         pool.in_place_scope(|scope| {
             let run = |part: &mut [Particle], done: &mut [Simple], level: &ParticleLevel| {
