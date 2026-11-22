@@ -326,6 +326,12 @@ pub struct Waypoints {
     next_id: u32,
     /// The `locator_bar` game rule as last seen.
     enabled: Option<bool>,
+    /// Scratch arrays for the per-tick movement sweep; their capacity survives quiet ticks.
+    move_scratch: Vec<Move>,
+    slot_scratch: Vec<u32>,
+    move_of_scratch: Vec<u32>,
+    changed_moves_scratch: Vec<u32>,
+    changed_slots_scratch: Vec<u32>,
     /// Which generation of the waypoints the rows' `watch` lists belong to: the transmitters, their
     /// numbers and the receivers change it.
     epoch: u64,
@@ -1054,7 +1060,8 @@ impl Waypoints {
     /// threads, and its packets come out as the loop sends them.
     fn moves_by_receiver(&mut self, t: &mut Tick, players: &[Player]) {
         let sparse = Self::calm(&t.s, players);
-        let mut moves = Vec::new();
+        let mut moves = std::mem::take(&mut self.move_scratch);
+        moves.clear();
         for player in players {
             let memo = self
                 .memo
@@ -1080,6 +1087,7 @@ impl Waypoints {
             });
         }
         if moves.is_empty() {
+            self.move_scratch = moves;
             return;
         }
         // Every row a move reaches: the receivers', and those of movers who receive but aren't
@@ -1122,7 +1130,9 @@ impl Waypoints {
                 })
             })
             .collect();
-        let mut slot = vec![NONE; self.next_id as usize];
+        let mut slot = std::mem::take(&mut self.slot_scratch);
+        slot.resize(self.next_id as usize, NONE);
+        slot.fill(NONE);
         for (i, src) in sources.iter().enumerate() {
             if let Some(src) = src {
                 slot[src.source.id as usize] = i as u32;
@@ -1138,9 +1148,13 @@ impl Waypoints {
         if sparse {
             tests::SPARSE_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let mut changed_moves: Vec<u32> = Vec::new();
-        let mut changed_slots: Vec<u32> = Vec::new();
-        let mut move_of = vec![NONE; self.next_id as usize];
+        let mut changed_moves = std::mem::take(&mut self.changed_moves_scratch);
+        changed_moves.clear();
+        let mut changed_slots = std::mem::take(&mut self.changed_slots_scratch);
+        changed_slots.clear();
+        let mut move_of = std::mem::take(&mut self.move_of_scratch);
+        move_of.resize(self.next_id as usize, NONE);
+        move_of.fill(NONE);
         let mut own: HashMap<u128, u32> = HashMap::default();
         if sparse {
             for (i, m) in moves.iter().enumerate() {
@@ -1288,6 +1302,11 @@ impl Waypoints {
             t.out.extend(job.out);
             self.connections.insert(job.receiver, job.row);
         }
+        self.move_scratch = moves;
+        self.slot_scratch = slot;
+        self.move_of_scratch = move_of;
+        self.changed_moves_scratch = changed_moves;
+        self.changed_slots_scratch = changed_slots;
     }
     /// Whether this tick's moves can be met by what changed alone. A pair neither of whose players
     /// changed block, and whose connection is a block one in range, has nothing to send: the check
