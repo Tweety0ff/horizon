@@ -335,6 +335,8 @@ pub struct Waypoints {
     all_moves_scratch: Vec<u32>,
     all_slots_scratch: Vec<u32>,
     gone_scratch: Vec<u128>,
+    view_scratch: HashMap<u128, View>,
+    updates_scratch: HashMap<u128, OnceLock<Option<Arc<Encoded>>>>,
     own_scratch: HashMap<u128, u32>,
     /// Which generation of the waypoints the rows' `watch` lists belong to: the transmitters, their
     /// numbers and the receivers change it.
@@ -932,16 +934,21 @@ impl Waypoints {
         by_receiver: usize,
     ) -> Vec<(u32, Sent)> {
         self.number(players);
+        let mut updates = std::mem::take(&mut self.updates_scratch);
+        updates.clear();
+        updates.extend(players.iter().map(|p| (p.uuid, OnceLock::new())));
+        let mut view = std::mem::take(&mut self.view_scratch);
+        view.clear();
         let mut t = Tick {
             s: Shared {
                 players: players.iter().map(|p| (p.uuid, p)).collect(),
                 ids: Arc::clone(&self.ids),
-                updates: players.iter().map(|p| (p.uuid, OnceLock::new())).collect(),
+                updates,
                 away,
                 fresh: respawned,
                 enabled: locator_bar,
             },
-            view: HashMap::default(),
+            view,
             out: Vec::new(),
         };
         // Vanilla reads the rule when it connects; changing it breaks or remakes
@@ -1012,6 +1019,8 @@ impl Waypoints {
             })
         {
             self.moves_by_receiver(&mut t, players);
+            self.view_scratch = std::mem::take(&mut t.view);
+            self.updates_scratch = std::mem::take(&mut t.s.updates);
             return t.out;
         }
         for p in players {
@@ -1063,6 +1072,8 @@ impl Waypoints {
                 self.track(&mut t, p.uuid);
             }
         }
+        self.view_scratch = std::mem::take(&mut t.view);
+        self.updates_scratch = std::mem::take(&mut t.s.updates);
         t.out
     }
 
