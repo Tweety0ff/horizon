@@ -4102,6 +4102,52 @@ mod tests {
     }
 
     #[test]
+    fn decoration_queue_reuses_rank_and_fresh_buffers() {
+        let distance = |x: i32, z: i32| {
+            let (x, z) = (i64::from(x), i64::from(z));
+            x * x + z * z
+        };
+        let mut order = DecorationOrder::default();
+        order.reassign((0, 0), 6, |x, z| (x + z).rem_euclid(5) == 0);
+        let wanted: Vec<_> = (-8i32..=8)
+            .flat_map(|x| (-8i32..=8).map(move |z| (x, z)))
+            .filter(|&(x, z)| (x * 7 + z).rem_euclid(3) != 0)
+            .collect();
+        let mut ranked = Vec::new();
+        let mut fresh = Vec::new();
+        let mut expected = None;
+        let mut capacities = None;
+
+        for round in 0..3 {
+            let queue = decoration_queue_with_scratch(
+                &mut order,
+                &mut ranked,
+                &mut fresh,
+                wanted.iter().copied(),
+                distance,
+            );
+            let popped: Vec<_> = queue
+                .into_sorted_vec()
+                .into_iter()
+                .map(|std::cmp::Reverse((_, x, z))| (x, z))
+                .collect();
+            if let Some(expected) = &expected {
+                assert_eq!(&popped, expected, "round {round}");
+            } else {
+                expected = Some(popped.clone());
+            }
+            ranked = queue.into_vec();
+            let now = (ranked.capacity(), fresh.capacity());
+            if let Some(capacities) = capacities {
+                assert_eq!(now, capacities, "round {round} must reuse both allocations");
+            } else {
+                assert!(now.0 > 0 && now.1 > 0);
+                capacities = Some(now);
+            }
+        }
+    }
+
+    #[test]
     fn taking_remote_columns_keeps_their_data_until_cleanup() {
         let mut world = World::new(horizon_world::registry::BlockStateId(0), 0);
         world.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
