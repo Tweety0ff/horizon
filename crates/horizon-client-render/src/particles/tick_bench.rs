@@ -148,26 +148,32 @@ fn state(engine: &ParticleEngine) -> Vec<String> {
 fn parallel_tick_matches_serial_tick() {
     with_scene(|level| {
         let types = emitters();
-        // One engine ticks every particle in turn; the other on three threads. Same seeds, same spawns.
-        let mut serial = engine(usize::MAX, 1);
-        let mut threaded = engine(0, 3);
-        for e in [&mut serial, &mut threaded] {
-            e.seed_randoms(7, 8, 9);
-        }
-        let (mut a, mut b) = (Lcg(99), Lcg(99));
-        for tick in 0..90 {
-            spawn_tick(&mut serial, &mut a, &types, 3);
-            spawn_tick(&mut threaded, &mut b, &types, 3);
-            serial.tick(level);
-            threaded.tick(level);
-            assert_eq!(serial.len(), threaded.len(), "tick {tick}");
-            if tick % 10 == 9 {
-                assert_eq!(state(&serial), state(&threaded), "tick {tick}");
+        // Check the small and full six-lane paths against the same serial sequence.
+        for threads in [3, 6] {
+            let mut serial = engine(usize::MAX, 1);
+            let mut threaded = engine(0, threads);
+            for e in [&mut serial, &mut threaded] {
+                e.seed_randoms(7, 8, 9);
             }
+            let (mut a, mut b) = (Lcg(99), Lcg(99));
+            for tick in 0..90 {
+                spawn_tick(&mut serial, &mut a, &types, 3);
+                spawn_tick(&mut threaded, &mut b, &types, 3);
+                serial.tick(level);
+                threaded.tick(level);
+                assert_eq!(serial.len(), threaded.len(), "{threads} lanes, tick {tick}");
+                if tick % 10 == 9 {
+                    assert_eq!(
+                        state(&serial),
+                        state(&threaded),
+                        "{threads} lanes, tick {tick}"
+                    );
+                }
+            }
+            assert!(serial.len() > 1000, "{} particles", serial.len());
+            assert_eq!(serial.sounds.len(), threaded.sounds.len());
+            assert_eq!(serial.next_randoms(), threaded.next_randoms());
         }
-        assert!(serial.len() > 1000, "{} particles", serial.len());
-        assert_eq!(serial.sounds.len(), threaded.sounds.len());
-        assert_eq!(serial.next_randoms(), threaded.next_randoms());
     });
 }
 
