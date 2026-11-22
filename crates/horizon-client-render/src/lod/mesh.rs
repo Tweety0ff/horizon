@@ -1108,7 +1108,8 @@ fn fill_buried_gaps<'a>(
         .iter()
         .map(|g| smallvec::smallvec![false; g.len()])
         .collect();
-    let mut reached = Vec::new();
+    // The common case reaches only a few gaps; retain a larger inline stack for a tile.
+    let mut reached: smallvec::SmallVec<[(usize, usize); 64]> = smallvec::SmallVec::new();
     for i in 0..CELLS * CELLS {
         let (x, z) = (i % CELLS, i / CELLS);
         let lowest = [
