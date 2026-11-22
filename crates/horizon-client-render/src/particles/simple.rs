@@ -2,7 +2,7 @@
 //! their own particle, the world and the sprite sets, which `ParticleEngine::tick_all` runs on several
 //! threads in a busy scene.
 use super::{Behaviour, Particle, ParticleEngine, ParticleLevel, Sprite, mod_curve};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The live particles it takes before `tick_all` uses more than one thread: a scoped thread costs
 /// tens of microseconds to start and join, and a simple particle about a tenth of one.
@@ -13,24 +13,31 @@ pub(super) fn parallel_threads() -> usize {
     (horizon_threads::worker_count() / 2).clamp(1, 4)
 }
 
-/// Persistent worker pools keyed by the requested lane count. The caller is
-/// one lane (via `in_place_scope`), so each pool owns only the helper lanes.
-/// The small set of lane counts also lets the stress benchmark compare
-/// different configurations in one process without silently reusing the
-/// first configuration's pool.
-fn particle_pool(lanes: usize) -> &'static rayon::ThreadPool {
+/// The persistent particle workers. The caller is one lane (via
+/// `in_place_scope`), so the pool owns only the helper lanes. A single cached
+/// pool avoids keeping several benchmark configurations alive at once; an
+/// in-flight tick holds an `Arc` while a changed configuration replaces it.
+fn particle_pool(lanes: usize) -> Arc<rayon::ThreadPool> {
     const MAX_HELPERS: usize = 64;
-    static POOLS: OnceLock<[OnceLock<rayon::ThreadPool>; MAX_HELPERS + 1]> = OnceLock::new();
+    static POOL: OnceLock<Mutex<Option<(usize, Arc<rayon::ThreadPool>)>>> = OnceLock::new();
 
     let helpers = lanes.saturating_sub(1).clamp(1, MAX_HELPERS);
-    let pools = POOLS.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
-    pools[helpers].get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
+    let mut current = POOL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if current
+        .as_ref()
+        .is_none_or(|(count, _)| *count != helpers)
+    {
+        let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(helpers)
             .thread_name(|i| format!("particle-tick-{i}"))
             .build()
-            .expect("particle tick worker pool")
-    })
+            .expect("particle tick worker pool");
+        *current = Some((helpers, Arc::new(pool)));
+    }
+    Arc::clone(&current.as_ref().expect("particle pool initialized").1)
 }
 pub(super) fn sprite_from_age_in(set_sprites: &[Vec<u32>], p: &mut Particle) {
     if p.removed {
@@ -155,7 +162,8 @@ impl ParticleEngine {
         let sets = &self.set_sprites;
         let per = particles.len().div_ceil(self.parallel_threads);
         let mut handled = vec![Simple::No; particles.len()];
-        particle_pool(self.parallel_threads).in_place_scope(|scope| {
+        let pool = particle_pool(self.parallel_threads);
+        pool.in_place_scope(|scope| {
             let run = |part: &mut [Particle], done: &mut [Simple], level: &ParticleLevel| {
                 for (p, done) in part.iter_mut().zip(done) {
                     *done = tick_simple(sets, p, level);
