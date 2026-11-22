@@ -2058,6 +2058,8 @@ pub struct Lod {
     kept: kept::KeptTiles,
     /// Kept tiles the plan wants again, not taken back yet (`bring_back`).
     returning: Vec<TileKey>,
+    /// Reused list of the coarsest returning tiles being brought back this update.
+    returning_now_scratch: Vec<TileKey>,
     /// When the plan last asked kept tiles back (`RETURN_SEAM_WAIT`).
     returned_at: std::time::Instant,
     /// `LodSource::keeps_observed`: tiles sampled without an observed chunk
@@ -2437,6 +2439,7 @@ impl Lod {
             saved_order: VecDeque::new(),
             kept: kept::KeptTiles::new(kept::KEPT_FOR, kept::KEPT_BYTES),
             returning: Vec::new(),
+            returning_now_scratch: Vec::new(),
             returned_at: std::time::Instant::now(),
             keeps_observed,
         }
@@ -3434,32 +3437,41 @@ impl Lod {
         {
             return;
         }
-        let (now, later): (Vec<_>, Vec<_>) =
-            self.returning.drain(..).partition(|key| key.level == level);
-        self.returning = later;
+        let mut now = std::mem::take(&mut self.returning_now_scratch);
+        now.clear();
+        self.returning.retain(|key| {
+            if key.level == level {
+                now.push(*key);
+                false
+            } else {
+                true
+            }
+        });
         // Tiles forgotten meanwhile (`refresh`) are sampled: the queue skipped them.
         self.wanted_stale = true;
-        let mut returned = Vec::new();
-        for key in now {
-            if self.ready.contains_key(&key) || self.pending.contains(&key) {
-                continue;
+        now.retain(|key| {
+            if self.ready.contains_key(key) || self.pending.contains(key) {
+                return false;
             }
-            if let Some((columns, mask)) = self.kept.take(&key) {
-                self.ready.insert(key, columns);
-                self.sync_sample(key);
-                if let Some(mask) = mask {
-                    self.detail_masks.insert(key, mask);
-                }
-                returned.push(key);
+            let Some((columns, mask)) = self.kept.take(key) else {
+                return false;
+            };
+            self.ready.insert(*key, columns);
+            self.sync_sample(*key);
+            if let Some(mask) = mask {
+                self.detail_masks.insert(*key, mask);
             }
-        }
-        if returned.is_empty() {
+            true
+        });
+        if now.is_empty() {
+            self.returning_now_scratch = now;
             return;
         }
         self.rebuild_selection();
-        for key in returned {
+        for &key in &now {
             self.refresh_path(key);
         }
+        self.returning_now_scratch = now;
     }
     /// Recomputes every active tile after a plan change, then marks only the
     /// tiles whose selection changed (plus their neighbours).
