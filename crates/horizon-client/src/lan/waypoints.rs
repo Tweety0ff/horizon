@@ -812,7 +812,8 @@ impl Waypoints {
         if !self.waypoints.contains(&source) {
             self.waypoints.push(source);
         }
-        for receiver in self.players.clone() {
+        for index in 0..self.players.len() {
+            let receiver = self.players[index];
             self.create_connection(t, receiver, source);
         }
     }
@@ -829,7 +830,8 @@ impl Waypoints {
     /// `untrackWaypoint`.
     fn untrack(&mut self, t: &mut Tick, source: u128) {
         self.epoch += 1;
-        for receiver in self.players.clone() {
+        for index in 0..self.players.len() {
+            let receiver = self.players[index];
             if self.take(receiver, source).is_some() {
                 t.disconnect(receiver, source);
             }
@@ -842,7 +844,8 @@ impl Waypoints {
         if !self.players.contains(&player) {
             self.players.push(player);
         }
-        for source in self.waypoints.clone() {
+        for index in 0..self.waypoints.len() {
+            let source = self.waypoints[index];
             self.create_connection(t, player, source);
         }
         if transmitting {
@@ -873,7 +876,8 @@ impl Waypoints {
     /// `breakAllConnections`.
     fn break_all(&mut self, t: &mut Tick) {
         self.epoch += 1;
-        for receiver in self.players.clone() {
+        for index in 0..self.players.len() {
+            let receiver = self.players[index];
             for source in self
                 .connections
                 .remove(&receiver)
@@ -987,7 +991,8 @@ impl Waypoints {
             }
         }
         if was == Some(false) && locator_bar {
-            for player in self.players.clone() {
+            for index in 0..self.players.len() {
+                let player = self.players[index];
                 self.update_player(&mut t, player);
             }
         }
@@ -1039,7 +1044,8 @@ impl Waypoints {
             // ServerScoreboard: a team joined, left or recoloured remakes the connections.
             if p.team != self.memo[&p.uuid].team {
                 self.memo.get_mut(&p.uuid).unwrap().team = p.team.clone();
-                for receiver in self.players.clone() {
+                for index in 0..self.players.len() {
+                    let receiver = self.players[index];
                     self.create_connection(&mut t, receiver, p.uuid);
                 }
             }
