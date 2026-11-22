@@ -1176,7 +1176,7 @@ impl Waypoints {
         let (sources, slot, move_of, own) = (&sources, &slot, &move_of, &own);
         let (changed_moves, changed_slots) = (&changed_moves, &changed_slots);
         let (all_moves, all_slots) = (&all_moves, &all_slots);
-        horizon_threads::par_chunks_mut(&mut jobs, 8, |jobs| {
+        crate::parallel::par_chunks_mut(&mut jobs, 8, |jobs| {
             for job in jobs {
                 let me = s.players.get(&job.receiver).map(|&p| Receiver {
                     conn: p.conn,
