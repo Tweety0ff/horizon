@@ -396,6 +396,19 @@ impl MeshPool {
 /// chunks; measuring and sorting them all every tick took a fifth of its tick.
 fn decoration_queue(
     order: &mut DecorationOrder,
+    wanted: impl Iterator<Item = (i32, i32)>,
+    distance: impl Fn(i32, i32) -> i64,
+) -> std::collections::BinaryHeap<std::cmp::Reverse<(u64, i32, i32)>> {
+    decoration_queue_with_scratch(
+        order,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        wanted,
+        distance,
+    )
+}
+fn decoration_queue_with_scratch(
+    order: &mut DecorationOrder,
     ranked: &mut Vec<std::cmp::Reverse<(u64, i32, i32)>>,
     fresh: &mut Vec<(i64, i32, i32)>,
     wanted: impl Iterator<Item = (i32, i32)>,
@@ -2242,7 +2255,7 @@ impl Streaming {
                     forced_cover: self.forced_cover.as_ref().filter(|_| self.cover_current),
                     band: self.band.as_ref(),
                 };
-                decoration_queue(
+                decoration_queue_with_scratch(
                     &mut order,
                     &mut ranked,
                     &mut fresh,
