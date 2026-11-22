@@ -548,17 +548,15 @@ fn mesh_columns_with_edges<L: Look>(
 ) -> SectionMesh {
     assert_eq!(columns.len(), CELLS * CELLS);
     // The heightmap columns are built here and borrowed like the tile's own.
-    let heightmap_columns: Vec<Spans>;
+    let heightmap_columns: [Spans; CELLS * CELLS];
     let heightmap_refs: [&[Span]; CELLS * CELLS];
     let heightmap_edges: [smallvec::SmallVec<[Spans; 4]>; 4];
     let heightmap_neighbors: [EdgeColumns<'_>; 4];
     let (columns, neighbors) = if key.level >= HEIGHTMAP_LEVEL {
         let [ox, _, oz] = key.origin();
         let mut fluid = |span: &Span| material(span, Direction::Up, [ox, oz]).fluid != 0;
-        heightmap_columns = columns
-            .iter()
-            .map(|column| heightmap(column, &mut fluid))
-            .collect();
+        heightmap_columns =
+            std::array::from_fn(|index| heightmap(columns[index], &mut fluid));
         heightmap_edges = neighbors.each_ref().map(|side| {
             side.iter()
                 .map(|edge| heightmap(edge.spans, &mut fluid))
