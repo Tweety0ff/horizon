@@ -1152,6 +1152,8 @@ pub struct ParticleEngine {
     /// How many live particles it takes to tick them on several threads (`tick_all`), and how many threads.
     parallel_min: usize,
     parallel_threads: usize,
+    /// Scratch results for independent particle ticks; kept across frames.
+    simple_handled: Vec<simple::Simple>,
     /// Resource packs' Polytone custom particle types (#11486).
     polytone: Option<std::sync::Arc<polytone::Registry>>,
     /// Vanilla particle types a pack replaces with a custom one of the same id
@@ -1379,6 +1381,7 @@ impl ParticleEngine {
             parallel_min: PARALLEL_MIN,
             live_limit: None,
             parallel_threads: parallel_threads(),
+            simple_handled: Vec::new(),
             polytone: None,
             polytone_overrides: FxHashMap::default(),
             polytone_gpu: Vec::new(),
