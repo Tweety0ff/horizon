@@ -420,8 +420,12 @@ pub fn par_map_on<T: Sync, R: Send>(
     let size = items.len().div_ceil(lanes.saturating_mul(4).max(1));
     let count = items.len().div_ceil(size);
     let next = AtomicUsize::new(0);
-    let slots: Vec<Mutex<Vec<R>>> = (0..count).map(|_| Mutex::new(Vec::new())).collect();
+    // Each lane accumulates its own completed parts and publishes them once:
+    // no mutex is needed for every small chunk of tick work.
+    let completed = Mutex::new(Vec::with_capacity(count));
+    let active_lanes = lanes.min(count);
     let work = || {
+        let mut local = Vec::with_capacity(count.div_ceil(active_lanes));
         loop {
             let k = next.fetch_add(1, Ordering::Relaxed);
             if k >= count {
@@ -430,20 +434,28 @@ pub fn par_map_on<T: Sync, R: Send>(
             let part = &items[k * size..((k + 1) * size).min(items.len())];
             let mut done = Vec::with_capacity(part.len());
             f(part, &mut done);
-            *slots[k].lock().unwrap_or_else(PoisonError::into_inner) = done;
+            local.push((k, done));
         }
+        completed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(local);
     };
     // Keep the requested lane cap: other users of the persistent pool may
-    // need the remaining helpers for foreground work.
+    // need the remaining helpers for foreground work. Don't start idle lanes.
     pool().in_place_scope(|s| {
-        for _ in 1..lanes {
+        for _ in 1..active_lanes {
             s.spawn(|_| work());
         }
         work();
     });
+    let mut completed = completed
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    completed.sort_unstable_by_key(|(index, _)| *index);
     let mut out = Vec::with_capacity(items.len());
-    for slot in slots {
-        out.extend(slot.into_inner().unwrap_or_else(PoisonError::into_inner));
+    for (_, part) in completed {
+        out.extend(part);
     }
     out
 }
@@ -521,6 +533,25 @@ mod tests {
             f(&items, &mut serial);
             assert_eq!(par_map_on(&items, 1, 4, f), serial, "{n} items");
         }
+    }
+
+    /// A caller's lane budget also caps concurrently running parts, even though
+    /// the persistent Rayon pool may have more helpers available.
+    #[test]
+    fn parallel_map_respects_the_lane_limit() {
+        use std::time::Duration;
+
+        let active = AtomicUsize::new(0);
+        let maximum = AtomicUsize::new(0);
+        let items: Vec<usize> = (0..256).collect();
+        par_map_on(&items, 1, 2, |part, out| {
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1));
+            out.extend(part);
+            active.fetch_sub(1, Ordering::SeqCst);
+        });
+        assert!(maximum.load(Ordering::SeqCst) <= 2);
     }
 
     /// Every chunk is handled once, whole, and its items changed in place, for item counts that
