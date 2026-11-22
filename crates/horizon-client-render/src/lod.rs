@@ -1712,7 +1712,7 @@ struct MeshInput {
     /// The tile's samples, with `overrides` replacing some of them.
     base: Arc<TileColumns>,
     overrides: [Option<ColumnSource>; CELLS * CELLS],
-    neighbors: [Vec<EdgeSource>; 4],
+    neighbors: [smallvec::SmallVec<[EdgeSource; 4]>; 4],
     finer: Vec<TileKey>,
 }
 struct ReducedColumns {
@@ -1737,7 +1737,7 @@ impl MeshInput {
             None => self.base.spans(index),
         })
     }
-    fn edges(&self) -> [Vec<mesh::EdgeColumn<'_>>; 4] {
+    fn edges(&self) -> [mesh::EdgeColumns<'_>; 4] {
         std::array::from_fn(|side| {
             self.neighbors[side]
                 .iter()
@@ -4075,7 +4075,7 @@ impl Snapshot {
             self.visited_source(ox + x as i32 * stride, oz + z as i32 * stride, stride)
         });
         let neighbors = std::array::from_fn(|direction| {
-            let mut edge = Vec::new();
+            let mut edge = smallvec::SmallVec::new();
             let mut offset = 0;
             while offset < key.size() {
                 let (wx, wz) = match direction {
