@@ -336,9 +336,9 @@ pub fn par_chunks_mut_with_state<T: Send, S: Send>(
 }
 
 /// Total tick lanes, including the server thread: one fewer than the available performance
-/// cores, capped at eight, so one performance core remains for the render thread. A single
-/// fewer than three performance cores stay serial; efficiency cores do not become stragglers in
-/// a foreground tick.
+/// cores, capped at eight, so one performance core remains for the render thread. Fewer
+/// than three performance cores stay serial; efficiency cores do not become stragglers in a
+/// foreground tick.
 fn tick_lanes(cores: usize) -> usize {
     cores.saturating_sub(1).clamp(1, 8)
 }
