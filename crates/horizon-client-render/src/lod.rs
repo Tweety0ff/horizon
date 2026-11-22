@@ -2046,6 +2046,10 @@ pub struct Lod {
     cutout_pending: Option<FxHashSet<(i32, i32)>>,
     /// Active tiles whose mesh must be accepted before the cutout publishes.
     cutout_waiting: FxHashSet<TileKey>,
+    /// Reusable tile-key lists used only when the selection is rebuilt.
+    selection_keys_scratch: Vec<TileKey>,
+    selection_inactive_scratch: Vec<TileKey>,
+    selection_changed_scratch: Vec<TileKey>,
     /// Unsample final tiles, nearest first. Rebuilt when the view changes,
     /// not scanned every frame.
     wanted: std::collections::BinaryHeap<std::cmp::Reverse<Wanted>>,
@@ -2431,6 +2435,9 @@ impl Lod {
             cutout: None,
             cutout_pending: None,
             cutout_waiting: FxHashSet::default(),
+            selection_keys_scratch: Vec::new(),
+            selection_inactive_scratch: Vec::new(),
+            selection_changed_scratch: Vec::new(),
             wanted: std::collections::BinaryHeap::new(),
             wanted_at: None,
             wanted_stale: true,
@@ -3481,38 +3488,45 @@ impl Lod {
         self.complete.clear();
         // The plan indexes nodes by level, children before parents. Plans
         // built by tests may not; sort those once.
-        let keys: Vec<TileKey> = if self.plan.by_level.iter().any(|level| !level.is_empty()) {
-            self.plan.by_level.iter().flatten().copied().collect()
+        let mut keys = std::mem::take(&mut self.selection_keys_scratch);
+        keys.clear();
+        if self.plan.by_level.iter().any(|level| !level.is_empty()) {
+            keys.extend(self.plan.by_level.iter().flatten().copied());
         } else {
-            let mut keys: Vec<_> = self.plan.nodes.iter().copied().collect();
+            keys.extend(self.plan.nodes.iter().copied());
             keys.sort_unstable_by_key(|key| (key.level, key.x, key.z));
-            keys
-        };
-        for key in keys {
+        }
+        for &key in &keys {
             let (complete, active) = self.evaluate(key);
             self.complete.insert(key, complete);
             if active {
                 self.active.insert(key);
             }
         }
+        self.selection_keys_scratch = keys;
         self.mesh_version.retain(|key, _| self.active.contains(key));
         self.shown_version
             .retain(|key, _| self.active.contains(key));
         self.dirty.retain(|key, _| self.active.contains(key));
         self.meshed.retain(|key| self.active.contains(key));
         self.unmeshed.retain(|key| self.active.contains(key));
-        let inactive_waiting: Vec<_> = self
-            .cutout_waiting
-            .iter()
-            .copied()
-            .filter(|key| !self.active.contains(key))
-            .collect();
-        for key in inactive_waiting {
+        let mut inactive_waiting = std::mem::take(&mut self.selection_inactive_scratch);
+        inactive_waiting.clear();
+        inactive_waiting.extend(
+            self.cutout_waiting
+                .iter()
+                .copied()
+                .filter(|key| !self.active.contains(key)),
+        );
+        for key in inactive_waiting.drain(..) {
             self.transfer_cutout_wait(key);
         }
+        self.selection_inactive_scratch = inactive_waiting;
         self.removed_pending
             .retain(|key| !self.active.contains(key));
-        let changed: Vec<_> = old.symmetric_difference(&self.active).copied().collect();
+        let mut changed = std::mem::take(&mut self.selection_changed_scratch);
+        changed.clear();
+        changed.extend(old.symmetric_difference(&self.active).copied());
         for &key in &changed {
             self.sync_sample(key);
             if old.contains(&key) && !self.active.contains(&key) {
@@ -3523,6 +3537,7 @@ impl Lod {
             }
             self.mark_selection_changed(key);
         }
+        self.selection_changed_scratch = changed;
         self.wanted_stale = true;
     }
     fn receive(&mut self, meshes: &mut Vec<(TileKey, SectionMesh)>) {
