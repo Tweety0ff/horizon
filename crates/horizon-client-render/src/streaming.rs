@@ -678,6 +678,8 @@ pub struct Streaming {
     mesh_columns_scratch: Vec<((i32, i32), SectionMask)>,
     /// The next bounded chunk-generation batch, reused as queue capacity opens.
     generation_batch_scratch: Vec<(i64, i32, i32)>,
+    /// Block positions used by incremental relighting and replay.
+    light_positions_scratch: Vec<(i32, i32, i32)>,
     sequence: u64,
     pub center: (i32, i32),
     /// The view distance around `center`; below 0, no area there (a dedicated
@@ -1342,6 +1344,7 @@ impl Streaming {
             mesh_candidates_scratch: Vec::new(),
             mesh_columns_scratch: Vec::new(),
             generation_batch_scratch: Vec::new(),
+            light_positions_scratch: Vec::new(),
             sequence: 0,
             center: (0, 0),
             radius: 8,
@@ -2549,39 +2552,41 @@ impl Streaming {
             return;
         }
         let edits = std::mem::take(&mut world.light_edits);
-        let positions: Vec<(i32, i32, i32)> = edits
-            .iter()
-            .filter(|(_, old, new)| self.light_tables.differs(*old, *new))
-            .map(|(p, _, _)| *p)
-            .collect();
-        if positions.is_empty() {
-            return;
-        }
-        let positions = if positions.len() > INLINE_RELIGHT_MAX {
-            self.relight_on_workers(world, positions)
-        } else {
-            positions
-        };
-        if positions.is_empty() {
-            return;
-        }
-        let mut changed = LightChanges::default();
-        crate::light::relight(
-            &mut world.chunks,
-            &self.light_tables,
-            self.sky_light,
-            &positions,
-            false,
-            &mut changed,
+        let mut positions = std::mem::take(&mut self.light_positions_scratch);
+        positions.clear();
+        positions.extend(
+            edits
+                .iter()
+                .filter(|(_, old, new)| self.light_tables.differs(*old, *new))
+                .map(|(p, _, _)| *p),
         );
-        Self::mark_light_changes(world, &changed);
-        Self::relight_beside_unlit(world, &changed);
-        if !self.light_snapshots.is_empty() {
-            for p in positions {
-                self.light_edit_sequence += 1;
-                self.light_log.push((self.light_edit_sequence, p));
+        if positions.is_empty() {
+            self.light_positions_scratch = positions;
+            return;
+        }
+        if positions.len() > INLINE_RELIGHT_MAX {
+            self.relight_on_workers(world, &mut positions);
+        }
+        if !positions.is_empty() {
+            let mut changed = LightChanges::default();
+            crate::light::relight(
+                &mut world.chunks,
+                &self.light_tables,
+                self.sky_light,
+                &positions,
+                false,
+                &mut changed,
+            );
+            Self::mark_light_changes(world, &changed);
+            Self::relight_beside_unlit(world, &changed);
+            if !self.light_snapshots.is_empty() {
+                for &p in &positions {
+                    self.light_edit_sequence += 1;
+                    self.light_log.push((self.light_edit_sequence, p));
+                }
             }
         }
+        self.light_positions_scratch = positions;
     }
     /// Hands a big batch of edits (a `/fill` arriving block by block) to the
     /// workers: the columns they touch and their neighbours get full light
@@ -2594,25 +2599,28 @@ impl Streaming {
     fn relight_on_workers(
         &self,
         world: &mut World,
-        positions: Vec<(i32, i32, i32)>,
-    ) -> Vec<(i32, i32, i32)> {
-        let (columns, inline) = whole_relight_columns(positions, |x, z| {
+        positions: &mut Vec<(i32, i32, i32)>,
+    ) {
+        let columns = whole_relight_columns_in_place(positions, |x, z| {
             self.lit.contains(&(x, z)) && self.light_region_ready(world, x, z)
         });
         world.dirty_light.extend(columns);
-        inline
     }
     /// A light job computed from blocks older than some edits: redo those
     /// edits on top of its result.
     fn replay_light_edits(&mut self, world: &mut World, x: i32, z: i32, snapshot: u64) {
-        let positions: Vec<(i32, i32, i32)> = self
-            .light_log
-            .iter()
-            .filter(|(seq, p)| {
-                *seq > snapshot && ((p.0 >> 4) - x).abs() <= 1 && ((p.2 >> 4) - z).abs() <= 1
-            })
-            .map(|(_, p)| *p)
-            .collect();
+        let mut positions = std::mem::take(&mut self.light_positions_scratch);
+        positions.clear();
+        positions.extend(
+            self.light_log
+                .iter()
+                .filter(|(seq, p)| {
+                    *seq > snapshot
+                        && ((p.0 >> 4) - x).abs() <= 1
+                        && ((p.2 >> 4) - z).abs() <= 1
+                })
+                .map(|(_, p)| *p),
+        );
         if !positions.is_empty() {
             let mut changed = LightChanges::default();
             crate::light::relight(
@@ -2626,6 +2634,7 @@ impl Streaming {
             Self::mark_light_changes(world, &changed);
             Self::relight_beside_unlit(world, &changed);
         }
+        self.light_positions_scratch = positions;
         let oldest = self.light_snapshots.values().copied().min();
         match oldest {
             Some(oldest) => self.light_log.retain(|(seq, _)| *seq > oldest),
@@ -3702,10 +3711,10 @@ const INLINE_RELIGHT_MAX: usize = 4096;
 /// edits to relight in place. An edited column is lit whole with its
 /// neighbours (light reaches 15 blocks, never past the next column) when all
 /// nine are `ready` to be lit whole; otherwise its edits stay in place.
-fn whole_relight_columns(
-    positions: Vec<(i32, i32, i32)>,
+fn whole_relight_columns_in_place(
+    positions: &mut Vec<(i32, i32, i32)>,
     ready: impl Fn(i32, i32) -> bool,
-) -> (FxHashSet<(i32, i32)>, Vec<(i32, i32, i32)>) {
+) -> FxHashSet<(i32, i32)> {
     let around =
         |(x, z): (i32, i32)| (-1..=1).flat_map(move |dz| (-1..=1).map(move |dx| (x + dx, z + dz)));
     let touched: FxHashSet<(i32, i32)> = positions
@@ -3717,11 +3726,15 @@ fn whole_relight_columns(
         .filter(|&column| around(column).all(|(x, z)| ready(x, z)))
         .collect();
     let columns = whole.iter().flat_map(|&column| around(column)).collect();
-    let inline = positions
-        .into_iter()
-        .filter(|&(x, _, z)| !whole.contains(&(x >> 4, z >> 4)))
-        .collect();
-    (columns, inline)
+    positions.retain(|&(x, _, z)| !whole.contains(&(x >> 4, z >> 4)));
+    columns
+}
+fn whole_relight_columns(
+    mut positions: Vec<(i32, i32, i32)>,
+    ready: impl Fn(i32, i32) -> bool,
+) -> (FxHashSet<(i32, i32)>, Vec<(i32, i32, i32)>) {
+    let columns = whole_relight_columns_in_place(&mut positions, ready);
+    (columns, positions)
 }
 
 /// Drops the pending sections (`meshing`, `compile_started`, `waiting`) of
