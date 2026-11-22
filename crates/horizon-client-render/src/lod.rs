@@ -1713,7 +1713,7 @@ struct MeshInput {
     base: Arc<TileColumns>,
     overrides: [Option<ColumnSource>; CELLS * CELLS],
     neighbors: [smallvec::SmallVec<[EdgeSource; 4]>; 4],
-    finer: Vec<TileKey>,
+    finer: smallvec::SmallVec<[TileKey; 4]>,
 }
 struct ReducedColumns {
     columns: Arc<TileColumns>,
@@ -1861,7 +1861,7 @@ struct MeshJob {
     snapshot: Arc<Snapshot>,
     key: TileKey,
     version: u64,
-    finer: Vec<TileKey>,
+    finer: smallvec::SmallVec<[TileKey; 4]>,
     covered: Arc<FxHashSet<(i32, i32)>>,
     bounds: Option<[i32; 4]>,
     canceled: Arc<AtomicBool>,
@@ -3706,7 +3706,7 @@ impl Lod {
         if key.level == 0 {
             return;
         }
-        let mut descendants = Vec::new();
+        let mut descendants = smallvec::SmallVec::<[TileKey; 4]>::new();
         self.collect_active_descendants(key, &mut descendants);
         self.cutout_waiting.extend(
             descendants
@@ -3862,15 +3862,19 @@ impl Lod {
             "mesh samples keep tiles no longer active or ready"
         );
     }
-    fn finer_of(&self, key: TileKey) -> Vec<TileKey> {
+    fn finer_of(&self, key: TileKey) -> smallvec::SmallVec<[TileKey; 4]> {
         if !self.plan.split.contains(&key) {
-            return Vec::new();
+            return smallvec::SmallVec::new();
         }
-        let mut finer = Vec::new();
+        let mut finer = smallvec::SmallVec::new();
         self.collect_active_descendants(key, &mut finer);
         finer
     }
-    fn collect_active_descendants(&self, key: TileKey, out: &mut Vec<TileKey>) {
+    fn collect_active_descendants(
+        &self,
+        key: TileKey,
+        out: &mut smallvec::SmallVec<[TileKey; 4]>,
+    ) {
         for child in key.children() {
             if !self.plan.nodes.contains(&child) {
                 continue;
@@ -4079,7 +4083,11 @@ impl Snapshot {
             .find(|key| self.nodes.contains(key))
             .is_some_and(|key| !self.split.contains(&key))
     }
-    fn mesh_input(&self, key: TileKey, finer: Vec<TileKey>) -> MeshInput {
+    fn mesh_input(
+        &self,
+        key: TileKey,
+        finer: smallvec::SmallVec<[TileKey; 4]>,
+    ) -> MeshInput {
         let stride = key.size() / CELLS as i32;
         let [ox, _, oz] = key.origin();
         let base = self
@@ -5908,7 +5916,7 @@ mod tests {
         lod.finish_sample(a, vec![Column::default(); CELLS * CELLS]);
         assert!(lod.active.contains(&a));
         let sides = |lod: &Lod| {
-            let input = lod.snapshot().mesh_input(a, Vec::new());
+            let input = lod.snapshot().mesh_input(a, smallvec::SmallVec::new());
             [0, 1].map(|side| {
                 input.neighbors[side]
                     .iter()
@@ -5984,6 +5992,42 @@ mod tests {
 
         assert_eq!(previous.get(&key).unwrap().spans(0)[0].max, 70);
         assert_eq!(lod.mesh_samples.get(&key).unwrap().spans(0)[0].max, 80);
+    }
+
+    #[test]
+    fn finer_tile_lists_inline_four_children_and_spill_for_deeper_cuts() {
+        let mut lod = Lod::scheduler_for_test();
+        let root = TileKey {
+            x: 0,
+            z: 0,
+            level: 2,
+        };
+        lod.plan.nodes.insert(root);
+        lod.plan.split.insert(root);
+        for child in root.children() {
+            lod.plan.nodes.insert(child);
+            lod.plan.split.insert(child);
+            for grandchild in child.children() {
+                lod.plan.nodes.insert(grandchild);
+                lod.active.insert(grandchild);
+            }
+        }
+        let finer = lod.finer_of(root);
+        assert_eq!(finer.len(), 16);
+        assert!(finer.spilled(), "deeper cuts must spill beyond inline storage");
+
+        let parent = TileKey {
+            x: 0,
+            z: 0,
+            level: 1,
+        };
+        let mut shallow = Lod::scheduler_for_test();
+        shallow.plan.nodes.insert(parent);
+        shallow.plan.split.insert(parent);
+        shallow.active.extend(parent.children());
+        let finer = shallow.finer_of(parent);
+        assert_eq!(finer.len(), 4);
+        assert!(!finer.spilled(), "four children fit in the inline buffer");
     }
 
     #[test]
