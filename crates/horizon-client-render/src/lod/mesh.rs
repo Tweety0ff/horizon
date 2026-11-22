@@ -1043,8 +1043,10 @@ fn fill_buried_gaps<'a>(
             .find(|span| span.min < span.max)
             .map_or(i16::MIN, |span| span.max)
     };
-    // Each column's gaps: the index of the span above, the gap's bottom and top.
-    let gaps_of = |spans: &[Span]| -> Vec<(usize, i16, i16)> {
+    // Most columns have at most four gaps. Keep their descriptors inline;
+    // highly fragmented columns still spill without truncating the geometry.
+    type Gaps = smallvec::SmallVec<[(usize, i16, i16); 4]>;
+    let gaps_of = |spans: &[Span]| -> Gaps {
         spans
             .windows(2)
             .enumerate()
@@ -1061,12 +1063,12 @@ fn fill_buried_gaps<'a>(
             i16::MIN
         }
     });
-    let gaps: Vec<Vec<(usize, i16, i16)>> = (0..CELLS * CELLS)
+    let gaps: Vec<Gaps> = (0..CELLS * CELLS)
         .map(|i| {
             if whole(i % CELLS, i / CELLS) {
                 gaps_of(columns[i])
             } else {
-                Vec::new()
+                Gaps::new()
             }
         })
         .collect();
@@ -1102,7 +1104,10 @@ fn fill_buried_gaps<'a>(
         .into_iter()
         .flatten()
     };
-    let mut open: Vec<Vec<bool>> = gaps.iter().map(|g| vec![false; g.len()]).collect();
+    let mut open: Vec<smallvec::SmallVec<[bool; 4]>> = gaps
+        .iter()
+        .map(|g| smallvec::smallvec![false; g.len()])
+        .collect();
     let mut reached = Vec::new();
     for i in 0..CELLS * CELLS {
         let (x, z) = (i % CELLS, i / CELLS);
