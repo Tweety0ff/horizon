@@ -266,7 +266,12 @@ fn performance_cores() -> Option<usize> {
     None
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+#[cfg(windows)]
+fn performance_cores() -> Option<usize> {
+    server_core::performance_cores()
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", windows)))]
 fn performance_cores() -> Option<usize> {
     None
 }
