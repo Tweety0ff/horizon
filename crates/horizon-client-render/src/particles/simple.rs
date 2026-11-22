@@ -7,10 +7,27 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// The live particles it takes before `tick_all` uses more than one thread: a scoped thread costs
 /// tens of microseconds to start and join, and a simple particle about a tenth of one.
 pub(super) const PARALLEL_MIN: usize = 2048;
-/// Threads for ticking particles: half the machine's workers, at most four (the chunk workers and
-/// the render thread need cores too); `HORIZON_WORKER_THREADS` caps them as it does every pool.
+/// Lanes for ticking particles, including the calling/render thread. Keep two CPU threads
+/// available for the integrated server and foreground work; on 8+ CPUs use the six-lane
+/// configuration covered by the particle stress benchmark. The worker override caps this too.
 pub(super) fn parallel_threads() -> usize {
-    (horizon_threads::worker_count() / 2).clamp(1, 4)
+    parallel_lanes(horizon_threads::worker_count())
+}
+
+fn parallel_lanes(cpus: usize) -> usize {
+    cpus.saturating_sub(2).clamp(1, 6)
+}
+
+#[cfg(test)]
+mod parallel_sizing_tests {
+    use super::parallel_lanes;
+
+    #[test]
+    fn particle_lanes_leave_two_cpus_for_foreground_work() {
+        for (cpus, lanes) in [(1, 1), (2, 1), (3, 1), (4, 2), (6, 4), (8, 6), (12, 6), (32, 6)] {
+            assert_eq!(parallel_lanes(cpus), lanes, "{cpus} CPUs");
+        }
+    }
 }
 
 /// The persistent particle workers. The caller is one lane (via
