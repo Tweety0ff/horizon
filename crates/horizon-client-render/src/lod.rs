@@ -2029,6 +2029,11 @@ pub struct Lod {
     removed: Vec<TileKey>,
     /// The columns left out: `full` and `retiring`.
     covered: FxHashSet<(i32, i32)>,
+    /// Reusable next-set and delta lists for coverage changes.
+    covered_scratch: FxHashSet<(i32, i32)>,
+    covered_added_scratch: Vec<(i32, i32)>,
+    covered_changes_scratch: Vec<(i32, i32)>,
+    covered_standins_scratch: Vec<TileKey>,
     covered_bounds: Option<[i32; 4]>,
     /// The full-detail columns `update` was last given.
     full: FxHashSet<(i32, i32)>,
@@ -2434,6 +2439,10 @@ impl Lod {
             restale: FxHashSet::default(),
             removed: Vec::new(),
             covered: FxHashSet::default(),
+            covered_scratch: FxHashSet::default(),
+            covered_added_scratch: Vec::new(),
+            covered_changes_scratch: Vec::new(),
+            covered_standins_scratch: Vec::new(),
             covered_bounds: None,
             full: FxHashSet::default(),
             retiring: FxHashSet::default(),
@@ -3691,17 +3700,21 @@ impl Lod {
         }
     }
     fn leave_out(&mut self) {
-        let covered: FxHashSet<_> = self.full.union(&self.retiring).copied().collect();
+        let mut covered = std::mem::take(&mut self.covered_scratch);
+        covered.clear();
+        covered.extend(self.full.union(&self.retiring).copied());
         if self.covered == covered {
+            self.covered_scratch = covered;
             return;
         }
-        let added: Vec<_> = covered.difference(&self.covered).copied().collect();
-        let changes: Vec<_> = self
-            .covered
-            .symmetric_difference(&covered)
-            .copied()
-            .collect();
-        self.covered = covered;
+        let mut added = std::mem::take(&mut self.covered_added_scratch);
+        added.clear();
+        added.extend(covered.difference(&self.covered).copied());
+        let mut changes = std::mem::take(&mut self.covered_changes_scratch);
+        changes.clear();
+        changes.extend(self.covered.symmetric_difference(&covered).copied());
+        let old_covered = std::mem::replace(&mut self.covered, covered);
+        self.covered_scratch = old_covered;
         self.covered_bounds = self.covered.iter().fold(None, |bounds, &(x, z)| {
             Some(match bounds {
                 None => [x * 16, z * 16, (x + 1) * 16, (z + 1) * 16],
@@ -3716,7 +3729,8 @@ impl Lod {
         for &(x, z) in &changes {
             self.invalidate_chunk(x, z);
         }
-        let mut standins = Vec::new();
+        let mut standins = std::mem::take(&mut self.covered_standins_scratch);
+        standins.clear();
         let mut empty_standin: Option<Arc<TileColumns>> = None;
         for &(x, z) in &added {
             let key = TileKey { x, z, level: 0 };
@@ -3726,12 +3740,15 @@ impl Lod {
                 standins.push(key);
             }
         }
-        for key in standins {
+        for &key in &standins {
             self.refresh_path(key);
         }
+        self.covered_standins_scratch = standins;
         for &(x, z) in &changes {
             self.refresh_path(TileKey { x, z, level: 0 });
         }
+        self.covered_added_scratch = added;
+        self.covered_changes_scratch = changes;
         self.cutout_pending = Some(self.covered.clone());
         // Every active tile whose mesh clips an old/new covered column is
         // dirty now; the cutout waits for their replacement meshes, not for
