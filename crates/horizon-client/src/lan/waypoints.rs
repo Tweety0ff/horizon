@@ -1444,6 +1444,8 @@ mod tests {
         job_capacities.sort_unstable();
         assert_eq!(job_capacities.len(), 2);
         assert!(job_capacities.iter().all(|&capacity| capacity >= 64));
+        let job_list_capacity = waypoints.jobs_scratch.capacity();
+        assert!(job_list_capacity >= 2);
         players[1].position[0] += 1.0;
         waypoints.tick_with(&players, &[], &[], true, 0);
         assert_eq!(
@@ -1465,6 +1467,10 @@ mod tests {
         assert_eq!(
             next_job_capacities, job_capacities,
             "receiver packet buffers retain their capacities across ticks"
+        );
+        assert!(
+            waypoints.jobs_scratch.capacity() >= job_list_capacity,
+            "the receiver job vector itself is reused"
         );
     }
 
