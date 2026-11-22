@@ -174,7 +174,8 @@ mod par_chunks_tests {
 
 /// The chunk worker pool's automatic size (`jobs::default_threads`, Graphics > Worker
 /// threads on Auto): every core but one, as vanilla's `Util.maxAllowedExecutorThreads`,
-/// counting on Apple silicon only its performance cores. Its efficiency cores are slower,
+/// counting only performance cores on Apple silicon and hybrid Linux CPUs where detected.
+/// Its efficiency cores are slower,
 /// and workers there kept the render and server threads waiting for a performance core: on
 /// a base M4 (4 performance and 6 efficiency cores) a fast flight's p99 frame went from
 /// 20 ms with 9 workers to 7 ms with 3 (#11294).
@@ -191,15 +192,15 @@ pub fn usable_cores() -> usize {
     *USABLE.get_or_init(|| usable_cores_for(worker_count(), performance_cores))
 }
 
-/// [`usable_cores`] for `cores` cores, of which `performance` (asked only here, the
-/// sysctl) are performance cores where the machine tells them apart (`None` elsewhere).
+/// [`usable_cores`] for `cores` cores, of which `performance` (asked only here by the
+/// platform probe) are performance cores where the machine tells them apart (`None` elsewhere).
 fn usable_cores_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usize {
     let fast = performance().filter(|&n| n > 0).unwrap_or(cores);
     cores.min(fast)
 }
 
-/// [`default_workers`] for `cores` cores, of which `performance` (asked only here, the
-/// sysctl) are performance cores where the machine tells them apart (`None` elsewhere):
+/// [`default_workers`] for `cores` cores, of which `performance` (asked only here by the
+/// platform probe) are performance cores where the machine tells them apart (`None` elsewhere):
 /// one less than the smaller count, at least 1.
 fn workers_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usize {
     usable_cores_for(cores, performance)
