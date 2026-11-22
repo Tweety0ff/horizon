@@ -338,6 +338,8 @@ pub struct Waypoints {
     view_scratch: HashMap<u128, View>,
     updates_scratch: HashMap<u128, OnceLock<Option<Arc<Encoded>>>>,
     own_scratch: HashMap<u128, u32>,
+    #[cfg(test)]
+    force_dense_for_test: bool,
     /// Which generation of the waypoints the rows' `watch` lists belong to: the transmitters, their
     /// numbers and the receivers change it.
     epoch: u64,
@@ -1167,7 +1169,9 @@ impl Waypoints {
         // number; where each receiver's own move is.
         let sparse = sparse && sources.iter().all(Option::is_some);
         #[cfg(test)]
-        let sparse = sparse && !tests::NO_SPARSE.load(std::sync::atomic::Ordering::Relaxed);
+        let sparse = sparse
+            && !self.force_dense_for_test
+            && !tests::NO_SPARSE.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         if sparse {
             tests::SPARSE_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1397,16 +1401,8 @@ mod tests {
 
     #[test]
     fn dense_waypoint_sweeps_reuse_their_index_buffers() {
-        let previous = NO_SPARSE.swap(true, std::sync::atomic::Ordering::Relaxed);
-        struct RestoreSparse(bool);
-        impl Drop for RestoreSparse {
-            fn drop(&mut self) {
-                NO_SPARSE.store(self.0, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        let _restore = RestoreSparse(previous);
-
         let mut waypoints = Waypoints::default();
+        waypoints.force_dense_for_test = true;
         let mut players = vec![
             player(1, 10, [0.5, 100.0, 0.5]),
             player(2, 20, [5.5, 100.0, 0.5]),
