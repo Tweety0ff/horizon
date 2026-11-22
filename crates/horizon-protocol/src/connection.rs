@@ -724,8 +724,8 @@ impl ConnWriter {
             Framing::Memory => self.send_contents(body),
             Framing::Network(None) => {
                 if body.len() > frame::MAX_FRAME {
-                    return Err(Error::frame_too_large(FrameTooLarge {
-                        stage: FrameSize::Encoded,
+                    return Err(Error::frame_too_large(frame::FrameTooLarge {
+                        stage: frame::FrameSize::Encoded,
                         size: body.len(),
                         limit: frame::MAX_FRAME,
                     }));
