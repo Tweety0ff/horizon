@@ -185,7 +185,7 @@ pub fn default_workers() -> usize {
 /// The cores this process has for its pools: [`worker_count`]'s share, narrowed to
 /// the performance cores where the machine tells them apart (its efficiency cores
 /// don't carry a worker, see [`default_workers`]).
-pub(crate) fn usable_cores() -> usize {
+pub fn usable_cores() -> usize {
     usable_cores_for(worker_count(), performance_cores)
 }
 
