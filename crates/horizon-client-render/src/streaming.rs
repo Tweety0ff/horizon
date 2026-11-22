@@ -771,8 +771,7 @@ struct GenerationScan {
     band: Option<Band>,
     chunk_revision: u64,
     plan: Vec<(i64, i32, i32)>,
-    /// Reused work lists for a full range scan.
-    scan_wanted: Vec<(i64, i32, i32)>,
+    /// Reused row-run storage for full range scans.
     scan_runs: Vec<(i32, i32, i32)>,
     /// Entries before it are no longer missing.
     next: usize,
@@ -893,8 +892,7 @@ impl GenerationScan {
             }
         }
         {
-            let wanted = &mut self.scan_wanted;
-            wanted.clear();
+            self.plan.clear();
             // Each area's square of columns, as one run per row. Players'
             // areas overlap (a server's players often stand together), so
             // the runs of a row are merged and each column is looked at once.
@@ -931,7 +929,7 @@ impl GenerationScan {
                         {
                             continue;
                         }
-                        wanted.push((input.ranges.priority(x, z), x, z));
+                        self.plan.push((input.ranges.priority(x, z), x, z));
                     }
                 }
             }
@@ -969,7 +967,7 @@ impl GenerationScan {
             band: input.ranges.band,
         };
         self.remember(ranges, input.world);
-        if self.scan_wanted.is_empty() {
+        if self.plan.is_empty() {
             self.plan.clear();
             self.plan_basis = None;
         } else {
@@ -978,13 +976,11 @@ impl GenerationScan {
             self.exhausted = false;
             self.plan_basis = Some(input.decorates);
         }
-        self.scan_wanted.sort_unstable();
-        self.scan_wanted.dedup();
-        self.plan.clear();
-        self.plan.extend_from_slice(&self.scan_wanted);
+        self.plan.sort_unstable();
+        self.plan.dedup();
         self.next = 0;
         batch.extend(
-            self.scan_wanted
+            self.plan
                 .iter()
                 .take(capacity - input.generating.len())
                 .copied(),
@@ -4994,11 +4990,7 @@ mod tests {
                 .candidates_into(fixture.input(), 3, &mut batch)
                 .is_some());
             assert_eq!(batch, expected);
-            let capacities = (
-                batch.capacity(),
-                gate.scan_wanted.capacity(),
-                gate.scan_runs.capacity(),
-            );
+            let capacities = (batch.capacity(), gate.plan.capacity(), gate.scan_runs.capacity());
             assert!(capacities.1 > 0 && capacities.2 > 0);
 
             // A changed view forces another full scan, but each scratch
@@ -5011,11 +5003,7 @@ mod tests {
                 .is_some());
             assert_eq!(batch, expected);
             assert_eq!(
-                (
-                    batch.capacity(),
-                    gate.scan_wanted.capacity(),
-                    gate.scan_runs.capacity(),
-                ),
+                (batch.capacity(), gate.plan.capacity(), gate.scan_runs.capacity()),
                 capacities
             );
         }
