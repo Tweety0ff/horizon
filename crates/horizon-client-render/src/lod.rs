@@ -2001,6 +2001,8 @@ pub struct Lod {
     mesh_samples: samples::Samples,
     /// Tiles needing a mesh, with the revision their job must carry.
     dirty: FxHashMap<TileKey, u64>,
+    /// Reused list of ready dirty tiles submitted to the mesh workers.
+    dispatch_keys_scratch: Vec<(TileKey, u64)>,
     /// The newest revision of each active tile's mesh.
     mesh_version: FxHashMap<TileKey, u64>,
     /// The newest revision accepted by the renderer for each active tile.
@@ -2405,6 +2407,7 @@ impl Lod {
             active: FxHashSet::default(),
             mesh_samples: samples::Samples::default(),
             dirty: FxHashMap::default(),
+            dispatch_keys_scratch: Vec::new(),
             mesh_version: FxHashMap::default(),
             shown_version: FxHashMap::default(),
             mesh_cancel: FxHashMap::default(),
@@ -3787,12 +3790,15 @@ impl Lod {
             Err(std::sync::TryLockError::WouldBlock) => return,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
-        let keys: Vec<(TileKey, u64)> = self
-            .dirty
-            .drain()
-            .filter(|(key, _)| self.active.contains(key) && self.ready.contains_key(key))
-            .collect();
+        let mut keys = std::mem::take(&mut self.dispatch_keys_scratch);
+        keys.clear();
+        keys.extend(
+            self.dirty
+                .drain()
+                .filter(|(key, _)| self.active.contains(key) && self.ready.contains_key(key)),
+        );
         if keys.is_empty() {
+            self.dispatch_keys_scratch = keys;
             return;
         }
         #[cfg(debug_assertions)]
@@ -3806,7 +3812,7 @@ impl Lod {
         });
         let covered = Arc::new(self.covered.clone());
         let count = keys.len();
-        for (key, version) in keys {
+        for (key, version) in keys.iter().copied() {
             let finer = self.finer_of(key);
             let canceled = Arc::new(AtomicBool::new(false));
             self.mesh_cancel.insert(key, canceled.clone());
@@ -3828,6 +3834,7 @@ impl Lod {
         }
         drop(queued);
         self.outstanding_meshes += count;
+        self.dispatch_keys_scratch = keys;
         self.shared.mesh_wake.notify_all();
     }
     /// Brings `mesh_samples` up to date for `key` after its `active` or `ready` changed.
@@ -5999,6 +6006,21 @@ mod tests {
         lod.set_near_loading(false);
         lod.dispatch_meshes([0, 0]);
         assert_eq!(lod.shared.mesh_jobs.lock().unwrap().len(), 1);
+        let capacity = lod.dispatch_keys_scratch.capacity();
+        assert!(capacity > 0);
+
+        let next = TileKey {
+            x: 1,
+            z: 0,
+            level: 0,
+        };
+        lod.active.insert(next);
+        lod.ready.insert(next, TileColumns::empty());
+        lod.sync_sample(next);
+        lod.mark_mesh(next);
+        lod.dispatch_meshes([0, 0]);
+        assert_eq!(lod.shared.mesh_jobs.lock().unwrap().len(), 2);
+        assert_eq!(lod.dispatch_keys_scratch.capacity(), capacity);
     }
 
     #[test]
