@@ -2051,6 +2051,8 @@ pub struct Lod {
     cutout_pending: Option<FxHashSet<(i32, i32)>>,
     /// Active tiles whose mesh must be accepted before the cutout publishes.
     cutout_waiting: FxHashSet<TileKey>,
+    /// The previous active set, swapped with the current set during a rebuild.
+    selection_old_active_scratch: FxHashSet<TileKey>,
     /// Reusable tile-key lists used only when the selection is rebuilt.
     selection_keys_scratch: Vec<TileKey>,
     selection_inactive_scratch: Vec<TileKey>,
@@ -2451,6 +2453,7 @@ impl Lod {
             cutout: None,
             cutout_pending: None,
             cutout_waiting: FxHashSet::default(),
+            selection_old_active_scratch: FxHashSet::default(),
             selection_keys_scratch: Vec::new(),
             selection_inactive_scratch: Vec::new(),
             selection_changed_scratch: Vec::new(),
@@ -3526,7 +3529,9 @@ impl Lod {
     /// tiles whose selection changed (plus their neighbours).
     fn rebuild_selection(&mut self) {
         self.reselect = false;
-        let old = std::mem::take(&mut self.active);
+        let mut next_active = std::mem::take(&mut self.selection_old_active_scratch);
+        next_active.clear();
+        let old = std::mem::replace(&mut self.active, next_active);
         self.complete.clear();
         // The plan indexes nodes by level, children before parents. Plans
         // built by tests may not; sort those once.
@@ -3580,6 +3585,7 @@ impl Lod {
             self.mark_selection_changed(key);
         }
         self.selection_changed_scratch = changed;
+        self.selection_old_active_scratch = old;
         self.wanted_stale = true;
     }
     fn receive(&mut self, meshes: &mut Vec<(TileKey, SectionMesh)>) {
@@ -6713,12 +6719,18 @@ mod tests {
                 lod.selection_keys_scratch.capacity(),
                 lod.selection_inactive_scratch.capacity(),
                 lod.selection_changed_scratch.capacity(),
+                lod.selection_old_active_scratch.capacity(),
                 lod.replan_gone_scratch.capacity(),
                 lod.replan_leaving_scratch.capacity(),
                 lod.replan_seam_scratch.capacity(),
                 lod.replan_standins_scratch.capacity(),
             );
-            assert!(scratch_capacities.0 > 0 && scratch_capacities.2 > 0 && scratch_capacities.3 > 0);
+            assert!(
+                scratch_capacities.0 > 0
+                    && scratch_capacities.2 > 0
+                    && scratch_capacities.3 > 0
+                    && scratch_capacities.4 > 0
+            );
             camera[0] += 16.0;
             lod.update(camera, 2, 64, Some(FxHashSet::default()), None);
             check(&lod);
@@ -6726,11 +6738,12 @@ mod tests {
                 lod.selection_keys_scratch.capacity() >= scratch_capacities.0
                     && lod.selection_inactive_scratch.capacity() >= scratch_capacities.1
                     && lod.selection_changed_scratch.capacity() >= scratch_capacities.2
-                    && lod.replan_gone_scratch.capacity() >= scratch_capacities.3
-                    && lod.replan_leaving_scratch.capacity() >= scratch_capacities.4
-                    && lod.replan_seam_scratch.capacity() >= scratch_capacities.5
-                    && lod.replan_standins_scratch.capacity() >= scratch_capacities.6,
-                "the next view-plan rebuild reuses its seven scratch lists"
+                    && lod.selection_old_active_scratch.capacity() >= scratch_capacities.3
+                    && lod.replan_gone_scratch.capacity() >= scratch_capacities.4
+                    && lod.replan_leaving_scratch.capacity() >= scratch_capacities.5
+                    && lod.replan_seam_scratch.capacity() >= scratch_capacities.6
+                    && lod.replan_standins_scratch.capacity() >= scratch_capacities.7,
+                "the next view-plan rebuild reuses its eight scratch lists"
             );
         }
         // A covered level-0 stand-in completes its parent but is not drawn.
