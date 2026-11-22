@@ -168,6 +168,43 @@ impl Outbox {
     fn queue(&self) -> MutexGuard<'_, Queue> {
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
     }
+    /// Queue one body without allocating a temporary one-element Vec.
+    /// The caller has already charged its retained bytes to pending.
+    pub(super) fn send_one(&self, body: Body, end: Option<End>) {
+        let packet = Queued {
+            cost: charge(body.retained()),
+            body,
+            prepared: false,
+            pending: self.pending.clone(),
+        };
+        let mut q = self.queue();
+        match (q.at, q.end) {
+            (At::Closed, _) => return,
+            (_, None) => {
+                q.bodies.push(packet);
+                q.end = if self.capped && self.pending.load(Ordering::Relaxed) > MAX_PENDING {
+                    Some(End::Close)
+                } else {
+                    end
+                };
+            }
+            (_, Some(End::Disconnect)) if end == Some(End::Close) => {
+                q.end = end;
+                return;
+            }
+            (_, Some(_)) => return,
+        }
+        let At::Slot(slot) = q.at else {
+            return;
+        };
+        if std::mem::replace(&mut q.listed, true) {
+            return;
+        }
+        drop(q);
+        if self.worker.post(|i| i.serve.push(slot)) {
+            self.worker.wake();
+        }
+    }
     /// Queue `bodies` (already counted in `pending`), then `end`. Nothing
     /// follows an end, but a close overrides a disconnect still writing.
     /// Past [`MAX_PENDING`] a capped connection closes. The thread to wake, if
