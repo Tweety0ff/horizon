@@ -1662,9 +1662,8 @@ mod tests {
                 &no_edges,
                 &[],
                 &FxHashSet::default(),
-                |s, _, _| {
-                painted(s, levels)
-            })
+                |s, _, _| painted(s, levels),
+            )
         };
         // The top faces: each one's cell (from its centre) and level.
         let tops = |mesh: &SectionMesh| {
