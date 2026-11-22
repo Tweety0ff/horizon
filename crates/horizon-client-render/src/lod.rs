@@ -6483,6 +6483,52 @@ mod tests {
         assert_eq!(lod.take_cutout(), Some([(3, 4)].into_iter().collect()));
     }
 
+    #[test]
+    fn leave_out_reuses_coverage_delta_buffers() {
+        let mut lod = Lod::scheduler_for_test();
+        for x in 0..8 {
+            lod.plan.nodes.insert(TileKey {
+                x,
+                z: 0,
+                level: 0,
+            });
+            lod.full.insert((x, 0));
+        }
+        lod.leave_out();
+        assert_eq!(lod.covered.len(), 8);
+        lod.full.insert((8, 0));
+        lod.plan.nodes.insert(TileKey {
+            x: 8,
+            z: 0,
+            level: 0,
+        });
+        lod.leave_out();
+        assert_eq!(lod.covered.len(), 9);
+        let capacities = (
+            lod.covered_scratch.capacity(),
+            lod.covered_added_scratch.capacity(),
+            lod.covered_changes_scratch.capacity(),
+            lod.covered_standins_scratch.capacity(),
+        );
+        assert!(capacities.1 > 0 && capacities.2 > 0 && capacities.3 > 0);
+
+        lod.full.insert((9, 0));
+        lod.plan.nodes.insert(TileKey {
+            x: 9,
+            z: 0,
+            level: 0,
+        });
+        lod.leave_out();
+        assert_eq!(lod.covered.len(), 10);
+        assert!(
+            lod.covered_scratch.capacity() >= capacities.0
+                && lod.covered_added_scratch.capacity() >= capacities.1
+                && lod.covered_changes_scratch.capacity() >= capacities.2
+                && lod.covered_standins_scratch.capacity() >= capacities.3,
+            "the next coverage change reuses all four work buffers"
+        );
+    }
+
     /// A saved summary is not detail: a covered empty stand-in must not let
     /// the cutout release the full-detail columns under it.
     #[test]
