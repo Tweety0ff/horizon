@@ -6024,7 +6024,9 @@ mod tests {
         let mut shallow = Lod::scheduler_for_test();
         shallow.plan.nodes.insert(parent);
         shallow.plan.split.insert(parent);
-        shallow.active.extend(parent.children());
+        let children = parent.children();
+        shallow.plan.nodes.extend(children.iter().copied());
+        shallow.active.extend(children);
         let finer = shallow.finer_of(parent);
         assert_eq!(finer.len(), 4);
         assert!(!finer.spilled(), "four children fit in the inline buffer");
