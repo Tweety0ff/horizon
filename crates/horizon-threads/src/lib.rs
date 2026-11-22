@@ -179,14 +179,16 @@ mod par_chunks_tests {
 /// a base M4 (4 performance and 6 efficiency cores) a fast flight's p99 frame went from
 /// 20 ms with 9 workers to 7 ms with 3 (#11294).
 pub fn default_workers() -> usize {
-    workers_for(worker_count(), performance_cores)
+    usable_cores().saturating_sub(1).max(1)
 }
 
-/// The cores this process has for its pools: [`worker_count`]'s share, narrowed to
-/// the performance cores where the machine tells them apart (its efficiency cores
-/// don't carry a worker, see [`default_workers`]).
+/// The cores this process has for its foreground CPU-bound pools: [`worker_count`]'s
+/// share, narrowed to the performance cores where the machine tells them apart (its
+/// efficiency cores don't carry foreground workers). Detection is cached: on Linux it
+/// reads CPU frequency data from sysfs, and this is called from foreground hot paths.
 pub fn usable_cores() -> usize {
-    usable_cores_for(worker_count(), performance_cores)
+    static USABLE: OnceLock<usize> = OnceLock::new();
+    *USABLE.get_or_init(|| usable_cores_for(worker_count(), performance_cores))
 }
 
 /// [`usable_cores`] for `cores` cores, of which `performance` (asked only here, the
