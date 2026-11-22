@@ -56,11 +56,17 @@ static BATTERY: OnceLock<bool> = OnceLock::new();
 
 /// [`sizing`] with this process's cores and `battery` as the caller knows it.
 pub fn for_pool_with(battery: bool, pool: Pool) -> usize {
-    let cores = match pool {
-        Pool::Jobs => crate::usable_cores(),
-        _ => crate::worker_count(),
-    };
+    let cores = pool_cores(pool, crate::worker_count(), crate::usable_cores());
     sizing(battery, cores, pool)
+}
+
+/// Foreground CPU-bound pools stay on performance cores on hybrid machines.
+/// Background and I/O-oriented pools retain the process-wide worker budget.
+fn pool_cores(pool: Pool, workers: usize, usable: usize) -> usize {
+    match pool {
+        Pool::Jobs | Pool::TickHelper => usable,
+        _ => workers,
+    }
 }
 
 /// [`for_pool_with`] under this process's Battery Mode ([`battery`]).
@@ -129,6 +135,20 @@ mod tests {
         assert!(battery());
         set_battery(false);
         assert!(battery());
+    }
+
+    /// Foreground CPU-bound work uses the performance-core budget on hybrid CPUs,
+    /// while decoders and other background/I/O pools retain the full worker budget.
+    #[test]
+    fn foreground_pools_use_the_performance_core_budget() {
+        use super::pool_cores;
+
+        assert_eq!(pool_cores(Pool::Jobs, 10, 4), 4);
+        assert_eq!(pool_cores(Pool::TickHelper, 10, 4), 4);
+        assert_eq!(pool_cores(Pool::ChunkDecoder, 10, 4), 10);
+        assert_eq!(pool_cores(Pool::SaveCompression, 10, 4), 10);
+        assert_eq!(sizing(false, pool_cores(Pool::TickHelper, 10, 4), Pool::TickHelper), 2);
+        assert_eq!(sizing(true, pool_cores(Pool::TickHelper, 10, 4), Pool::TickHelper), 1);
     }
 
     /// A plain Jobs pool is the streaming pool's own automatic count, so the table
