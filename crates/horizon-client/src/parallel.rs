@@ -62,7 +62,7 @@ pub fn after_tick(ms: f32, cpu_ms: Option<f32>) {
     }
     let mut auto = AUTO.lock().unwrap_or_else(PoisonError::into_inner);
     let was = auto.shared;
-    let shared = auto.after_tick(ms, cpu_ms.unwrap_or(ms), horizon_threads::worker_count());
+    let shared = auto.after_tick(ms, cpu_ms.unwrap_or(ms), horizon_threads::usable_cores());
     AUTO_STATE.store(auto.state as u8, Ordering::Relaxed);
     if shared != was {
         let ms = auto.last_median;
@@ -275,7 +275,7 @@ pub static OWN_RANDOM_TEST: std::sync::atomic::AtomicBool =
 /// the parallel tick is on, else 1.
 pub fn lanes() -> usize {
     if parallel_tick() > 0 {
-        horizon_threads::worker_count().clamp(1, 8)
+        worker_lanes()
     } else {
         1
     }
@@ -329,21 +329,23 @@ pub fn par_chunks_mut_with_state<T: Send, S: Send>(
     init: impl Fn() -> S + Send + Sync,
     f: impl Fn(&mut [T], &mut S) + Send + Sync,
 ) {
-    let lanes = if horizon_threads::serial_tick_all() {
-        1
-    } else {
-        horizon_threads::worker_count().clamp(1, 8)
-    };
-    par_chunks_mut_on_with(items, chunk, lanes, init, f);
+    par_chunks_mut_on_with(items, chunk, worker_lanes(), init, f);
 }
 
-/// Worker lane count without the 8-lane cap of [`par_chunks_mut`]: 1 when `HORIZON_SERIAL_TICK=all`,
-/// else all workers configured in `horizon_threads`.
+/// Total tick lanes, including the server thread: one fewer than the available performance
+/// cores, capped at eight, so one performance core remains for the render thread. A single
+/// performance core stays serial; efficiency cores do not become stragglers in a foreground tick.
+fn tick_lanes(cores: usize) -> usize {
+    cores.saturating_sub(1).clamp(1, 8)
+}
+
+/// Worker lane count without the cap of [`par_chunks_mut`], or one when
+/// `HORIZON_SERIAL_TICK=all`.
 pub fn worker_lanes() -> usize {
     if horizon_threads::serial_tick_all() {
         1
     } else {
-        horizon_threads::worker_count().max(1)
+        tick_lanes(horizon_threads::usable_cores())
     }
 }
 
@@ -467,6 +469,15 @@ pub fn par_map_on<T: Sync, R: Send>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The server shares foreground tick work across performance cores only, leaving
+    /// one such core available for rendering and keeping a one-core CPU serial.
+    #[test]
+    fn tick_lanes_leave_a_performance_core_for_rendering() {
+        for (cores, lanes) in [(1, 1), (2, 1), (3, 2), (4, 3), (8, 7), (9, 8), (16, 8)] {
+            assert_eq!(tick_lanes(cores), lanes, "{cores} performance cores");
+        }
+    }
 
     /// Auto keeps a quiet world on one thread, shares a heavy tick only after two heavy windows,
     /// keeps the trial when the ticks got faster, goes back once they are light, and after a
