@@ -130,6 +130,8 @@ pub struct ConnWriter {
     encrypt: Option<Cfb8>,
     pub threshold: Option<usize>,
     counters: Arc<Counters>,
+    /// Reused by the blocking writer path; detached pollers keep their own output buffer.
+    send_buffer: Vec<u8>,
     /// Set for a server of an older release: what is sent is renumbered.
     adapter: Option<Arc<crate::adapter::Session>>,
     /// Set on a server for a client of an older release: what is sent is renumbered.
@@ -300,9 +302,11 @@ impl Connection {
                 encrypt: None,
                 threshold: None,
                 counters,
+                send_buffer: Vec::new(),
                 adapter: None,
                 older_client: None,
             },
+
         })
     }
     /// Speak to a server of `version` from now on (before the handshake): packets are renumbered both
@@ -620,6 +624,7 @@ impl ConnWriter {
             encrypt: None,
             threshold: None,
             counters: self.counters.clone(),
+            send_buffer: Vec::new(),
             adapter: None,
             older_client: None,
         };
@@ -697,26 +702,58 @@ impl ConnWriter {
     pub fn send(&mut self, body: &[u8]) -> Result<()> {
         if self.older_client.is_some() {
             for body in self.for_client(body)? {
-                self.send_contents(&self.contents(&body)?)?;
+                self.send_body(&body)?;
             }
             return Ok(());
         }
         if let Some(a) = self.adapter.clone() {
             if let Some(body) = a.serverbound(body)? {
-                self.send_contents(&self.contents(&body)?)?;
+                self.send_body(&body)?;
             }
             for body in a.take_outgoing() {
-                self.send_contents(&self.contents(&body)?)?;
+                self.send_body(&body)?;
             }
             return Ok(());
         }
-        self.send_contents(&self.contents(body)?)
+        self.send_body(body)
+    }
+    /// Frame directly from the packet body whenever the wire format needs no compression.
+    /// This avoids making an owned copy of every ordinary packet before writing it.
+    fn send_body(&mut self, body: &[u8]) -> Result<()> {
+        match self.framing() {
+            Framing::Memory => self.send_contents(body),
+            Framing::Network(None) => {
+                if body.len() > frame::MAX_FRAME {
+                    return Err(Error::frame_too_large(FrameTooLarge {
+                        stage: FrameSize::Encoded,
+                        size: body.len(),
+                        limit: frame::MAX_FRAME,
+                    }));
+                }
+                self.send_contents(body)
+            }
+            Framing::Network(Some(_)) => {
+                let contents = self.contents(body)?;
+                self.send_contents(&contents)
+            }
+        }
     }
     /// Send a frame whose contents [`Self::contents`] made for this transport.
+    /// The blocking writer owns this scratch buffer exclusively, so small and
+    /// medium packets reuse its allocation instead of allocating one Vec each.
     pub fn send_contents(&mut self, contents: &[u8]) -> Result<()> {
-        let mut framed = Vec::with_capacity(contents.len() + 3);
+        const RETAINED_WRITE_BUFFER: usize = 256 << 10;
+        let mut framed = std::mem::take(&mut self.send_buffer);
+        framed.clear();
         self.frame_into(contents, &mut framed);
-        self.stream.write_all(&framed)?;
+        let result = self.stream.write_all(&framed);
+        if framed.capacity() > RETAINED_WRITE_BUFFER {
+            framed = Vec::new();
+        } else {
+            framed.clear();
+        }
+        self.send_buffer = framed;
+        result?;
         Ok(())
     }
     /// The bytes [`Self::send_contents`] writes, appended to `out` instead: a
