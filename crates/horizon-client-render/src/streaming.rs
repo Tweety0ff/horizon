@@ -4791,6 +4791,32 @@ mod tests {
     }
 
     #[test]
+    fn whole_relight_partition_reuses_column_sets() {
+        let mut positions = vec![(3, 70, 4), (15, 64, 15), (16, 80, 0), (31, 64, 9)];
+        let mut touched = FxHashSet::default();
+        let mut whole = FxHashSet::default();
+        partition_whole_relight_columns(
+            &mut positions,
+            &mut touched,
+            &mut whole,
+            |x, z| (x, z) != (2, 1),
+        );
+        let capacities = (touched.capacity(), whole.capacity());
+        assert_eq!(positions, vec![(16, 80, 0), (31, 64, 9)]);
+        assert!(capacities.0 > 0 && capacities.1 > 0);
+
+        positions = vec![(3, 70, 4), (15, 64, 15), (16, 80, 0), (31, 64, 9)];
+        partition_whole_relight_columns(
+            &mut positions,
+            &mut touched,
+            &mut whole,
+            |x, z| (x, z) != (2, 1),
+        );
+        assert_eq!(positions, vec![(16, 80, 0), (31, 64, 9)]);
+        assert_eq!((touched.capacity(), whole.capacity()), capacities);
+    }
+
+    #[test]
     fn whole_relights_cover_the_edited_columns_and_their_neighbours() {
         // Blocks in columns (0, 0) and (1, 0).
         let positions = vec![(3, 70, 4), (15, 64, 15), (16, 80, 0), (31, 64, 9)];
