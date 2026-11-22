@@ -111,9 +111,9 @@ const SETTLE: u8 = 1;
 /// How many ticks after a trial that didn't help before the next one: 5 minutes after the
 /// first, 20 after every later one.
 const RETRY_AFTER: [u64; 2] = [5 * 60 * 20, 20 * 60 * 20];
-/// Fewer hardware threads than this and Auto never shares the tick: the helpers would run on
-/// the cores the frame and the chunk workers need.
-const MIN_THREADS: usize = 4;
+/// Fewer performance cores than this and Auto never shares the tick: helpers would take cores
+/// the frame and foreground chunk work need.
+const MIN_PERFORMANCE_CORES: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -164,9 +164,9 @@ impl Auto {
         }
     }
 
-    /// A tick took `ms`, `cpu_ms` of them on the processor, on a machine with `threads`
-    /// hardware threads: whether the next one shares its phases' work.
-    fn after_tick(&mut self, ms: f32, cpu_ms: f32, threads: usize) -> bool {
+    /// A tick took `ms`, `cpu_ms` of them on the processor, on a machine with
+    /// `performance_cores`: whether the next one shares its phases' work.
+    fn after_tick(&mut self, ms: f32, cpu_ms: f32, performance_cores: usize) -> bool {
         self.ticks += 1;
         self.window.push(ms);
         self.cpu.push(cpu_ms);
@@ -186,7 +186,7 @@ impl Auto {
         match self.state {
             State::Watching => {
                 let heavy =
-                    working >= HEAVY_MS && threads >= MIN_THREADS && self.ticks >= self.retry_at;
+                    working >= HEAVY_MS && performance_cores >= MIN_PERFORMANCE_CORES && self.ticks >= self.retry_at;
                 self.streak = if heavy { self.streak + 1 } else { 0 };
                 if self.streak >= STREAK {
                     self.before = median;
@@ -271,8 +271,8 @@ pub fn mob_turn_random(id: u32, game_time: i64) -> horizon_core::random::LegacyR
 pub static OWN_RANDOM_TEST: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// How many threads a phase may share its work among: `horizon-threads`' count (at most 8) while
-/// the parallel tick is on, else 1.
+/// Total foreground tick lanes, including the server thread: one fewer than the performance-core
+/// budget (at most 8) while the parallel tick is on, else 1.
 pub fn lanes() -> usize {
     if parallel_tick() > 0 {
         worker_lanes()
@@ -315,7 +315,8 @@ pub fn par_map<T: Sync, R: Send>(
 /// `horizon_threads::par_chunks_mut`, without starting threads for every call. A chunk runs on
 /// whatever thread takes it, so `f` must not depend on the order. Unlike [`par_map`] it does not
 /// wait for the parallel tick's switch (the phases that use it ran shared out before the pool
-/// existed, #8158): it shares out unless `HORIZON_SERIAL_TICK=all` or one thread is all there is.
+/// existed, #8158): it shares out unless `HORIZON_SERIAL_TICK=all` or fewer than three
+/// performance cores are available.
 /// The thread-locals the tick relies on do not follow a helper.
 pub fn par_chunks_mut<T: Send>(items: &mut [T], chunk: usize, f: impl Fn(&mut [T]) + Send + Sync) {
     par_chunks_mut_with_state(items, chunk, || (), |part, ()| f(part));
@@ -334,13 +335,14 @@ pub fn par_chunks_mut_with_state<T: Send, S: Send>(
 
 /// Total tick lanes, including the server thread: one fewer than the available performance
 /// cores, capped at eight, so one performance core remains for the render thread. A single
-/// performance core stays serial; efficiency cores do not become stragglers in a foreground tick.
+/// fewer than three performance cores stay serial; efficiency cores do not become stragglers in
+/// a foreground tick.
 fn tick_lanes(cores: usize) -> usize {
     cores.saturating_sub(1).clamp(1, 8)
 }
 
 /// Worker lane count without the cap of [`par_chunks_mut`], or one when
-/// `HORIZON_SERIAL_TICK=all`.
+/// `HORIZON_SERIAL_TICK=all` or fewer than three performance cores are available.
 pub fn worker_lanes() -> usize {
     if horizon_threads::serial_tick_all() {
         1
@@ -510,7 +512,7 @@ mod tests {
         assert!(!run(&mut auto, 36.0, 2), "no faster: undone");
         assert!(!run(&mut auto, 36.0, 40), "waiting");
         assert!(run(&mut auto, 36.0, 20), "tried again after five minutes");
-        // Too few hardware threads: never.
+        // Too few performance cores: never.
         let mut small = Auto::new();
         for _ in 0..20 * WINDOW {
             assert!(!small.after_tick(40.0, 40.0, 2));
