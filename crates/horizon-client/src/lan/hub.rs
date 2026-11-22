@@ -972,13 +972,13 @@ impl Hub {
         );
     }
     fn broadcast_to<'g>(&self, packet: &C, guests: impl IntoIterator<Item = &'g Guest>) {
-        let mut body = None;
+        let mut body: Option<super::Body> = None;
         for g in guests {
             if let C::RemoveEntities(p) = packet {
                 self.send_ordered_removal(g, &p.ids);
             } else {
-                g.sender
-                    .send(body.get_or_insert_with(|| packet.encode()).clone());
+                let body = body.get_or_insert_with(|| super::Body::shared(packet.encode()));
+                g.sender.send_many([body.clone()]);
             }
         }
     }
@@ -1118,29 +1118,31 @@ impl Hub {
     }
     /// `PlayerList.broadcastAll(packet, dimension)`: the players in the level in place.
     pub fn broadcast_level(&self, packet: &C) {
-        let mut body = None;
+        let mut body: Option<super::Body> = None;
         for g in self.guests.simulation_iter().filter(|g| self.watches(g)) {
-            g.sender
-                .send(body.get_or_insert_with(|| packet.encode()).clone());
+            let body = body.get_or_insert_with(|| super::Body::shared(packet.encode()));
+            g.sender.send_many([body.clone()]);
         }
     }
     /// `DedicatedServer.sendLowDiskSpaceWarning`: the players with
     /// `PermissionLevel.ADMINS` (3) or more get `ClientboundLowDiskSpaceWarningPacket`.
     pub fn send_low_disk_space_warning(&self) {
-        let body = C::LowDiskSpaceWarning(horizon_protocol::packets::Empty).encode();
+        let body = super::Body::shared(
+            C::LowDiskSpaceWarning(horizon_protocol::packets::Empty).encode(),
+        );
         for g in self.guests.iter().filter(|g| g.placed && g.permission >= 3) {
-            g.sender.send(body.clone());
+            g.sender.send_many([body.clone()]);
         }
     }
     pub fn broadcast_except(&self, conn: u32, packet: &C) {
-        let mut body = None;
+        let mut body: Option<super::Body> = None;
         for g in self
             .guests
             .simulation_iter()
             .filter(|g| g.placed && g.conn != conn && g.participates_online())
         {
-            g.sender
-                .send(body.get_or_insert_with(|| packet.encode()).clone());
+            let body = body.get_or_insert_with(|| super::Body::shared(packet.encode()));
+            g.sender.send_many([body.clone()]);
         }
     }
     /// PlayerList.broadcastSystemMessage.
@@ -1159,17 +1161,19 @@ impl Hub {
     /// `ServerPlayer.sendSystemMessage(Component, false)` to the placed guests `to` picks: not to one whose
     /// chat is hidden (`acceptsSystemMessages`: HIDDEN, 2, takes only an overlay).
     fn send_system(&self, content: Tag, to: impl Fn(&Guest) -> bool) {
-        let body = C::SystemChat(play::SystemChat {
-            content,
-            overlay: false,
-        })
-        .encode();
+        let body = super::Body::shared(
+            C::SystemChat(play::SystemChat {
+                content,
+                overlay: false,
+            })
+            .encode(),
+        );
         for g in self
             .guests
             .iter()
             .filter(|g| g.placed && g.info.chat_visibility != 2 && to(g))
         {
-            g.sender.send(body.clone());
+            g.sender.send_many([body.clone()]);
         }
     }
     /// `ServerPlayer.sendOverlayMessage` to every guest (the action bar).
