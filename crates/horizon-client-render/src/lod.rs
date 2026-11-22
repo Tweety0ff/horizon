@@ -6603,6 +6603,21 @@ mod tests {
             camera[0] += 16.0;
             lod.update(camera, 2, 64, Some(FxHashSet::default()), None);
             check(&lod);
+            let scratch_capacities = (
+                lod.selection_keys_scratch.capacity(),
+                lod.selection_inactive_scratch.capacity(),
+                lod.selection_changed_scratch.capacity(),
+            );
+            assert!(scratch_capacities.0 > 0 && scratch_capacities.2 > 0);
+            camera[0] += 16.0;
+            lod.update(camera, 2, 64, Some(FxHashSet::default()), None);
+            check(&lod);
+            assert!(
+                lod.selection_keys_scratch.capacity() >= scratch_capacities.0
+                    && lod.selection_inactive_scratch.capacity() >= scratch_capacities.1
+                    && lod.selection_changed_scratch.capacity() >= scratch_capacities.2,
+                "the next selection rebuild reuses its three scratch lists"
+            );
         }
         // A covered level-0 stand-in completes its parent but is not drawn.
         lod.update(camera, 2, 64, Some([(0, 0)].into_iter().collect()), None);
