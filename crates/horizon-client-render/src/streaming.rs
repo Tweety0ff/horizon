@@ -676,6 +676,8 @@ pub struct Streaming {
     gone_scratch: Vec<(i32, i32)>,
     mesh_candidates_scratch: Vec<(i64, i32, i32, SectionMask)>,
     mesh_columns_scratch: Vec<((i32, i32), SectionMask)>,
+    /// Far columns being unloaded in the current commit pass.
+    unload_columns_scratch: FxHashSet<(i32, i32)>,
     /// The next bounded chunk-generation batch, reused as queue capacity opens.
     generation_batch_scratch: Vec<(i64, i32, i32)>,
     /// Block positions used by incremental relighting and replay.
@@ -1346,6 +1348,7 @@ impl Streaming {
             gone_scratch: Vec::new(),
             mesh_candidates_scratch: Vec::new(),
             mesh_columns_scratch: Vec::new(),
+            unload_columns_scratch: FxHashSet::default(),
             generation_batch_scratch: Vec::new(),
             light_positions_scratch: Vec::new(),
             light_touched_scratch: FxHashSet::default(),
@@ -2085,7 +2088,9 @@ impl Streaming {
                     self.light_snapshots.remove(key);
                     world.dirty_sections.take_column(key.0, key.1);
                 }
-                let far_set: FxHashSet<(i32, i32)> = far.iter().copied().collect();
+                let mut far_set = std::mem::take(&mut self.unload_columns_scratch);
+                far_set.clear();
+                far_set.extend(far.iter().copied());
                 forget_pending_sections(
                     &mut self.meshing,
                     &mut self.compile_started,
@@ -2093,6 +2098,7 @@ impl Streaming {
                     &far_set,
                     world.layout().sections() as i32,
                 );
+                self.unload_columns_scratch = far_set;
             }
             // Drop far proto chunks that are not checked out.
             if !self.protos.is_empty() {
