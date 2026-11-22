@@ -290,6 +290,10 @@ fn pool() -> &'static rayon::ThreadPool {
             .num_threads(horizon_threads::sizing::for_pool(
                 horizon_threads::sizing::Pool::TickHelper,
             ))
+            // The pool may be initialized by the server thread after it has
+            // reserved a core. Rayon helpers must widen their inherited CPU
+            // mask just like the scoped tick workers did.
+            .start_handler(|_| horizon_threads::server_core::leave_reserved())
             .thread_name(|i| format!("tick-helper-{i}"))
             .build()
             .expect("the tick's helper threads start")
