@@ -8,8 +8,7 @@
 //! ([`after_tick`]) and never during one. `HORIZON_PARALLEL_TICK` wins over the setting, and is
 //! all a dedicated server follows (`server.toml`'s `parallel_tick`).
 use crate::graphics::ParallelTickMode;
-use rayon::prelude::*;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 /// `HORIZON_PARALLEL_TICK`, whatever the setting says: `0` keeps every tick serial, `1` turns the
@@ -419,21 +418,32 @@ pub fn par_map_on<T: Sync, R: Send>(
         return out;
     }
     let size = items.len().div_ceil(lanes.saturating_mul(4).max(1));
-    // Slice parallel chunks are indexed: collecting their per-part results
-    // preserves input order without a ticket counter or one mutex per part.
-    let parts = pool().in_place_scope(|_| {
-        items
-            .par_chunks(size)
-            .map(|part| {
-                let mut done = Vec::with_capacity(part.len());
-                f(part, &mut done);
-                done
-            })
-            .collect::<Vec<_>>()
+    let count = items.len().div_ceil(size);
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Vec<R>>> = (0..count).map(|_| Mutex::new(Vec::new())).collect();
+    let work = || {
+        loop {
+            let k = next.fetch_add(1, Ordering::Relaxed);
+            if k >= count {
+                break;
+            }
+            let part = &items[k * size..((k + 1) * size).min(items.len())];
+            let mut done = Vec::with_capacity(part.len());
+            f(part, &mut done);
+            *slots[k].lock().unwrap_or_else(PoisonError::into_inner) = done;
+        }
+    };
+    // Keep the requested lane cap: other users of the persistent pool may
+    // need the remaining helpers for foreground work.
+    pool().in_place_scope(|s| {
+        for _ in 1..lanes {
+            s.spawn(|_| work());
+        }
+        work();
     });
     let mut out = Vec::with_capacity(items.len());
-    for part in parts {
-        out.extend(part);
+    for slot in slots {
+        out.extend(slot.into_inner().unwrap_or_else(PoisonError::into_inner));
     }
     out
 }
@@ -441,7 +451,6 @@ pub fn par_map_on<T: Sync, R: Send>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
 
     /// Auto keeps a quiet world on one thread, shares a heavy tick only after two heavy windows,
     /// keeps the trial when the ticks got faster, goes back once they are light, and after a
