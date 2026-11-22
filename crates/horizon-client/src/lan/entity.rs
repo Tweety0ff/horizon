@@ -1393,149 +1393,149 @@ impl Entities {
                 16,
                 || vec![0; chunks.len()],
                 |players, held| {
-                for (v, flags, starts) in players {
-                    flags.clear();
-                    starts.clear();
-                    held.fill(0);
-                    let (chunks, held) = (&**chunks, &mut *held);
-                    let mut kept = 0;
-                    let room = horizon_protocol::viewed_levels::MAX_ENTITIES;
-                    // A client that moved (ChunkMap.move), or whose own entity
-                    // appeared or changed section (ChunkMap.tick's movedPlayers), has
-                    // every pair checked again.
-                    let all = v.moved
-                        || states
-                            .get(&v.entity_id)
-                            .is_none_or(|s| s.seen != now || is_moved[s.index]);
-                    if all {
-                        // `sees` caps the range at its view distance, so only the
-                        // entities in chunks that far from its own can be seen; the
-                        // rest stay 0, as checking each of them gave.
-                        flags.resize(probes.len(), 0);
-                        let reach = v.view_distance + 1;
-                        let (vx, vz) = (
-                            (v.position[0].floor() as i32) >> 4,
-                            (v.position[2].floor() as i32) >> 4,
-                        );
-                        for ((&(cx, cz), members), stat) in chunks.iter().zip(members).zip(stats) {
-                            if v.sources.is_none()
-                                && ((cx - vx).abs() > reach || (cz - vz).abs() > reach)
-                            {
-                                cells::drop_cell(v, (cx, cz));
-                                continue;
-                            }
-                            if cells_on
-                                && let Some(tracked) =
-                                    cells::skip(v, (cx, cz), stat, members, probes, flags)
-                            {
-                                kept += tracked;
-                                continue;
-                            }
-                            let (kept_before, starts_before) = (kept, starts.len());
-                            for &index in members {
-                                let index = index as usize;
-                                let p = &probes[index];
-                                if p.id == v.entity_id || !sees(v, p, chunks, held) {
+                    for (v, flags, starts) in players {
+                        flags.clear();
+                        starts.clear();
+                        held.fill(0);
+                        let (chunks, held) = (&**chunks, &mut *held);
+                        let mut kept = 0;
+                        let room = horizon_protocol::viewed_levels::MAX_ENTITIES;
+                        // A client that moved (ChunkMap.move), or whose own entity
+                        // appeared or changed section (ChunkMap.tick's movedPlayers), has
+                        // every pair checked again.
+                        let all = v.moved
+                            || states
+                                .get(&v.entity_id)
+                                .is_none_or(|s| s.seen != now || is_moved[s.index]);
+                        if all {
+                            // `sees` caps the range at its view distance, so only the
+                            // entities in chunks that far from its own can be seen; the
+                            // rest stay 0, as checking each of them gave.
+                            flags.resize(probes.len(), 0);
+                            let reach = v.view_distance + 1;
+                            let (vx, vz) = (
+                                (v.position[0].floor() as i32) >> 4,
+                                (v.position[2].floor() as i32) >> 4,
+                            );
+                            for ((&(cx, cz), members), stat) in chunks.iter().zip(members).zip(stats) {
+                                if v.sources.is_none()
+                                    && ((cx - vx).abs() > reach || (cz - vz).abs() > reach)
+                                {
+                                    cells::drop_cell(v, (cx, cz));
                                     continue;
                                 }
-                                if v.tracker.seen.contains_key(&p.id) {
-                                    flags[index] = SEES | TRACKS;
+                                if cells_on
+                                    && let Some(tracked) =
+                                        cells::skip(v, (cx, cz), stat, members, probes, flags)
+                                {
+                                    kept += tracked;
+                                    continue;
+                                }
+                                let (kept_before, starts_before) = (kept, starts.len());
+                                for &index in members {
+                                    let index = index as usize;
+                                    let p = &probes[index];
+                                    if p.id == v.entity_id || !sees(v, p, chunks, held) {
+                                        continue;
+                                    }
+                                    if v.tracker.seen.contains_key(&p.id) {
+                                        flags[index] = SEES | TRACKS;
+                                        kept += 1;
+                                    } else if v.sources.is_none() || starts.len() + kept < room {
+                                        // A viewing client collects no more starts than its world
+                                        // could take with what it keeps so far; the cut below is exact.
+                                        flags[index] = SEES;
+                                        starts.push(index);
+                                    }
+                                }
+                                if cells_on {
+                                    let met = (kept - kept_before, starts.len() != starts_before);
+                                    cells::record(v, (cx, cz), stat, members, probes, met);
+                                }
+                            }
+                        } else if v.tracker.seen.len() * 4 > probes.len() {
+                            // Otherwise its pairs stay as they were, but for the
+                            // entities that appeared or changed section; a client
+                            // tracking much of the level goes through it in order.
+                            flags.reserve(probes.len());
+                            for (index, (p, &entity_moved)) in probes.iter().zip(is_moved).enumerate() {
+                                let tracks = v.tracker.seen.contains_key(&p.id);
+                                let flag = if p.id == v.entity_id
+                                    || (entity_moved && !sees(v, p, chunks, held))
+                                {
+                                    0
+                                } else if tracks {
                                     kept += 1;
-                                } else if v.sources.is_none() || starts.len() + kept < room {
-                                    // A viewing client collects no more starts than its world
-                                    // could take with what it keeps so far; the cut below is exact.
-                                    flags[index] = SEES;
+                                    SEES | TRACKS
+                                } else if entity_moved {
                                     starts.push(index);
+                                    SEES
+                                } else {
+                                    0
+                                };
+                                flags.push(flag);
+                            }
+                        } else {
+                            // One tracking little of it, from what it tracks.
+                            flags.resize(probes.len(), 0);
+                            for id in v.tracker.seen.keys() {
+                                if let Some(s) = states.get(id).filter(|s| s.seen == now) {
+                                    flags[s.index] = SEES | TRACKS;
+                                    kept += 1;
                                 }
                             }
-                            if cells_on {
-                                let met = (kept - kept_before, starts.len() != starts_before);
-                                cells::record(v, (cx, cz), stat, members, probes, met);
-                            }
-                        }
-                    } else if v.tracker.seen.len() * 4 > probes.len() {
-                        // Otherwise its pairs stay as they were, but for the
-                        // entities that appeared or changed section; a client
-                        // tracking much of the level goes through it in order.
-                        flags.reserve(probes.len());
-                        for (index, (p, &entity_moved)) in probes.iter().zip(is_moved).enumerate() {
-                            let tracks = v.tracker.seen.contains_key(&p.id);
-                            let flag = if p.id == v.entity_id
-                                || (entity_moved && !sees(v, p, chunks, held))
-                            {
-                                0
-                            } else if tracks {
-                                kept += 1;
-                                SEES | TRACKS
-                            } else if entity_moved {
-                                starts.push(index);
-                                SEES
-                            } else {
-                                0
-                            };
-                            flags.push(flag);
-                        }
-                    } else {
-                        // One tracking little of it, from what it tracks.
-                        flags.resize(probes.len(), 0);
-                        for id in v.tracker.seen.keys() {
-                            if let Some(s) = states.get(id).filter(|s| s.seen == now) {
-                                flags[s.index] = SEES | TRACKS;
-                                kept += 1;
-                            }
-                        }
-                        for &index in moved {
-                            let p = &probes[index];
-                            let tracks = flags[index] & TRACKS != 0;
-                            if p.id != v.entity_id && sees(v, p, chunks, held) {
-                                if !tracks {
-                                    flags[index] = SEES;
-                                    starts.push(index);
+                            for &index in moved {
+                                let p = &probes[index];
+                                let tracks = flags[index] & TRACKS != 0;
+                                if p.id != v.entity_id && sees(v, p, chunks, held) {
+                                    if !tracks {
+                                        flags[index] = SEES;
+                                        starts.push(index);
+                                    }
+                                } else if tracks {
+                                    flags[index] = 0;
+                                    kept -= 1;
                                 }
-                            } else if tracks {
+                            }
+                        }
+                        // Usually the client still sees all it tracks.
+                        let mut removed = Vec::new();
+                        if kept != v.tracker.seen.len() {
+                            let Tracker { seen, events, .. } = &mut *v.tracker;
+                            seen.retain(|id, tracked| match states.get(id) {
+                                Some(s) if s.seen == now && flags[s.index] & TRACKS != 0 => true,
+                                other => {
+                                    if let (Some(gone), Some(s)) = (v.gone.as_deref_mut(), other) {
+                                        gone.push(s.base);
+                                    }
+                                    removed.push(*id);
+                                    events.push(TrackEvent {
+                                        start: false,
+                                        entity: *id,
+                                        tracked: Arc::clone(tracked),
+                                    });
+                                    false
+                                }
+                            });
+                        }
+                        if !removed.is_empty() {
+                            v.out.push(
+                                play::Clientbound::RemoveEntities(play::RemoveEntities {
+                                    ids: removed,
+                                })
+                                .encode()
+                                .into(),
+                            );
+                        }
+                        // A viewing client starts tracking no more than its viewed world holds.
+                        if v.sources.is_some() {
+                            let room = room.saturating_sub(v.tracker.seen.len());
+                            for &index in starts.iter().skip(room) {
                                 flags[index] = 0;
-                                kept -= 1;
                             }
+                            starts.truncate(room);
                         }
                     }
-                    // Usually the client still sees all it tracks.
-                    let mut removed = Vec::new();
-                    if kept != v.tracker.seen.len() {
-                        let Tracker { seen, events, .. } = &mut *v.tracker;
-                        seen.retain(|id, tracked| match states.get(id) {
-                            Some(s) if s.seen == now && flags[s.index] & TRACKS != 0 => true,
-                            other => {
-                                if let (Some(gone), Some(s)) = (v.gone.as_deref_mut(), other) {
-                                    gone.push(s.base);
-                                }
-                                removed.push(*id);
-                                events.push(TrackEvent {
-                                    start: false,
-                                    entity: *id,
-                                    tracked: Arc::clone(tracked),
-                                });
-                                false
-                            }
-                        });
-                    }
-                    if !removed.is_empty() {
-                        v.out.push(
-                            play::Clientbound::RemoveEntities(play::RemoveEntities {
-                                ids: removed,
-                            })
-                            .encode()
-                            .into(),
-                        );
-                    }
-                    // A viewing client starts tracking no more than its viewed world holds.
-                    if v.sources.is_some() {
-                        let room = room.saturating_sub(v.tracker.seen.len());
-                        for &index in starts.iter().skip(room) {
-                            flags[index] = 0;
-                        }
-                        starts.truncate(room);
-                    }
-                }
             });
         }
         self.flags = flags;
