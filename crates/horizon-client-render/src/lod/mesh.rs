@@ -501,6 +501,7 @@ fn mesh_columns_with_neighbors(
         covered_bounds,
         &edges,
         &[],
+        &FxHashSet::default(),
         material,
     )
 }
