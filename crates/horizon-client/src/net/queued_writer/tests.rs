@@ -3,6 +3,22 @@ use horizon_protocol::connection::{Connection, Pipe};
 use std::time::Duration;
 
 #[test]
+fn owned_packets_reach_the_peer_in_order() {
+    let (a, b) = Pipe::pair();
+    let (_, writer) = Connection::local(a).split();
+    let writer = QueuedWriter::new(writer).unwrap();
+    let mut peer = Connection::local(b);
+    peer.reader
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+
+    writer.send_owned(vec![7, 10, 11]).unwrap();
+    writer.send_owned(vec![8, 12, 13]).unwrap();
+    assert_eq!(peer.recv().unwrap(), (7, vec![10, 11]));
+    assert_eq!(peer.recv().unwrap(), (8, vec![12, 13]));
+    writer.shutdown();
+}
+#[test]
 fn memory_payload_is_invisible_until_commit_and_keeps_large_body_exact() {
     let (a, b) = Pipe::pair();
     let (_, writer) = Connection::local(a).split();
