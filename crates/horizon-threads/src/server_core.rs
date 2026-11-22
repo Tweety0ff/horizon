@@ -122,6 +122,32 @@ fn whole_count(plan: &Plan) -> usize {
         .len()
 }
 
+#[cfg(any(windows, test))]
+fn fastest_allowed_cpu_count(cores: &[Core], allowed: &[usize]) -> Option<usize> {
+    let allowed: BTreeSet<usize> = allowed.iter().copied().collect();
+    let fastest_rank = cores
+        .iter()
+        .filter(|core| core.cpus.iter().any(|cpu| allowed.contains(cpu)))
+        .map(|core| core.rank)
+        .max()?;
+    let fastest = cores
+        .iter()
+        .filter(|core| core.rank == fastest_rank)
+        .flat_map(|core| core.cpus.iter())
+        .filter(|cpu| allowed.contains(cpu))
+        .count();
+    (fastest > 0 && fastest < allowed.len()).then_some(fastest)
+}
+
+/// The process's performance-core logical CPUs on Windows, from the CPU-set
+/// efficiency classes that also guide server-core reservation.
+#[cfg(windows)]
+pub(crate) fn performance_cores() -> Option<usize> {
+    let (cores, allowed) = os::topology()?;
+    fastest_allowed_cpu_count(&cores, &allowed)
+}
+
+
 struct WorkerState {
     generation: u64,
     previous: Option<os::State>,
@@ -908,6 +934,20 @@ mod tests {
         let mut cpus: Vec<usize> = cores.iter().flat_map(|c| c.cpus.clone()).collect();
         cpus.sort_unstable();
         cpus
+    }
+
+    #[test]
+    fn fastest_allowed_cpu_count_uses_efficiency_class_and_affinity() {
+        let cores = [
+            Core { cpus: vec![0, 1], rank: 5 },
+            Core { cpus: vec![2, 3], rank: 5 },
+            Core { cpus: vec![4], rank: 2 },
+            Core { cpus: vec![5], rank: 2 },
+        ];
+        assert_eq!(fastest_allowed_cpu_count(&cores, &[0, 1, 2, 3, 4, 5]), Some(4));
+        assert_eq!(fastest_allowed_cpu_count(&cores, &[1, 2, 4, 5]), Some(2));
+        assert_eq!(fastest_allowed_cpu_count(&cores, &[0, 1]), None);
+        assert_eq!(fastest_allowed_cpu_count(&[], &[0, 1]), None);
     }
 
     #[test]
