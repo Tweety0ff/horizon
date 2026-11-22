@@ -380,14 +380,18 @@ pub fn par_chunks_mut_on_with<T: Send, S: Send>(
         return;
     }
     // A thread takes a chunk whole; the lock is only held while a chunk is taken, never while
-    // it runs: the chunk is popped in a statement of its own, so the guard is gone before `f`
-    // (a guard in a `while let` scrutinee would live through the loop body). State is local
-    // to this worker invocation and survives all the chunks it takes.
-    let pending = Mutex::new(items.chunks_mut(chunk).collect::<Vec<_>>());
+    // it runs: next_back() is evaluated in its own statement, so the guard is gone before `f`
+    // (a guard in a `while let` scrutinee would live through the loop body). The iterator avoids
+    // allocating a Vec of all the mutable slices, and next_back keeps the old pop order. State is
+    // local to this worker invocation and survives all the chunks it takes.
+    let pending = Mutex::new(items.chunks_mut(chunk));
     let work = || {
         let mut state = init();
         loop {
-            let next = pending.lock().unwrap_or_else(PoisonError::into_inner).pop();
+            let next = pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .next_back();
             let Some(slice) = next else { break };
             f(slice, &mut state);
         }
