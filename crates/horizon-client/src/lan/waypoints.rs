@@ -332,6 +332,7 @@ pub struct Waypoints {
     move_of_scratch: Vec<u32>,
     changed_moves_scratch: Vec<u32>,
     changed_slots_scratch: Vec<u32>,
+    own_scratch: HashMap<u128, u32>,
     /// Which generation of the waypoints the rows' `watch` lists belong to: the transmitters, their
     /// numbers and the receivers change it.
     epoch: u64,
@@ -1155,7 +1156,8 @@ impl Waypoints {
         let mut move_of = std::mem::take(&mut self.move_of_scratch);
         move_of.resize(self.next_id as usize, NONE);
         move_of.fill(NONE);
-        let mut own: HashMap<u128, u32> = HashMap::default();
+        let mut own = std::mem::take(&mut self.own_scratch);
+        own.clear();
         if sparse {
             for (i, m) in moves.iter().enumerate() {
                 own.insert(m.uuid, i as u32);
@@ -1190,112 +1192,116 @@ impl Waypoints {
         let (sources, slot, move_of, own) = (&sources, &slot, &move_of, &own);
         let (changed_moves, changed_slots) = (&changed_moves, &changed_slots);
         let (all_moves, all_slots) = (&all_moves, &all_slots);
-        crate::parallel::par_chunks_mut(&mut jobs, 8, |jobs| {
-            for job in jobs {
-                let me = s.players.get(&job.receiver).map(|&p| Receiver {
-                    conn: p.conn,
-                    position: p.position,
-                    range: p.receive_range,
-                    spectator: p.spectator,
-                });
-                // The moves this row meets, in order, and the waypoints it sweeps: everything, or in a
-                // calm tick what changed, the pairs this row has no block connection for, and its own.
-                let mut own_moves: Vec<u32> = Vec::new();
-                let mut own_slots: Vec<u32> = Vec::new();
-                if sparse {
-                    let own_id = s.id(job.receiver);
-                    let watch = job.row.watch_for(epoch, own_id, sources);
-                    for &id in watch {
-                        if let Some(&mi) = move_of.get(id as usize)
-                            && mi != NONE
-                        {
-                            let m = &moves[mi as usize];
-                            if m.ticked && m.transmits && !m.block_changed {
-                                own_moves.push(mi);
-                            }
-                        }
-                        own_slots.push(slot[id as usize]);
-                    }
-                    if let Some(&mi) = own.get(&job.receiver)
-                        && changed_moves.binary_search(&mi).is_err()
-                    {
-                        own_moves.push(mi);
-                    }
-                    own_slots.retain(|k| changed_slots.binary_search(k).is_err());
-                    if !own_moves.is_empty() {
-                        own_moves.extend_from_slice(changed_moves);
-                        own_moves.sort_unstable();
-                    }
-                    if !own_slots.is_empty() {
-                        own_slots.extend_from_slice(changed_slots);
-                        own_slots.sort_unstable();
-                    }
-                }
-                let (meet, swept): (&[u32], &[u32]) = if !sparse {
-                    (all_moves, all_slots)
-                } else {
-                    (
-                        if own_moves.is_empty() {
-                            changed_moves
-                        } else {
-                            &own_moves
-                        },
-                        if own_slots.is_empty() {
-                            changed_slots
-                        } else {
-                            &own_slots
-                        },
-                    )
-                };
-                let mut to = Receiving {
-                    receiver: job.receiver,
-                    view: job.view,
-                    row: &mut job.row,
-                    out: &mut job.out,
-                };
-                for &mi in meet {
-                    let m = &moves[mi as usize];
-                    if m.uuid != job.receiver {
-                        // `updateWaypoint`: this receiver's connection to the mover.
-                        if job.listed && m.ticked && m.transmits {
-                            // Most movers stay in their block: nothing to send or remake.
-                            let done = me.as_ref().is_some_and(|me| {
-                                Shared::quiet(to.row, &m.source, me)
-                                    || slot
-                                        .get(m.source.id as usize)
-                                        .and_then(|&i| sources.get(i as usize)?.as_ref())
-                                        .is_some_and(|src| Shared::step(to.row, src, me, to.out))
-                            });
-                            if !done {
-                                s.update_or_create(&mut to, m.uuid);
-                            }
-                        }
-                        continue;
-                    }
-                    // `updatePlayer` before and after the view follows the move.
-                    let sweep = |to: &mut Receiving| {
-                        for &k in swept {
-                            let (source, known) = (waypoints[k as usize], &sources[k as usize]);
-                            if let (Some(src), Some(me)) = (known, &me)
-                                && (Shared::quiet(to.row, &src.source, me)
-                                    || Shared::step(to.row, src, me, to.out))
+        crate::parallel::par_chunks_mut_with_state(
+            &mut jobs,
+            8,
+            || (Vec::<u32>::new(), Vec::<u32>::new()),
+            |jobs, (own_moves, own_slots)| {
+                    for job in jobs {
+                        own_moves.clear();
+                        own_slots.clear();
+                    let me = s.players.get(&job.receiver).map(|&p| Receiver {
+                        conn: p.conn,
+                        position: p.position,
+                        range: p.receive_range,
+                        spectator: p.spectator,
+                    });
+                    // The moves this row meets, in order, and the waypoints it sweeps: everything, or in a
+                    // calm tick what changed, the pairs this row has no block connection for, and its own.
+                    if sparse {
+                        let own_id = s.id(job.receiver);
+                        let watch = job.row.watch_for(epoch, own_id, sources);
+                        for &id in watch {
+                            if let Some(&mi) = move_of.get(id as usize)
+                                && mi != NONE
                             {
-                                continue;
+                                let m = &moves[mi as usize];
+                                if m.ticked && m.transmits && !m.block_changed {
+                                    own_moves.push(mi);
+                                }
                             }
-                            s.update_or_create(to, source);
+                            own_slots.push(slot[id as usize]);
                         }
+                        if let Some(&mi) = own.get(&job.receiver)
+                            && changed_moves.binary_search(&mi).is_err()
+                        {
+                            own_moves.push(mi);
+                        }
+                        own_slots.retain(|k| changed_slots.binary_search(k).is_err());
+                        if !own_moves.is_empty() {
+                            own_moves.extend_from_slice(changed_moves);
+                            own_moves.sort_unstable();
+                        }
+                        if !own_slots.is_empty() {
+                            own_slots.extend_from_slice(changed_slots);
+                            own_slots.sort_unstable();
+                        }
+                    }
+                    let (meet, swept): (&[u32], &[u32]) = if !sparse {
+                        (all_moves, all_slots)
+                    } else {
+                        (
+                            if own_moves.is_empty() {
+                                changed_moves
+                            } else {
+                                &own_moves
+                            },
+                            if own_slots.is_empty() {
+                                changed_slots
+                            } else {
+                                &own_slots
+                            },
+                        )
                     };
-                    if m.ticked && m.receives {
-                        sweep(&mut to);
-                    }
-                    if m.new_view.is_some() {
-                        to.view = m.new_view;
-                    }
-                    if m.receives {
-                        sweep(&mut to);
+                    let mut to = Receiving {
+                        receiver: job.receiver,
+                        view: job.view,
+                        row: &mut job.row,
+                        out: &mut job.out,
+                    };
+                    for &mi in meet {
+                        let m = &moves[mi as usize];
+                        if m.uuid != job.receiver {
+                            // `updateWaypoint`: this receiver's connection to the mover.
+                            if job.listed && m.ticked && m.transmits {
+                                // Most movers stay in their block: nothing to send or remake.
+                                let done = me.as_ref().is_some_and(|me| {
+                                    Shared::quiet(to.row, &m.source, me)
+                                        || slot
+                                            .get(m.source.id as usize)
+                                            .and_then(|&i| sources.get(i as usize)?.as_ref())
+                                            .is_some_and(|src| Shared::step(to.row, src, me, to.out))
+                                });
+                                if !done {
+                                    s.update_or_create(&mut to, m.uuid);
+                                }
+                            }
+                            continue;
+                        }
+                        // `updatePlayer` before and after the view follows the move.
+                        let sweep = |to: &mut Receiving| {
+                            for &k in swept {
+                                let (source, known) = (waypoints[k as usize], &sources[k as usize]);
+                                if let (Some(src), Some(me)) = (known, &me)
+                                    && (Shared::quiet(to.row, &src.source, me)
+                                        || Shared::step(to.row, src, me, to.out))
+                                {
+                                    continue;
+                                }
+                                s.update_or_create(to, source);
+                            }
+                        };
+                        if m.ticked && m.receives {
+                            sweep(&mut to);
+                        }
+                        if m.new_view.is_some() {
+                            to.view = m.new_view;
+                        }
+                        if m.receives {
+                            sweep(&mut to);
+                        }
                     }
                 }
-            }
         });
         t.out.reserve(jobs.iter().map(|j| j.out.len()).sum());
         for job in jobs {
@@ -1307,6 +1313,7 @@ impl Waypoints {
         self.move_of_scratch = move_of;
         self.changed_moves_scratch = changed_moves;
         self.changed_slots_scratch = changed_slots;
+        self.own_scratch = own;
     }
     /// Whether this tick's moves can be met by what changed alone. A pair neither of whose players
     /// changed block, and whose connection is a block one in range, has nothing to send: the check
