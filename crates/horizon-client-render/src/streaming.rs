@@ -771,6 +771,9 @@ struct GenerationScan {
     band: Option<Band>,
     chunk_revision: u64,
     plan: Vec<(i64, i32, i32)>,
+    /// Reused work lists for a full range scan.
+    scan_wanted: Vec<(i64, i32, i32)>,
+    scan_runs: Vec<(i32, i32, i32)>,
     /// Entries before it are no longer missing.
     next: usize,
     /// What `plan` was made for: the ranges and decoration; the chunk
@@ -890,39 +893,46 @@ impl GenerationScan {
             }
         }
         {
-            let mut wanted = Vec::new();
+            let wanted = &mut self.scan_wanted;
+            wanted.clear();
             // Each area's square of columns, as one run per row. Players'
             // areas overlap (a server's players often stand together), so
             // the runs of a row are merged and each column is looked at once.
-            let mut runs: Vec<(i32, i32, i32)> = Vec::new();
-            for (center, radius) in std::iter::once((input.ranges.center, input.ranges.radius))
-                .chain(input.ranges.extra.iter().copied())
             {
-                let r = radius + margin.max(reach + 1);
-                runs.extend((center.1 - r..=center.1 + r).map(|z| (z, center.0 - r, center.0 + r)));
-            }
-            if let Some(band) = input.ranges.band {
-                let r = margin.max(reach + 1);
-                runs.extend((band.z0 - r..=band.z1 + r).map(|z| (z, band.x0 - r, band.x1 + r)));
-            }
-            runs.sort_unstable();
-            let mut runs = runs.into_iter().peekable();
-            while let Some((z, x0, mut x1)) = runs.next() {
-                while let Some((_, _, next_x1)) =
-                    runs.next_if(|&(nz, nx0, _)| nz == z && nx0 <= x1.saturating_add(1))
+                let runs = &mut self.scan_runs;
+                runs.clear();
+                for (center, radius) in
+                    std::iter::once((input.ranges.center, input.ranges.radius))
+                        .chain(input.ranges.extra.iter().copied())
                 {
-                    x1 = x1.max(next_x1);
+                    let r = radius + margin.max(reach + 1);
+                    runs.extend(
+                        (center.1 - r..=center.1 + r).map(|z| (z, center.0 - r, center.0 + r)),
+                    );
                 }
-                for x in x0..=x1 {
-                    if !input.ranges.requested(x, z, input.decorates)
-                        || input.world.chunks.contains_key(&(x, z))
-                        || input.generating.contains(&(x, z))
-                        || input.protos.contains_key(&(x, z))
-                        || input.finishing.contains(&(x, z))
+                if let Some(band) = input.ranges.band {
+                    let r = margin.max(reach + 1);
+                    runs.extend((band.z0 - r..=band.z1 + r).map(|z| (z, band.x0 - r, band.x1 + r)));
+                }
+                runs.sort_unstable();
+                let mut runs = runs.drain(..).peekable();
+                while let Some((z, x0, mut x1)) = runs.next() {
+                    while let Some((_, _, next_x1)) =
+                        runs.next_if(|&(nz, nx0, _)| nz == z && nx0 <= x1.saturating_add(1))
                     {
-                        continue;
+                        x1 = x1.max(next_x1);
                     }
-                    wanted.push((input.ranges.priority(x, z), x, z));
+                    for x in x0..=x1 {
+                        if !input.ranges.requested(x, z, input.decorates)
+                            || input.world.chunks.contains_key(&(x, z))
+                            || input.generating.contains(&(x, z))
+                            || input.protos.contains_key(&(x, z))
+                            || input.finishing.contains(&(x, z))
+                        {
+                            continue;
+                        }
+                        wanted.push((input.ranges.priority(x, z), x, z));
+                    }
                 }
             }
             // Forced chunks and their generation neighbourhood: the ring that
@@ -940,7 +950,7 @@ impl GenerationScan {
                         if input.world.chunks.contains_key(&(x, z))
                             || input.generating.contains(&(x, z))
                             || input.protos.contains_key(&(x, z))
-                            || input.finishing.contains(&(x, z))
+                            || input.finishing.contains_key(&(x, z))
                         {
                             continue;
                         }
@@ -948,33 +958,38 @@ impl GenerationScan {
                     }
                 }
             }
-            let ranges = Ranges {
-                center: input.ranges.center,
-                radius: input.ranges.radius,
-                extra: input.ranges.extra,
-                forced: input.ranges.forced,
-                cover: input.ranges.cover,
-                forced_cover: None,
-                band: input.ranges.band,
-            };
-            self.remember(ranges, input.world);
-            if wanted.is_empty() {
-                self.plan.clear();
-                self.plan_basis = None;
-            } else {
-                // A bounded batch may leave candidates behind: the next calls
-                // take them from the plan as capacity opens.
-                self.exhausted = false;
-                self.plan_basis = Some(input.decorates);
-            }
-            wanted.sort_unstable();
-            wanted.dedup();
-            self.plan.clear();
-            self.plan.extend_from_slice(&wanted);
-            self.next = 0;
-            batch.extend(wanted.into_iter().take(capacity - input.generating.len()));
-            Some(())
         }
+        let ranges = Ranges {
+            center: input.ranges.center,
+            radius: input.ranges.radius,
+            extra: input.ranges.extra,
+            forced: input.ranges.forced,
+            cover: input.ranges.cover,
+            forced_cover: None,
+            band: input.ranges.band,
+        };
+        self.remember(ranges, input.world);
+        if self.scan_wanted.is_empty() {
+            self.plan.clear();
+            self.plan_basis = None;
+        } else {
+            // A bounded batch may leave candidates behind: the next calls
+            // take them from the plan as capacity opens.
+            self.exhausted = false;
+            self.plan_basis = Some(input.decorates);
+        }
+        self.scan_wanted.sort_unstable();
+        self.scan_wanted.dedup();
+        self.plan.clear();
+        self.plan.extend_from_slice(&self.scan_wanted);
+        self.next = 0;
+        batch.extend(
+            self.scan_wanted
+                .iter()
+                .take(capacity - input.generating.len())
+                .copied(),
+        );
+        Some(())
     }
 }
 /// What a pool worker keeps for one streamer between its jobs: the
@@ -4967,29 +4982,42 @@ mod tests {
     }
 
     #[test]
-    fn generation_batch_buffer_reuses_capacity_and_keeps_candidate_order() {
+    fn generation_batch_and_full_scan_buffers_reuse_capacity_in_order() {
         for decorates in [false, true] {
-            let fixture = GenerationFixture::new(2, decorates);
-            let expected = {
-                let mut reference = GenerationScan::default();
-                reference.candidates(fixture.input(), 3).unwrap()
-            };
-            assert_eq!(expected.len(), 3);
-
+            let mut fixture = GenerationFixture::new(2, decorates);
             let mut gate = GenerationScan::default();
             let mut batch = Vec::with_capacity(3);
-            assert!(gate
-                .candidates_into(fixture.input(), 3, &mut batch)
-                .is_some());
-            assert_eq!(batch, expected);
-            let capacity = batch.capacity();
 
-            batch.clear();
+            let expected = baseline_candidates(fixture.input(), 3);
+            assert_eq!(expected.len(), 3);
             assert!(gate
                 .candidates_into(fixture.input(), 3, &mut batch)
                 .is_some());
             assert_eq!(batch, expected);
-            assert_eq!(batch.capacity(), capacity);
+            let capacities = (
+                batch.capacity(),
+                gate.scan_wanted.capacity(),
+                gate.scan_runs.capacity(),
+            );
+            assert!(capacities.1 > 0 && capacities.2 > 0);
+
+            // A changed view forces another full scan, but each scratch
+            // allocation is retained and the exact same ordering is produced.
+            fixture.center = (1, -1);
+            batch.clear();
+            let expected = baseline_candidates(fixture.input(), 3);
+            assert!(gate
+                .candidates_into(fixture.input(), 3, &mut batch)
+                .is_some());
+            assert_eq!(batch, expected);
+            assert_eq!(
+                (
+                    batch.capacity(),
+                    gate.scan_wanted.capacity(),
+                    gate.scan_runs.capacity(),
+                ),
+                capacities
+            );
         }
     }
 
