@@ -2069,6 +2069,8 @@ pub struct Lod {
     returning: Vec<TileKey>,
     /// Reused list of the coarsest returning tiles being brought back this update.
     returning_now_scratch: Vec<TileKey>,
+    /// Queued sample keys removed while holding or rebuilding the view.
+    dropped_samples_scratch: Vec<TileKey>,
     /// Reusable lists for the infrequent view-plan rebuild.
     replan_gone_scratch: Vec<TileKey>,
     replan_leaving_scratch: Vec<TileKey>,
@@ -2461,6 +2463,7 @@ impl Lod {
             kept: kept::KeptTiles::new(kept::KEPT_FOR, kept::KEPT_BYTES),
             returning: Vec::new(),
             returning_now_scratch: Vec::new(),
+            dropped_samples_scratch: Vec::new(),
             replan_gone_scratch: Vec::new(),
             replan_leaving_scratch: Vec::new(),
             replan_seam_scratch: Vec::new(),
@@ -3149,11 +3152,13 @@ impl Lod {
             // must not wait behind it. Larger machines keep its first
             // `SAMPLE_JOBS`, small ones none.
             let mut keep = if self.small { 0 } else { SAMPLE_JOBS };
-            let dropped = drop_queued_samples(&self.shared, &mut self.pending, |_| {
+            let mut dropped = std::mem::take(&mut self.dropped_samples_scratch);
+            dropped.clear();
+            drop_queued_samples_into(&self.shared, &mut self.pending, |_| {
                 let kept = keep > 0;
                 keep = keep.saturating_sub(1);
                 kept
-            });
+            }, &mut dropped);
             // Sampled again from the queue: they read what `refresh` announced.
             for key in &dropped {
                 self.restale.remove(key);
@@ -3162,7 +3167,7 @@ impl Lod {
             // start and stop loading every few frames, and rebuilding the whole
             // queue each time cost more than the samples it held back.
             let camera = self.plan.camera;
-            self.wanted.extend(dropped.into_iter().map(|key| {
+            self.wanted.extend(dropped.drain(..).map(|key| {
                 let class = if self.plan.split.contains(&key) {
                     BACKDROP
                 } else if key.reach(camera) < self.plan.first {
@@ -3178,6 +3183,7 @@ impl Lod {
                     level: key.level,
                 })
             }));
+            self.dropped_samples_scratch = dropped;
             // A sample may still be running: the held pace starts from now.
             self.held_sample_at = std::time::Instant::now();
         }
@@ -3400,9 +3406,12 @@ impl Lod {
         let nodes = &self.plan.nodes;
         self.mesh_samples.retain(|key| nodes.contains(key));
         // Queued tiles the view left are not sampled; a running one is dropped (`finish_sample`).
-        drop_queued_samples(&self.shared, &mut self.pending, |key| {
+        let mut dropped = std::mem::take(&mut self.dropped_samples_scratch);
+        dropped.clear();
+        drop_queued_samples_into(&self.shared, &mut self.pending, |key| {
             self.plan.nodes.contains(key)
-        });
+        }, &mut dropped);
+        self.dropped_samples_scratch = dropped;
         self.stale.retain(|key| self.plan.nodes.contains(key));
         self.restale.retain(|key| self.plan.nodes.contains(key));
         self.detail_masks
@@ -4228,9 +4237,19 @@ fn detail_count(mask: &[u64; 4]) -> usize {
 fn drop_queued_samples(
     shared: &Shared,
     pending: &mut FxHashSet<TileKey>,
-    mut keep: impl FnMut(&TileKey) -> bool,
+    keep: impl FnMut(&TileKey) -> bool,
 ) -> Vec<TileKey> {
     let mut dropped = Vec::new();
+    drop_queued_samples_into(shared, pending, keep, &mut dropped);
+    dropped
+}
+fn drop_queued_samples_into(
+    shared: &Shared,
+    pending: &mut FxHashSet<TileKey>,
+    mut keep: impl FnMut(&TileKey) -> bool,
+    dropped: &mut Vec<TileKey>,
+) {
+    dropped.clear();
     shared.jobs.lock().unwrap().retain(|job| match job {
         Job::Sample(key) if !keep(key) => {
             pending.remove(key);
@@ -4239,7 +4258,6 @@ fn drop_queued_samples(
         }
         _ => true,
     });
-    dropped
 }
 /// Fine retiring stand-ins need actual column detail before `Plan::replaces`
 /// can release their normal meshes. The caller keeps the usual detail-request
