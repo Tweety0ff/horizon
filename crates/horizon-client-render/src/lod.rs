@@ -3679,19 +3679,14 @@ impl Lod {
             return;
         }
         let (plan, ready, masks) = (&self.plan, &self.ready, &self.detail_masks);
-        let keep: FxHashSet<_> = self
-            .retiring
-            .iter()
-            .copied()
-            .filter(|&column| {
-                // A saved summary alone is not detail: the tile may still be
-                // the empty covered stand-in. Only a completed mask proves
-                // its columns replaced the full-detail mesh.
-                !plan.replaces(column, ready, |key| masks.get(&key) == Some(&[u64::MAX; 4]))
-            })
-            .collect();
-        if keep.len() != self.retiring.len() {
-            self.retiring = keep;
+        let before = self.retiring.len();
+        self.retiring.retain(|&column| {
+            // A saved summary alone is not detail: the tile may still be
+            // the empty covered stand-in. Only a completed mask proves
+            // its columns replaced the full-detail mesh.
+            !plan.replaces(column, ready, |key| masks.get(&key) == Some(&[u64::MAX; 4]))
+        });
+        if self.retiring.len() != before {
             self.leave_out();
         }
     }
