@@ -343,8 +343,8 @@ fn tick_lanes(cores: usize) -> usize {
     cores.saturating_sub(1).clamp(1, 8)
 }
 
-/// Worker lane count without the cap of [`par_chunks_mut`], or one when
-/// `HORIZON_SERIAL_TICK=all` or fewer than three performance cores are available.
+/// Worker lane count (up to eight), or one when `HORIZON_SERIAL_TICK=all`
+/// or fewer than three performance cores are available.
 pub fn worker_lanes() -> usize {
     if horizon_threads::serial_tick_all() {
         1
@@ -514,10 +514,12 @@ mod tests {
         assert!(!run(&mut auto, 36.0, 2), "no faster: undone");
         assert!(!run(&mut auto, 36.0, 40), "waiting");
         assert!(run(&mut auto, 36.0, 20), "tried again after five minutes");
-        // Too few performance cores: never.
-        let mut small = Auto::new();
-        for _ in 0..20 * WINDOW {
-            assert!(!small.after_tick(40.0, 40.0, 2));
+        // Fewer than four performance cores: never.
+        for performance_cores in 1..MIN_PERFORMANCE_CORES {
+            let mut small = Auto::new();
+            for _ in 0..20 * WINDOW {
+                assert!(!small.after_tick(40.0, 40.0, performance_cores));
+            }
         }
         // Ticks that are slow on the clock while the thread hardly works (a busy or swapping
         // machine) have nothing to share.
