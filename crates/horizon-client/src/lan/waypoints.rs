@@ -1197,9 +1197,9 @@ impl Waypoints {
             8,
             || (Vec::<u32>::new(), Vec::<u32>::new()),
             |jobs, (own_moves, own_slots)| {
-                    for job in jobs {
-                        own_moves.clear();
-                        own_slots.clear();
+                for job in jobs {
+                    own_moves.clear();
+                    own_slots.clear();
                     let me = s.players.get(&job.receiver).map(|&p| Receiver {
                         conn: p.conn,
                         position: p.position,
