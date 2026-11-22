@@ -634,7 +634,8 @@ fn mesh_columns_with_edges<L: Look>(
         .collect();
     let mut faces = Faces::<L>::new();
     let finer_keys: FxHashSet<_> = finer.iter().copied().collect();
-    let mut finer_levels: Vec<_> = finer.iter().map(|key| key.level).collect();
+    let mut finer_levels = smallvec::SmallVec::<[u8; 4]>::new();
+    finer_levels.extend(finer.iter().map(|key| key.level));
     finer_levels.sort_unstable();
     finer_levels.dedup();
     let is_covered = |x: i32, z: i32| {
