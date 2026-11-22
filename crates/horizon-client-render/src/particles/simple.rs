@@ -2,6 +2,7 @@
 //! their own particle, the world and the sprite sets, which `ParticleEngine::tick_all` runs on several
 //! threads in a busy scene.
 use super::{Behaviour, Particle, ParticleEngine, ParticleLevel, Sprite, mod_curve};
+use std::sync::OnceLock;
 
 /// The live particles it takes before `tick_all` uses more than one thread: a scoped thread costs
 /// tens of microseconds to start and join, and a simple particle about a tenth of one.
@@ -10,6 +11,26 @@ pub(super) const PARALLEL_MIN: usize = 2048;
 /// the render thread need cores too); `HORIZON_WORKER_THREADS` caps them as it does every pool.
 pub(super) fn parallel_threads() -> usize {
     (horizon_threads::worker_count() / 2).clamp(1, 4)
+}
+
+/// Persistent worker pools keyed by the requested lane count. The caller is
+/// one lane (via `in_place_scope`), so each pool owns only the helper lanes.
+/// The small set of lane counts also lets the stress benchmark compare
+/// different configurations in one process without silently reusing the
+/// first configuration's pool.
+fn particle_pool(lanes: usize) -> &'static rayon::ThreadPool {
+    const MAX_HELPERS: usize = 64;
+    static POOLS: OnceLock<[OnceLock<rayon::ThreadPool>; MAX_HELPERS + 1]> = OnceLock::new();
+
+    let helpers = lanes.saturating_sub(1).clamp(1, MAX_HELPERS);
+    let pools = POOLS.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
+    pools[helpers].get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(helpers)
+            .thread_name(|i| format!("particle-tick-{i}"))
+            .build()
+            .expect("particle tick worker pool")
+    })
 }
 pub(super) fn sprite_from_age_in(set_sprites: &[Vec<u32>], p: &mut Particle) {
     if p.removed {
@@ -134,7 +155,7 @@ impl ParticleEngine {
         let sets = &self.set_sprites;
         let per = particles.len().div_ceil(self.parallel_threads);
         let mut handled = vec![Simple::No; particles.len()];
-        std::thread::scope(|scope| {
+        particle_pool(self.parallel_threads).in_place_scope(|scope| {
             let run = |part: &mut [Particle], done: &mut [Simple], level: &ParticleLevel| {
                 for (p, done) in part.iter_mut().zip(done) {
                     *done = tick_simple(sets, p, level);
@@ -144,9 +165,10 @@ impl ParticleEngine {
             let own = parts.next();
             for (part, done) in parts {
                 let view = thread_view(level);
-                scope.spawn(move || run(part, done, &view));
+                scope.spawn(move |_| run(part, done, &view));
             }
-            // This thread takes the first share, instead of waiting for the others.
+            // The calling thread takes one share too; the pool only supplies
+            // the remaining lanes, and its workers are reused by later ticks.
             if let Some((part, done)) = own {
                 run(part, done, level);
             }
