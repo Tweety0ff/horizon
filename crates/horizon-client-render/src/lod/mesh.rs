@@ -593,7 +593,7 @@ fn mesh_columns_with_edges<L: Look>(
             [ox, oz]
         }
     };
-    let mut materials = Vec::new();
+    let mut materials = smallvec::SmallVec::<[Material<L>; 4]>::new();
     let prepared: Vec<Vec<Segment<'_, L>>> = filled
         .iter()
         .map(FilledSpans::as_slice)
