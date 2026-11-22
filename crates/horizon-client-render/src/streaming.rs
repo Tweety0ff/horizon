@@ -2469,29 +2469,30 @@ impl Streaming {
         (uploads, removed)
     }
     fn schedule_generation(&mut self, world: &World, workers: usize) {
-        let input = GenerationInputs {
-            ranges: Ranges {
-                center: self.center,
-                radius: self.radius,
-                extra: &self.extra,
-                forced: &self.forced,
-                cover: ExtraCover::current(&self.cover, &self.extra, self.cover_current),
-                forced_cover: self.forced_cover.as_ref().filter(|_| self.cover_current),
-                band: self.band.as_ref(),
-            },
-            world,
-            generating: &self.generating,
-            protos: &self.protos,
-            finishing: &self.finishing,
-            decorates: self.decorates,
-            remote: self.remote,
-        };
         let mut wanted = std::mem::take(&mut self.generation_batch_scratch);
-        if self
-            .generation_scan
-            .candidates_into(input, workers * 3, &mut wanted)
-            .is_some()
-        {
+        let has_batch = {
+            let input = GenerationInputs {
+                ranges: Ranges {
+                    center: self.center,
+                    radius: self.radius,
+                    extra: &self.extra,
+                    forced: &self.forced,
+                    cover: ExtraCover::current(&self.cover, &self.extra, self.cover_current),
+                    forced_cover: self.forced_cover.as_ref().filter(|_| self.cover_current),
+                    band: self.band.as_ref(),
+                },
+                world,
+                generating: &self.generating,
+                protos: &self.protos,
+                finishing: &self.finishing,
+                decorates: self.decorates,
+                remote: self.remote,
+            };
+            self.generation_scan
+                .candidates_into(input, workers * 3, &mut wanted)
+                .is_some()
+        };
+        if has_batch {
             for &(_, x, z) in &wanted {
                 self.generating.insert((x, z));
                 self.submit(Some((x, z)), 0, Job::Generate(x, z));
@@ -4962,6 +4963,33 @@ mod tests {
             let result = gate.candidates(self.input(), capacity);
             assert_eq!(result.as_deref().unwrap_or(&[]), expected);
             result.is_some()
+        }
+    }
+
+    #[test]
+    fn generation_batch_buffer_reuses_capacity_and_keeps_candidate_order() {
+        for decorates in [false, true] {
+            let fixture = GenerationFixture::new(2, decorates);
+            let expected = {
+                let mut reference = GenerationScan::default();
+                reference.candidates(fixture.input(), 3).unwrap()
+            };
+            assert_eq!(expected.len(), 3);
+
+            let mut gate = GenerationScan::default();
+            let mut batch = Vec::with_capacity(3);
+            assert!(gate
+                .candidates_into(fixture.input(), 3, &mut batch)
+                .is_some());
+            assert_eq!(batch, expected);
+            let capacity = batch.capacity();
+
+            batch.clear();
+            assert!(gate
+                .candidates_into(fixture.input(), 3, &mut batch)
+                .is_some());
+            assert_eq!(batch, expected);
+            assert_eq!(batch.capacity(), capacity);
         }
     }
 
