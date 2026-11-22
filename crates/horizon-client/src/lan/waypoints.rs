@@ -332,6 +332,8 @@ pub struct Waypoints {
     move_of_scratch: Vec<u32>,
     changed_moves_scratch: Vec<u32>,
     changed_slots_scratch: Vec<u32>,
+    all_moves_scratch: Vec<u32>,
+    all_slots_scratch: Vec<u32>,
     own_scratch: HashMap<u128, u32>,
     /// Which generation of the waypoints the rows' `watch` lists belong to: the transmitters, their
     /// numbers and the receivers change it.
@@ -1183,21 +1185,19 @@ impl Waypoints {
             }
             changed_slots.sort_unstable();
         }
-        let all_moves: Vec<u32> = if sparse {
-            Vec::new()
-        } else {
-            (0..moves.len() as u32).collect()
-        };
-        let all_slots: Vec<u32> = if sparse {
-            Vec::new()
-        } else {
-            (0..sources.len() as u32).collect()
-        };
+        let mut all_moves = std::mem::take(&mut self.all_moves_scratch);
+        all_moves.clear();
+        let mut all_slots = std::mem::take(&mut self.all_slots_scratch);
+        all_slots.clear();
+        if !sparse {
+            all_moves.extend(0..moves.len() as u32);
+            all_slots.extend(0..sources.len() as u32);
+        }
         let epoch = self.epoch + 1;
         let (s, waypoints, moves) = (&t.s, &self.waypoints, &moves);
         let (sources, slot, move_of, own) = (&sources, &slot, &move_of, &own);
         let (changed_moves, changed_slots) = (&changed_moves, &changed_slots);
-        let (all_moves, all_slots) = (&all_moves, &all_slots);
+        let (all_moves_view, all_slots_view) = (&all_moves, &all_slots);
         crate::parallel::par_chunks_mut_with_state(
             &mut jobs,
             8,
@@ -1244,7 +1244,7 @@ impl Waypoints {
                         }
                     }
                     let (meet, swept): (&[u32], &[u32]) = if !sparse {
-                        (all_moves, all_slots)
+                        (all_moves_view, all_slots_view)
                     } else {
                         (
                             if own_moves.is_empty() {
@@ -1319,6 +1319,8 @@ impl Waypoints {
         self.move_of_scratch = move_of;
         self.changed_moves_scratch = changed_moves;
         self.changed_slots_scratch = changed_slots;
+        self.all_moves_scratch = all_moves;
+        self.all_slots_scratch = all_slots;
         self.own_scratch = own;
     }
     /// Whether this tick's moves can be met by what changed alone. A pair neither of whose players
@@ -1376,6 +1378,43 @@ mod tests {
                 other => panic!("{other:?}"),
             })
             .collect()
+    }
+
+    #[test]
+    fn dense_waypoint_sweeps_reuse_their_index_buffers() {
+        let previous = NO_SPARSE.swap(true, std::sync::atomic::Ordering::Relaxed);
+        struct RestoreSparse(bool);
+        impl Drop for RestoreSparse {
+            fn drop(&mut self) {
+                NO_SPARSE.store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _restore = RestoreSparse(previous);
+
+        let mut waypoints = Waypoints::default();
+        let mut players = vec![
+            player(1, 10, [0.5, 100.0, 0.5]),
+            player(2, 20, [5.5, 100.0, 0.5]),
+        ];
+        // Use a zero threshold to exercise the receiver sweep without a large fixture.
+        waypoints.tick_with(&players, &[], &[], true, 0);
+        players[0].position[0] += 1.0;
+        waypoints.tick_with(&players, &[], &[], true, 0);
+        let capacities = (
+            waypoints.all_moves_scratch.capacity(),
+            waypoints.all_slots_scratch.capacity(),
+        );
+        assert!(capacities.0 > 0 && capacities.1 > 0);
+        players[1].position[0] += 1.0;
+        waypoints.tick_with(&players, &[], &[], true, 0);
+        assert_eq!(
+            (
+                waypoints.all_moves_scratch.capacity(),
+                waypoints.all_slots_scratch.capacity(),
+            ),
+            capacities,
+            "successive dense sweeps reuse both index buffers"
+        );
     }
 
     #[test]
