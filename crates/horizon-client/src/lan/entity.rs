@@ -1385,9 +1385,12 @@ impl Entities {
             );
             let (cells_on, stats) = (self.cells.on(), self.cells.stats());
             crate::parallel::par_chunks_mut(&mut players, 16, |players| {
+                // One reusable chunk-visibility scratch buffer per worker batch,
+                // not one fresh allocation for every viewer in that batch.
+                let mut held = vec![0; chunks.len()];
                 for (v, flags, starts) in players {
                     flags.clear();
-                    let mut held = vec![0; chunks.len()];
+                    held.fill(0);
                     let (chunks, held) = (&**chunks, &mut held);
                     let mut kept = 0;
                     let room = horizon_protocol::viewed_levels::MAX_ENTITIES;
