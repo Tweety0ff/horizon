@@ -174,7 +174,7 @@ mod par_chunks_tests {
 
 /// The chunk worker pool's automatic size (`jobs::default_threads`, Graphics > Worker
 /// threads on Auto): every core but one, as vanilla's `Util.maxAllowedExecutorThreads`,
-/// counting only performance cores on Apple silicon and hybrid Linux CPUs where detected.
+/// counting only performance cores on Apple silicon, hybrid Linux and Windows CPUs where detected.
 /// Its efficiency cores are slower,
 /// and workers there kept the render and server threads waiting for a performance core: on
 /// a base M4 (4 performance and 6 efficiency cores) a fast flight's p99 frame went from
@@ -185,8 +185,9 @@ pub fn default_workers() -> usize {
 
 /// The cores this process has for its foreground CPU-bound pools: [`worker_count`]'s
 /// share, narrowed to the performance cores where the machine tells them apart (its
-/// efficiency cores don't carry foreground workers). Detection is cached: on Linux it
-/// reads CPU frequency data from sysfs, and this is called from foreground hot paths.
+/// efficiency cores don't carry foreground workers). Detection is cached: Linux reads the
+/// process's CPU affinity and sysfs frequencies; Windows reads CPU-set efficiency classes.
+
 pub fn usable_cores() -> usize {
     static USABLE: OnceLock<usize> = OnceLock::new();
     *USABLE.get_or_init(|| usable_cores_for(worker_count(), performance_cores))
@@ -208,10 +209,7 @@ fn workers_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usi
         .max(1)
 }
 
-/// The machine's performance cores:
-/// - on Apple silicon via `hw.perflevel0.physicalcpu`
-/// - on Linux by comparing max frequencies in `/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq`
-///   (Intel Alder Lake, Raptor Lake, Meteor Lake, big.LITTLE ARM)
+/// The Apple Silicon performance cores, via `hw.perflevel0.physicalcpu`.
 #[cfg(target_vendor = "apple")]
 fn performance_cores() -> Option<usize> {
     let mut count: libc::c_int = 0;
@@ -229,11 +227,13 @@ fn performance_cores() -> Option<usize> {
     (read == 0 && count > 0).then_some(count as usize)
 }
 
+/// Linux performance cores among the CPUs allowed to this process, using sysfs frequencies.
 #[cfg(target_os = "linux")]
 fn performance_cores() -> Option<usize> {
     server_core::performance_cores()
 }
 
+/// Windows performance cores, using CPU-set efficiency classes.
 #[cfg(windows)]
 fn performance_cores() -> Option<usize> {
     server_core::performance_cores()
