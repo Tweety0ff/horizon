@@ -994,6 +994,8 @@ pub struct Entities {
     /// that moved checks only the chunks within its view distance.
     chunk_members: Vec<Vec<u32>>,
     flags: Vec<Vec<u8>>,
+    /// Per-viewer start lists, kept across ticks to reuse their allocations.
+    starts: Vec<Vec<usize>>,
     /// Whether a client starts tracking each entity this tick.
     pairs: Vec<bool>,
     /// The entities that appeared or moved to another section this tick
@@ -1367,7 +1369,9 @@ impl Entities {
         // player's packets keep their order, as vanilla's do.
         let mut flags = std::mem::take(&mut self.flags);
         flags.resize_with(viewers.len(), Vec::new);
-        let mut starts: Vec<Vec<usize>> = vec![Vec::new(); viewers.len()];
+        let mut starts = std::mem::take(&mut self.starts);
+        starts.resize_with(viewers.len(), Vec::new);
+        starts.truncate(viewers.len());
         let mut players: Vec<(&mut Viewer, &mut Vec<u8>, &mut Vec<usize>)> = viewers
             .iter_mut()
             .zip(&mut flags)
@@ -1390,6 +1394,7 @@ impl Entities {
                 let mut held = vec![0; chunks.len()];
                 for (v, flags, starts) in players {
                     flags.clear();
+                    starts.clear();
                     held.fill(0);
                     let (chunks, held) = (&**chunks, &mut held);
                     let mut kept = 0;
@@ -1552,6 +1557,7 @@ impl Entities {
         if self.states.len() > stamped {
             self.states.retain(|s| s.seen == now);
         }
+        self.starts = starts;
     }
 
     /// Whether this tick's send pass runs on several threads: with many clients and many
