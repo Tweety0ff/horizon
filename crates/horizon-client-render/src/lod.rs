@@ -2922,7 +2922,8 @@ impl Lod {
     }
     fn apply_detail(&mut self, (cx, cz): (i32, i32), columns: &ReducedColumns) {
         self.apply_fine((cx, cz), &columns.columns);
-        let mut modified = Vec::new();
+        // At most one tile per level is touched below (four levels total).
+        let mut modified = smallvec::SmallVec::<[TileKey; 4]>::new();
         // A single generated chunk cannot describe a larger cell's area
         // (strides over 16 blocks, levels over 4); level 0 was applied above.
         // At each level up to 4, only the tile holding the chunk overlaps it.
