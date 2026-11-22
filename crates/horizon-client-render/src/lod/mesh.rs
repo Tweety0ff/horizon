@@ -536,6 +536,31 @@ fn heightmap(column: &[Span], mut fluid: impl FnMut(&Span) -> bool) -> Spans {
     }
     spans
 }
+/// Small descendant sets are quicker to scan directly. Once a coarse fallback has many
+/// active descendants, index the smallest descendant tile touching each of its 256 cells
+/// in one pass instead of rescanning the whole set for every cell.
+fn finer_cell_steps(key: TileKey, finer: &[TileKey], stride: i32) -> [i32; CELLS * CELLS] {
+    let [ox, _, oz] = key.origin();
+    let mut steps = [stride; CELLS * CELLS];
+    for other in finer {
+        let size = other.size();
+        // A tile at least as wide as one cell cannot make that cell's step smaller.
+        if size >= stride {
+            continue;
+        }
+        let [x, _, z] = other.origin();
+        let (x, z) = (x - ox, z - oz);
+        // Descendant tiles are aligned to the parent grid. Since size < stride,
+        // each one belongs wholly to exactly one of its cells.
+        if x < 0 || z < 0 || x >= key.size() || z >= key.size() {
+            continue;
+        }
+        let index = (z / stride) as usize * CELLS + (x / stride) as usize;
+        steps[index] = steps[index].min(size);
+    }
+    steps
+}
+
 fn mesh_columns_with_edges<L: Look>(
     key: TileKey,
     columns: &[&[Span]],
@@ -588,17 +613,28 @@ fn mesh_columns_with_edges<L: Look>(
     let stride = key.size() / CELLS as i32;
     let [ox, _, oz] = key.origin();
     // A cell meets full-detail or finer terrain: it is meshed in smaller steps.
+    // A deep cut can leave hundreds of active descendants under one coarse
+    // fallback. Index those once; for the usual four-or-fewer children, the
+    // direct scan avoids building the table.
+    let finer_steps = (finer.len() > CELLS).then(|| finer_cell_steps(key, finer, stride));
     let cell_step = |x: usize, z: usize| {
         let (wx, wz) = (ox + x as i32 * stride, oz + z as i32 * stride);
         let overlaps = covered_bounds.is_some_and(|[x0, z0, x1, z1]| {
             wx < x1 && wx + stride > x0 && wz < z1 && wz + stride > z0
         });
         let mut step = if overlaps { stride.min(16) } else { stride };
-        for other in finer {
-            let [x, _, z] = other.origin();
-            if wx < x + other.size() && x < wx + stride && wz < z + other.size() && z < wz + stride
-            {
-                step = step.min(other.size());
+        if let Some(finer_steps) = &finer_steps {
+            step = step.min(finer_steps[z * CELLS + x]);
+        } else {
+            for other in finer {
+                let [x, _, z] = other.origin();
+                if wx < x + other.size()
+                    && x < wx + stride
+                    && wz < z + other.size()
+                    && z < wz + stride
+                {
+                    step = step.min(other.size());
+                }
             }
         }
         // The cells of the coarsest tiles are thousands of blocks wide: a
@@ -881,6 +917,69 @@ fn mesh_columns_with_edges<L: Look>(
 #[cfg(test)]
 mod refinement_tests {
     use super::*;
+
+    #[test]
+    fn deep_refinement_cell_steps_match_the_overlap_scan() {
+        let key = TileKey {
+            x: -2,
+            z: 3,
+            level: 8,
+        };
+        let stride = key.size() / CELLS as i32;
+        let [ox, _, oz] = key.origin();
+        let mut finer = Vec::new();
+
+        // Four 128-block descendants fit inside each of these 256-block cells.
+        // This deliberately exceeds the indexing threshold while spanning
+        // negative and positive world coordinates.
+        for cell_z in 0..4 {
+            for cell_x in 0..4 {
+                for sub_z in 0..2 {
+                    for sub_x in 0..2 {
+                        let x = ox + cell_x * stride + sub_x * 128;
+                        let z = oz + cell_z * stride + sub_z * 128;
+                        finer.push(TileKey {
+                            x: x.div_euclid(128),
+                            z: z.div_euclid(128),
+                            level: 3,
+                        });
+                    }
+                }
+            }
+        }
+        // Equal-sized and larger descendants must not reduce a cell's step.
+        finer.push(TileKey {
+            x: (ox + 4 * stride).div_euclid(stride),
+            z: oz.div_euclid(stride),
+            level: 4,
+        });
+        finer.push(TileKey {
+            x: (ox + 6 * stride).div_euclid(512),
+            z: oz.div_euclid(512),
+            level: 5,
+        });
+
+        assert!(finer.len() > CELLS);
+        let indexed = finer_cell_steps(key, &finer, stride);
+        for cell_z in 0..CELLS {
+            for cell_x in 0..CELLS {
+                let wx = ox + cell_x as i32 * stride;
+                let wz = oz + cell_z as i32 * stride;
+                let mut expected = stride;
+                for other in &finer {
+                    let [x, _, z] = other.origin();
+                    if wx < x + other.size()
+                        && x < wx + stride
+                        && wz < z + other.size()
+                        && z < wz + stride
+                    {
+                        expected = expected.min(other.size());
+                    }
+                }
+                assert_eq!(indexed[cell_z * CELLS + cell_x], expected);
+            }
+        }
+    }
     #[test]
     fn fallback_mesh_leaves_exactly_the_fine_tiles_footprints_empty() {
         let parent = TileKey {
