@@ -322,6 +322,8 @@ pub struct Waypoints {
     /// A small number for each player the manager knows, which its rows index their
     /// connections by (a lookup by number is a load, by UUID a hash and a probe).
     ids: Arc<HashMap<u128, u32>>,
+    /// Current tick's UUID-to-slice-index lookup, rebuilt in its retained allocation.
+    player_indices: Arc<HashMap<u128, usize>>,
     free: Vec<u32>,
     next_id: u32,
     /// The `locator_bar` game rule as last seen.
@@ -353,7 +355,8 @@ pub struct Waypoints {
 
 /// What every row reads this tick: the players, read only.
 struct Shared<'a> {
-    players: HashMap<u128, &'a Player>,
+    players: &'a [Player],
+    player_indices: Arc<HashMap<u128, usize>>,
     ids: Arc<HashMap<u128, u32>>,
     /// One waypoint update per mover and tick, encoded once for the receivers it goes to.
     updates: HashMap<u128, OnceLock<Option<Arc<Encoded>>>>,
@@ -376,6 +379,9 @@ struct Receiving<'r> {
 impl Shared<'_> {
     fn id(&self, uuid: u128) -> u32 {
         self.ids.get(&uuid).copied().unwrap_or(NONE)
+    }
+    fn player(&self, uuid: u128) -> Option<&Player> {
+        self.players.get(*self.player_indices.get(&uuid)?)
     }
     /// What `update_or_create` does for a Block connection whose source has not left its
     /// block and is not ignored: nothing. True only when that is all it would do (a pair that
@@ -498,7 +504,7 @@ impl Shared<'_> {
     }
     /// The source and the receiver, if both are in the level this tick.
     fn pair(&self, source: u128, receiver: u128) -> Option<(&Player, &Player)> {
-        Some((*self.players.get(&source)?, *self.players.get(&receiver)?))
+        Some((self.player(source)?, self.player(receiver)?))
     }
     /// The icon of a connection to `s`: the player's own, with the team's colour when it has none
     /// (`Waypoint.Icon.cloneAndAssignStyle`).
@@ -534,7 +540,7 @@ impl Shared<'_> {
         if !in_range {
             return false;
         }
-        let Some(&player) = self.players.get(&src.uuid) else {
+        let Some(player) = self.player(src.uuid) else {
             return false;
         };
         let Some(e) = src.update(player) else {
@@ -954,6 +960,9 @@ impl Waypoints {
         by_receiver: usize,
     ) -> Vec<(u32, Sent)> {
         self.number(players);
+        let indices = Arc::make_mut(&mut self.player_indices);
+        indices.clear();
+        indices.extend(players.iter().enumerate().map(|(index, p)| (p.uuid, index)));
         let mut updates = std::mem::take(&mut self.updates_scratch);
         updates.clear();
         updates.extend(players.iter().map(|p| (p.uuid, OnceLock::new())));
@@ -961,7 +970,8 @@ impl Waypoints {
         view.clear();
         let mut t = Tick {
             s: Shared {
-                players: players.iter().map(|p| (p.uuid, p)).collect(),
+                players,
+                player_indices: Arc::clone(&self.player_indices),
                 ids: Arc::clone(&self.ids),
                 updates,
                 away,
@@ -975,7 +985,7 @@ impl Waypoints {
         // every connection (MinecraftServer.onGameRuleChanged).
         let was = self.enabled.replace(locator_bar);
         for (uuid, memo) in &self.memo {
-            if let Some(p) = t.s.players.get(uuid) {
+            if let Some(p) = t.s.player(*uuid) {
                 t.view.insert(*uuid, (memo.view_center, p.view_distance));
             }
         }
@@ -986,12 +996,12 @@ impl Waypoints {
             self.players
                 .iter()
                 .copied()
-                .filter(|uuid| !t.s.players.contains_key(uuid) || respawned.contains(uuid)),
+                .filter(|uuid| t.s.player(*uuid).is_none() || respawned.contains(uuid)),
         );
         for uuid in gone.drain(..) {
             self.remove_player(&mut t, uuid);
             self.memo.remove(&uuid);
-            if !t.s.players.contains_key(&uuid) {
+            if t.s.player(uuid).is_none() {
                 self.release(uuid);
             }
         }
@@ -1167,7 +1177,7 @@ impl Waypoints {
         let mut sources = std::mem::take(&mut self.sources_scratch);
         sources.clear();
         sources.extend(self.waypoints.iter().map(|u| {
-            t.s.players.get(u).map(|&p| Src {
+            t.s.player(*u).map(|p| Src {
                 source: Source::of(t.s.id(*u), p),
                 uuid: *u,
                 shared: OnceLock::new(),
