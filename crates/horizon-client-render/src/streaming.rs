@@ -396,11 +396,13 @@ impl MeshPool {
 /// chunks; measuring and sorting them all every tick took a fifth of its tick.
 fn decoration_queue(
     order: &mut DecorationOrder,
+    ranked: &mut Vec<std::cmp::Reverse<(u64, i32, i32)>>,
+    fresh: &mut Vec<(i64, i32, i32)>,
     wanted: impl Iterator<Item = (i32, i32)>,
     distance: impl Fn(i32, i32) -> i64,
 ) -> std::collections::BinaryHeap<std::cmp::Reverse<(u64, i32, i32)>> {
-    let mut ranked = Vec::new();
-    let mut fresh = Vec::new();
+    ranked.clear();
+    fresh.clear();
     for (x, z) in wanted {
         match order.rank(x, z) {
             Some(rank) => ranked.push(std::cmp::Reverse((rank, x, z))),
@@ -408,10 +410,10 @@ fn decoration_queue(
         }
     }
     fresh.sort_unstable();
-    for (_, x, z) in fresh {
+    for &(_, x, z) in fresh.iter() {
         ranked.push(std::cmp::Reverse((order.rank_or_append(x, z), x, z)));
     }
-    std::collections::BinaryHeap::from(ranked)
+    std::collections::BinaryHeap::from(std::mem::take(ranked))
 }
 
 /// Keep only decoration ranks that can still matter: within the active ranges
@@ -622,6 +624,11 @@ pub struct Streaming {
     /// Vanilla's decoration order around the player, and the centre and
     /// radius it was last ranked for.
     decoration_order: DecorationOrder,
+    /// Reused buffers for ranking chunks eligible for decoration.
+    decoration_ranked_scratch: Vec<std::cmp::Reverse<(u64, i32, i32)>>,
+    decoration_fresh_scratch: Vec<(i64, i32, i32)>,
+    /// Neighbour blocking answers, valid for one scheduling pass only.
+    decoration_waiting_scratch: FxHashMap<(i32, i32), bool>,
     order_area: Option<((i32, i32), i32)>,
     /// What the queued jobs' priorities were computed from (`requeue`): the
     /// centre, the band, the extra areas, and the forced chunks.
@@ -1297,6 +1304,9 @@ impl Streaming {
             saving: 0,
             viewing: Default::default(),
             decoration_order: DecorationOrder::default(),
+            decoration_ranked_scratch: Vec::new(),
+            decoration_fresh_scratch: Vec::new(),
+            decoration_waiting_scratch: FxHashMap::default(),
             order_area: None,
             queue_basis: Default::default(),
             finishing: Default::default(),
@@ -2220,6 +2230,8 @@ impl Streaming {
             };
             // Out for the call: ranking reads the streamer's ranges.
             let mut order = std::mem::take(&mut self.decoration_order);
+            let mut ranked = std::mem::take(&mut self.decoration_ranked_scratch);
+            let mut fresh = std::mem::take(&mut self.decoration_fresh_scratch);
             let mut wanted = {
                 let ranges = Ranges {
                     center: self.center,
@@ -2232,6 +2244,8 @@ impl Streaming {
                 };
                 decoration_queue(
                     &mut order,
+                    &mut ranked,
+                    &mut fresh,
                     self.protos
                         .iter()
                         .filter(|&(&(x, z), proto)| {
@@ -2251,17 +2265,18 @@ impl Streaming {
                 // the pass (nothing it reads changes in it but `decorated`, which
                 // updates the entry). Without it, scheduling at render distance 32
                 // took most of the thread that runs it while the world loaded.
-                let waiting: std::cell::RefCell<FxHashMap<(i32, i32), bool>> = Default::default();
+                let mut waiting = std::mem::take(&mut self.decoration_waiting_scratch);
+                waiting.clear();
                 while let Some(std::cmp::Reverse((_, x, z))) = wanted.pop() {
                     if self.decorating >= workers * 2 {
                         break;
                     }
                     if self.decoration_order.blocked(x, z, |nx, nz| {
-                        if let Some(&known) = waiting.borrow().get(&(nx, nz)) {
+                        if let Some(&known) = waiting.get(&(nx, nz)) {
                             return known;
                         }
                         let known = waits_for(self, nx, nz);
-                        waiting.borrow_mut().insert((nx, nz), known);
+                        waiting.insert((nx, nz), known);
                         known
                     }) {
                         continue;
@@ -2279,7 +2294,7 @@ impl Streaming {
                     let has_final = keys.iter().any(|k| world.chunks.contains_key(k));
                     if has_final && !self.saves_beside_final {
                         self.decorated.insert((x, z));
-                        waiting.borrow_mut().insert((x, z), false);
+                        waiting.insert((x, z), false);
                         continue;
                     }
                     if !keys.iter().all(|k| {
@@ -2308,7 +2323,10 @@ impl Streaming {
                         .extend(finals.iter().map(|(i, _)| keys[*i]));
                     self.submit(Some((x, z)), 1, Job::Decorate(x, z, region, finals));
                 }
+                self.decoration_waiting_scratch = waiting;
             }
+            self.decoration_ranked_scratch = wanted.into_vec();
+            self.decoration_fresh_scratch = fresh;
         }
         hz_laps.lap("st_decorate");
         self.schedule_generation(world, workers);
