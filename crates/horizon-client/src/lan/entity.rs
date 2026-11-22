@@ -1008,6 +1008,8 @@ pub struct Entities {
     /// them, the send pass skips them without looking their state up again.
     /// Thousands of items frozen past the simulation distance cost a flag each.
     quiet: Vec<bool>,
+    /// Active entity indices for this tick's send pass, kept between ticks.
+    active: Vec<usize>,
     /// What each of `chunks` holds (`cells`).
     cells: cells::Cells,
     /// One entity's packets and their bodies, kept between entities.
@@ -1546,9 +1548,9 @@ impl Entities {
         }
         // The entities with something to send or someone to pair with: an unchanged leash
         // is all the pass below would do with the rest, which is nothing.
-        let active: Vec<usize> = (0..entities.len())
-            .filter(|&index| !self.quiet[index] || self.pairs[index])
-            .collect();
+        let mut active = std::mem::take(&mut self.active);
+        active.clear();
+        active.extend((0..entities.len()).filter(|&index| !self.quiet[index] || self.pairs[index]));
         if self.send_apart(viewers.len(), active.len()) {
             self.send_on_threads(entities, riding, viewers, &active);
         } else {
@@ -1559,6 +1561,7 @@ impl Entities {
             self.states.retain(|s| s.seen == now);
         }
         self.starts = starts;
+        self.active = active;
     }
 
     /// Whether this tick's send pass runs on several threads: with many clients and many
