@@ -231,39 +231,7 @@ fn performance_cores() -> Option<usize> {
 
 #[cfg(target_os = "linux")]
 fn performance_cores() -> Option<usize> {
-    // Read max frequencies across CPUs from sysfs
-    let mut max_freq = 0u64;
-    let mut freqs = Vec::new();
-    let mut cpu_idx = 0;
-    loop {
-        let path = format!("/sys/devices/system/cpu/cpu{cpu_idx}/cpufreq/cpuinfo_max_freq");
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                if let Ok(freq) = content.trim().parse::<u64>() {
-                    max_freq = max_freq.max(freq);
-                    freqs.push(freq);
-                }
-                cpu_idx += 1;
-            }
-            Err(_) => break,
-        }
-    }
-
-    if freqs.is_empty() {
-        return None;
-    }
-
-    // Check if there is frequency disparity indicating asymmetric cores (hybrid architecture)
-    let min_freq = *freqs.iter().min()?;
-    if min_freq < max_freq {
-        // Count performance cores (within 5% of max frequency)
-        let threshold = max_freq.saturating_sub(max_freq / 20);
-        let p_threads = freqs.iter().filter(|&&f| f >= threshold).count();
-        if p_threads > 0 && p_threads < freqs.len() {
-            return Some(p_threads);
-        }
-    }
-    None
+    server_core::performance_cores()
 }
 
 #[cfg(windows)]
