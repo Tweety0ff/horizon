@@ -1448,6 +1448,7 @@ mod tests {
             waypoints.view_scratch.capacity(),
             waypoints.updates_scratch.capacity(),
             waypoints.sources_scratch.capacity(),
+            waypoints.player_indices.capacity(),
         );
         assert!(capacities.iter().all(|&capacity| capacity > 0));
         let mut job_capacities: Vec<_> = waypoints
@@ -1469,6 +1470,7 @@ mod tests {
                 waypoints.view_scratch.capacity(),
                 waypoints.updates_scratch.capacity(),
                 waypoints.sources_scratch.capacity(),
+                waypoints.player_indices.capacity(),
             ),
             capacities,
             "successive dense sweeps reuse both index buffers"
