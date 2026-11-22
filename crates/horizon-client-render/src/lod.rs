@@ -6582,7 +6582,7 @@ mod tests {
         lod.request_detail([0, 0]);
         let first = match lod.shared.jobs.lock().unwrap().pop_front() {
             Some(Job::RequestDetail { chunks, .. }) => chunks,
-            other => panic!("expected detail request, got {other:?}"),
+            _ => panic!("detail request was not queued"),
         };
         let capacities = (
             lod.detail_request_keys_scratch.capacity(),
@@ -6594,7 +6594,7 @@ mod tests {
         lod.request_detail([0, 0]);
         let second = match lod.shared.jobs.lock().unwrap().pop_front() {
             Some(Job::RequestDetail { chunks, .. }) => chunks,
-            other => panic!("expected repeated detail request, got {other:?}"),
+            _ => panic!("repeated detail request was not queued"),
         };
         assert_eq!(second, first, "request order must remain stable");
         assert!(
