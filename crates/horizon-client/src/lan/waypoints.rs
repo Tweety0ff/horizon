@@ -1461,7 +1461,10 @@ mod tests {
         assert!(job_capacities.iter().all(|&capacity| capacity >= 64));
         let job_list_capacity = waypoints.jobs_scratch.capacity();
         assert!(job_list_capacity >= 2);
-        players[1].position[0] += 1.0;
+        // Reorder the input slice before the next moved player: the retained
+        // UUID index must be rebuilt for the new positions, not reused stale.
+        players.swap(0, 1);
+        players[0].position[0] += 1.0;
         waypoints.tick_with(&players, &[], &[], true, 0);
         assert_eq!(
             (
