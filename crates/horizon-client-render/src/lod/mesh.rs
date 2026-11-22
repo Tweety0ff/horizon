@@ -88,6 +88,8 @@ impl Look for [u32; 2] {
 #[derive(Default)]
 pub(super) struct Mesher {
     styles: FxHashMap<(BlockStateId, u8), Styles>,
+    /// Finer active tiles used by the current mesh, reused by this worker.
+    finer_keys: FxHashSet<TileKey>,
     /// Whether quads get their looks (`crate::mesher::QuadLook`), as the section mesher's
     /// `looks`: 0 not, 1 with the Overworld's face shades, 2 with the Nether's.
     pub(super) looks: u8,
@@ -106,29 +108,60 @@ impl Mesher {
         neighbors: &[EdgeColumns<'_>; 4],
         finer: &[TileKey],
     ) -> SectionMesh {
+        let Self {
+            styles,
+            finer_keys,
+            looks,
+            shader_pack,
+        } = self;
+        finer_keys.clear();
+        finer_keys.extend(finer.iter().copied());
         let (c, b) = (covered, covered_bounds);
-        match self.looks != 0 {
+        match *looks != 0 {
             false => {
-                let material = |s: &Span, d, at| self.material(s, d, at, context);
-                mesh_columns_with_edges::<()>(key, columns, c, b, neighbors, finer, material)
+                let material = |s: &Span, d, at| {
+                    Self::material(styles, *looks, *shader_pack, s, d, at, context)
+                };
+                mesh_columns_with_edges::<()>(
+                    key,
+                    columns,
+                    c,
+                    b,
+                    neighbors,
+                    finer,
+                    finer_keys,
+                    material,
+                )
             }
             true => {
-                let material = |s: &Span, d, at| self.material(s, d, at, context);
-                mesh_columns_with_edges::<[u32; 2]>(key, columns, c, b, neighbors, finer, material)
+                let material = |s: &Span, d, at| {
+                    Self::material(styles, *looks, *shader_pack, s, d, at, context)
+                };
+                mesh_columns_with_edges::<[u32; 2]>(
+                    key,
+                    columns,
+                    c,
+                    b,
+                    neighbors,
+                    finer,
+                    finer_keys,
+                    material,
+                )
             }
         }
     }
     /// `at`: the block column the face covers, for the grass colours that
     /// change across a biome (swamps).
     fn material<L: Look>(
-        &mut self,
+        styles_cache: &mut FxHashMap<(BlockStateId, u8), Styles>,
+        looks: u8,
+        shader_pack: bool,
         span: &Span,
         direction: Direction,
         at: [i32; 2],
         context: &WorkerContext,
     ) -> Material<L> {
-        let styles = *self
-            .styles
+        let styles = *styles_cache
             .entry((span.state, direction as u8))
             .or_insert_with(|| {
                 let assets = &context.assets;
@@ -230,7 +263,6 @@ impl Mesher {
                 }
             });
         let biome = context.biomes.get(span.biome);
-        let looks = self.looks;
         let fluid = styles.fluid != 0;
         let shade = match direction {
             Direction::Up => 1.0,
@@ -259,7 +291,7 @@ impl Mesher {
                         shade,
                         (context.tables.hdr_tier(span.state), level),
                         fluid.then_some(direction),
-                        self.shader_pack,
+                        shader_pack,
                     );
                     Paint {
                         look: L::make(|| far_look(looks, rgb, direction, fluid)),
@@ -510,6 +542,7 @@ fn mesh_columns_with_edges<L: Look>(
     covered_bounds: Option<[i32; 4]>,
     neighbors: &[EdgeColumns<'_>; 4],
     finer: &[TileKey],
+    finer_keys: &FxHashSet<TileKey>,
     mut material: impl FnMut(&Span, Direction, [i32; 2]) -> Material<L>,
 ) -> SectionMesh {
     assert_eq!(columns.len(), CELLS * CELLS);
@@ -633,7 +666,6 @@ fn mesh_columns_with_edges<L: Look>(
         })
         .collect();
     let mut faces = Faces::<L>::new();
-    let finer_keys: FxHashSet<_> = finer.iter().copied().collect();
     let mut finer_levels = smallvec::SmallVec::<[u8; 4]>::new();
     finer_levels.extend(finer.iter().map(|key| key.level));
     finer_levels.sort_unstable();
