@@ -1700,38 +1700,45 @@ impl Entities {
             .collect();
         let (pairs, is_moved, synced_ranges) = (&*pairs, &*is_moved, &*synced_ranges);
         let lanes = crate::parallel::worker_lanes();
-        crate::parallel::par_chunks_mut_on(&mut made, 64, lanes, |part| {
-            let mut packets = Vec::new();
-            for m in part {
-                let (s, e) = (&mut *m.state, entities[m.index]);
-                packets.clear();
-                // As in `send_in_order`: paired as it joined, its first changes go out with
-                // the pairing; an idle one sends only its leash.
-                m.synced = s.added
-                    && e.kind != "minecraft:player"
-                    && !s.arrow
-                    && synced_ranges
-                        .iter()
-                        .any(|&(after, through)| e.id > after && e.id <= through);
-                if !s.added || m.synced {
-                    if e.idle && !is_moved[m.index] && !e.needs_sync {
-                        s.send_leash(e, &mut packets);
-                    } else {
-                        s.send_changes(e, riding, &mut packets);
+        crate::parallel::par_chunks_mut_on_with(
+            &mut made,
+            64,
+            lanes,
+            Vec::new,
+            |part, packets| {
+                // One packet buffer per participating worker, reused across every
+                // 64-entity chunk it takes instead of allocating once per chunk.
+                for m in part {
+                    let (s, e) = (&mut *m.state, entities[m.index]);
+                    packets.clear();
+                    // As in `send_in_order`: paired as it joined, its first changes go out with
+                    // the pairing; an idle one sends only its leash.
+                    m.synced = s.added
+                        && e.kind != "minecraft:player"
+                        && !s.arrow
+                        && synced_ranges
+                            .iter()
+                            .any(|&(after, through)| e.id > after && e.id <= through);
+                    if !s.added || m.synced {
+                        if e.idle && !is_moved[m.index] && !e.needs_sync {
+                            s.send_leash(e, packets);
+                        } else {
+                            s.send_changes(e, riding, packets);
+                        }
+                    }
+                    s.added = false;
+                    m.changes.encode(packets);
+                    if pairs[m.index]
+                        && !e.bare
+                        && let Some(kind) = s.kind
+                    {
+                        packets.clear();
+                        s.pairing(e, kind, riding, packets);
+                        m.pairing = Some(Bodies::of(packets));
                     }
                 }
-                s.added = false;
-                m.changes.encode(&packets);
-                if pairs[m.index]
-                    && !e.bare
-                    && let Some(kind) = s.kind
-                {
-                    packets.clear();
-                    s.pairing(e, kind, riding, &mut packets);
-                    m.pairing = Some(Bodies::of(&packets));
-                }
-            }
-        });
+            },
+        );
         // Nothing to send and nobody to pair with.
         made.retain(|m| !m.changes.all.is_empty() || m.pairing.is_some());
         let made = &made;
