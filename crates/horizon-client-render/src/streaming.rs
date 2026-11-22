@@ -4119,16 +4119,14 @@ mod tests {
         let mut capacities = None;
 
         for round in 0..3 {
-            let queue = decoration_queue_with_scratch(
+            let mut queue = decoration_queue_with_scratch(
                 &mut order,
                 &mut ranked,
                 &mut fresh,
                 wanted.iter().copied(),
                 distance,
             );
-            let popped: Vec<_> = queue
-                .into_sorted_vec()
-                .into_iter()
+            let popped: Vec<_> = std::iter::from_fn(|| queue.pop())
                 .map(|std::cmp::Reverse((_, x, z))| (x, z))
                 .collect();
             if let Some(expected) = &expected {
