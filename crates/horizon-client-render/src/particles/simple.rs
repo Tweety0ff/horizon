@@ -8,10 +8,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// tens of microseconds to start and join, and a simple particle about a tenth of one.
 pub(super) const PARALLEL_MIN: usize = 2048;
 /// Lanes for ticking particles, including the calling/render thread. Keep two CPU threads
-/// available for the integrated server and foreground work; on 8+ CPUs use the six-lane
-/// configuration covered by the particle stress benchmark. The worker override caps this too.
+/// available for the integrated server and foreground work; on 8+ performance cores use the
+/// six-lane configuration covered by the particle stress benchmark. Efficiency cores are left
+/// to lower-priority work rather than becoming stragglers in this foreground phase. The worker
+/// override caps this through `usable_cores()`.
 pub(super) fn parallel_threads() -> usize {
-    parallel_lanes(horizon_threads::worker_count())
+    parallel_lanes(horizon_threads::usable_cores())
 }
 
 fn parallel_lanes(cpus: usize) -> usize {
