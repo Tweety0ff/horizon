@@ -787,6 +787,23 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
+    fn blocking_writer_reuses_its_framed_output_buffer() {
+        let (a, b) = Pipe::pair();
+        let (_, mut writer) = Connection::local(a).split();
+        let mut peer = Connection::local(b);
+
+        writer.send(&[1, 2, 3]).unwrap();
+        let capacity = writer.send_buffer.capacity();
+        let pointer = writer.send_buffer.as_ptr();
+
+        writer.send(&[4, 5, 6]).unwrap();
+        assert_eq!(writer.send_buffer.capacity(), capacity);
+        assert_eq!(writer.send_buffer.as_ptr(), pointer);
+        assert_eq!(peer.recv().unwrap(), (1, vec![2, 3]));
+        assert_eq!(peer.recv().unwrap(), (4, vec![5, 6]));
+    }
+
+    #[test]
     fn ipv4_first_keeps_each_familys_order() {
         let a = |s: &str| s.parse::<SocketAddr>().unwrap();
         let resolved = vec![
