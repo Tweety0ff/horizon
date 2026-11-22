@@ -1429,6 +1429,14 @@ mod tests {
             waypoints.updates_scratch.capacity(),
         );
         assert!(capacities.iter().all(|&capacity| capacity > 0));
+        let mut job_capacities: Vec<_> = waypoints
+            .job_out_scratch
+            .iter()
+            .map(Vec::capacity)
+            .collect();
+        job_capacities.sort_unstable();
+        assert_eq!(job_capacities.len(), 2);
+        assert!(job_capacities.iter().all(|&capacity| capacity >= 64));
         players[1].position[0] += 1.0;
         waypoints.tick_with(&players, &[], &[], true, 0);
         assert_eq!(
@@ -1440,6 +1448,16 @@ mod tests {
             ),
             capacities,
             "successive dense sweeps reuse both index buffers"
+        );
+        let mut next_job_capacities: Vec<_> = waypoints
+            .job_out_scratch
+            .iter()
+            .map(Vec::capacity)
+            .collect();
+        next_job_capacities.sort_unstable();
+        assert_eq!(
+            next_job_capacities, job_capacities,
+            "receiver packet buffers retain their capacities across ticks"
         );
     }
 
