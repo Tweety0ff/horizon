@@ -1418,14 +1418,18 @@ mod tests {
         let capacities = (
             waypoints.all_moves_scratch.capacity(),
             waypoints.all_slots_scratch.capacity(),
+            waypoints.view_scratch.capacity(),
+            waypoints.updates_scratch.capacity(),
         );
-        assert!(capacities.0 > 0 && capacities.1 > 0);
+        assert!(capacities.iter().all(|&capacity| capacity > 0));
         players[1].position[0] += 1.0;
         waypoints.tick_with(&players, &[], &[], true, 0);
         assert_eq!(
             (
                 waypoints.all_moves_scratch.capacity(),
                 waypoints.all_slots_scratch.capacity(),
+                waypoints.view_scratch.capacity(),
+                waypoints.updates_scratch.capacity(),
             ),
             capacities,
             "successive dense sweeps reuse both index buffers"
