@@ -952,7 +952,7 @@ impl GenerationScan {
                         {
                             continue;
                         }
-                        wanted.push((input.ranges.priority(x, z), x, z));
+                        self.plan.push((input.ranges.priority(x, z), x, z));
                     }
                 }
             }
