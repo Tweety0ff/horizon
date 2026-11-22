@@ -508,7 +508,7 @@ fn mesh_columns_with_edges<L: Look>(
     columns: &[&[Span]],
     covered: &FxHashSet<(i32, i32)>,
     covered_bounds: Option<[i32; 4]>,
-    neighbors: &[Vec<EdgeColumn<'_>>; 4],
+    neighbors: &[EdgeColumns<'_>; 4],
     finer: &[TileKey],
     mut material: impl FnMut(&Span, Direction, [i32; 2]) -> Material<L>,
 ) -> SectionMesh {
