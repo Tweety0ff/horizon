@@ -1042,6 +1042,10 @@ mod tests {
         assert!(pending.load(Ordering::Relaxed) > 0);
         outbox.closed();
         assert_eq!(pending.load(Ordering::Relaxed), 0);
+        let after_close = body(3, 4);
+        pending.fetch_add(charge(after_close.capacity()), Ordering::Relaxed);
+        outbox.send_one(Body::from(after_close), None);
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
     }
     #[test]
     #[ignore = "daily"]
