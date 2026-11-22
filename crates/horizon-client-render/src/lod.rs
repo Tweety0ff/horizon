@@ -6631,16 +6631,24 @@ mod tests {
                 lod.selection_keys_scratch.capacity(),
                 lod.selection_inactive_scratch.capacity(),
                 lod.selection_changed_scratch.capacity(),
+                lod.replan_gone_scratch.capacity(),
+                lod.replan_leaving_scratch.capacity(),
+                lod.replan_seam_scratch.capacity(),
+                lod.replan_standins_scratch.capacity(),
             );
-            assert!(scratch_capacities.0 > 0 && scratch_capacities.2 > 0);
+            assert!(scratch_capacities.0 > 0 && scratch_capacities.2 > 0 && scratch_capacities.3 > 0);
             camera[0] += 16.0;
             lod.update(camera, 2, 64, Some(FxHashSet::default()), None);
             check(&lod);
             assert!(
                 lod.selection_keys_scratch.capacity() >= scratch_capacities.0
                     && lod.selection_inactive_scratch.capacity() >= scratch_capacities.1
-                    && lod.selection_changed_scratch.capacity() >= scratch_capacities.2,
-                "the next selection rebuild reuses its three scratch lists"
+                    && lod.selection_changed_scratch.capacity() >= scratch_capacities.2
+                    && lod.replan_gone_scratch.capacity() >= scratch_capacities.3
+                    && lod.replan_leaving_scratch.capacity() >= scratch_capacities.4
+                    && lod.replan_seam_scratch.capacity() >= scratch_capacities.5
+                    && lod.replan_standins_scratch.capacity() >= scratch_capacities.6,
+                "the next view-plan rebuild reuses its seven scratch lists"
             );
         }
         // A covered level-0 stand-in completes its parent but is not drawn.
