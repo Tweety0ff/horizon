@@ -1132,13 +1132,6 @@ impl Waypoints {
         }
         // Every row a move reaches: the receivers', and those of movers who receive but aren't
         // listed as receivers (`updatePlayer` runs on their own row all the same).
-        struct Job {
-            receiver: u128,
-            listed: bool,
-            view: View,
-            row: Row,
-            out: Vec<(u32, Sent)>,
-        }
         let mut job_outs = std::mem::take(&mut self.job_out_scratch);
         let mut jobs = std::mem::take(&mut self.jobs_scratch);
         jobs.clear();
@@ -1351,7 +1344,7 @@ impl Waypoints {
                 }
         });
         t.out.reserve(jobs.iter().map(|j| j.out.len()).sum());
-        for mut job in jobs {
+        for mut job in jobs.drain(..) {
             t.out.extend(job.out.drain(..));
             self.connections.insert(job.receiver, job.row);
             job_outs.push(job.out);
