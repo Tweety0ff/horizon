@@ -2047,6 +2047,7 @@ dependencies = [
  "naga",
  "png",
  "pollster",
+ "rayon",
  "rustix 1.1.5",
  "serde",
  "serde_json",
