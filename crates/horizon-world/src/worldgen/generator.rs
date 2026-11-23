@@ -1225,10 +1225,16 @@ where
     }
     /// ChunkGenerator.getBaseHeight: the first free Y above the noise column
     /// (with aquifers, without terrain adaptation) for a heightmap type.
-    fn base_height(&self, x: i32, z: i32, kind: HeightmapType) -> i32 {
+    fn base_height(
+        &self,
+        x: i32,
+        z: i32,
+        kind: HeightmapType,
+        density: &mut Vec<f32>,
+    ) -> i32 {
         let (min, _) = self.column_range();
         let mut found = min;
-        self.noise_column(x, z, &mut |y, state| {
+        self.noise_column(x, z, density, &mut |y, state| {
             if kind.is_opaque(self.data.states.get(state)) {
                 found = y + 1;
                 return true;
@@ -1239,8 +1245,14 @@ where
     }
     /// ChunkGenerator.getBaseColumn: opacity of each noise-column state for
     /// a heightmap type, indexed from the minimum Y.
-    fn base_column(&self, x: i32, z: i32, kind: HeightmapType) -> Vec<bool> {
-        self.base_columns_by(x, z, 1, &|_| kind)
+    fn base_column(
+        &self,
+        x: i32,
+        z: i32,
+        kind: HeightmapType,
+        density: &mut Vec<f32>,
+    ) -> Vec<bool> {
+        self.base_columns_by(x, z, 1, &|_| kind, density)
             .pop()
             .unwrap_or_default()
     }
@@ -1251,10 +1263,11 @@ where
         z: i32,
         count: usize,
         kind: &dyn Fn(usize) -> HeightmapType,
+        density: &mut Vec<f32>,
     ) -> Vec<Vec<bool>> {
         let (min, height) = self.column_range();
         let mut columns = vec![vec![false; height as usize]; count];
-        self.noise_column(x, z, &mut |y, state| {
+        self.noise_column(x, z, density, &mut |y, state| {
             let state = self.data.states.get(state);
             for (index, column) in columns.iter_mut().enumerate() {
                 column[(y - min) as usize] = kind(index).is_opaque(state);
@@ -1271,12 +1284,13 @@ where
         x: i32,
         z: i32,
         column: &mut dyn super::structure::start::NoiseColumnTarget,
+        density: &mut Vec<f32>,
     ) {
         use super::structure::start::NoiseBlock;
         let (min, height) = self.column_range();
         column.resize(min, height as usize);
         let registry = self.data.registry;
-        self.noise_column(x, z, &mut |y, state| {
+        self.noise_column(x, z, density, &mut |y, state| {
             let props = self.data.states.get(state);
             let block = if props.is_air() {
                 NoiseBlock::Air
@@ -1293,7 +1307,13 @@ where
         });
     }
     /// iterateNoiseColumn from the top down until `visit` returns true.
-    fn noise_column(&self, x: i32, z: i32, visit: &mut dyn FnMut(i32, BlockStateId) -> bool) {
+    fn noise_column(
+        &self,
+        x: i32,
+        z: i32,
+        density: &mut Vec<f32>,
+        visit: &mut dyn FnMut(i32, BlockStateId) -> bool,
+    ) {
         // `FlatLevelSource.getBaseHeight` and `getBaseColumn`: the layers, and air above them.
         if let Some(flat) = &self.flat {
             let air = self.data.registry.default_state("minecraft:air");
@@ -1342,11 +1362,11 @@ where
                 self.data.registry.default_state("minecraft:air").unwrap(),
             )),
         };
-        let mut density = vec![0.; height as usize];
+        density.resize(height as usize, 0.0);
         if self
             .router
             .get(RouterField::FinalDensity)
-            .sample_volume(&mut context, &mut density, volume)
+            .sample_volume(&mut context, density, volume)
             .is_err()
         {
             return;
@@ -1388,7 +1408,7 @@ where
         if let Some(h) = self.worker.heights.get(&(x, z, kind as u8)) {
             return *h;
         }
-        let h = self.pipeline.base_height(x, z, kind);
+        let h = self.pipeline.base_height(x, z, kind, &mut self.worker.noise_column_density);
         if self.worker.heights.len() > 65536 {
             self.worker.heights.clear();
         }
@@ -1457,7 +1477,7 @@ where
         }
     }
     fn base_column(&mut self, x: i32, z: i32, kind: HeightmapType) -> Vec<bool> {
-        self.pipeline.base_column(x, z, kind)
+        self.pipeline.base_column(x, z, kind, &mut self.worker.noise_column_density)
     }
     fn base_columns_by(
         &mut self,
@@ -1466,7 +1486,7 @@ where
         count: usize,
         kind: &dyn Fn(usize) -> HeightmapType,
     ) -> Vec<Vec<bool>> {
-        self.pipeline.base_columns_by(x, z, count, kind)
+        self.pipeline.base_columns_by(x, z, count, kind, &mut self.worker.noise_column_density)
     }
     fn noise_column_into(
         &mut self,
@@ -1474,7 +1494,8 @@ where
         z: i32,
         column: &mut dyn super::structure::start::NoiseColumnTarget,
     ) {
-        self.pipeline.noise_blocks_into(x, z, column)
+        self.pipeline
+            .noise_blocks_into(x, z, column, &mut self.worker.noise_column_density)
     }
     fn cold_enough_to_snow(&mut self, biome: BiomeId, pos: [i32; 3]) -> bool {
         let sea = self.pipeline.settings.sea_level;
@@ -1804,6 +1825,8 @@ pub(super) struct WorkerState {
     structure_biomes: HashMap<[i32; 3], BiomeId>,
     timings: StageTimings,
     heights: HashMap<(i32, i32, u8), i32>,
+    /// Reused density samples for structure height/column queries.
+    noise_column_density: Vec<f32>,
     /// Decorate with structure pieces only (for structure parity checks).
     pub(super) structures_only: bool,
     pub(super) structure_mobs: Option<Arc<dyn StructureMobs>>,
@@ -2964,6 +2987,7 @@ impl OverworldGenerator {
                 structures_only: false,
                 structure_mobs: None,
                 heights: HashMap::new(),
+                noise_column_density: Vec::new(),
                 surface_rule: None,
             },
         }
@@ -3145,6 +3169,7 @@ impl GeneratorWorker {
         state.carver_biomes = HashMap::new();
         state.structure_biomes = HashMap::new();
         state.heights = HashMap::new();
+        state.noise_column_density = Vec::new();
     }
 }
 
