@@ -385,6 +385,16 @@ impl MeshPool {
         self.meshes.push(mesh);
         None
     }
+    /// Insert a mesh whose geometry and per-section metadata were cleared outside the pool lock.
+    fn put_cleared(&mut self, mesh: SectionMesh) -> Option<SectionMesh> {
+        let bytes = mesh.capacity_bytes();
+        if bytes == 0 || self.meshes.len() == Self::COUNT || bytes > Self::BYTES - self.bytes {
+            return Some(mesh);
+        }
+        self.bytes += bytes;
+        self.meshes.push(mesh);
+        None
+    }
 }
 
 /// The chunks `wanted` in the order they decorate: by rank, lowest first. No
@@ -675,6 +685,8 @@ pub struct Streaming {
     light_scratch: Vec<(i64, i32, i32)>,
     gone_scratch: Vec<(i32, i32)>,
     mesh_candidates_scratch: Vec<(i64, i32, i32, SectionMask)>,
+    /// Staged mesh jobs are prepared off-lock and published to workers as one batch.
+    mesh_jobs_scratch: Vec<Queued>,
     mesh_columns_scratch: Vec<((i32, i32), SectionMask)>,
     /// Far columns being unloaded in the current commit pass.
     unload_columns_scratch: FxHashSet<(i32, i32)>,
@@ -1206,11 +1218,24 @@ impl<G: ChunkGenerator> Jobs<G> {
                 let view = generator.light_view(&proto);
                 Done::LightView(x, z, proto, view)
             }
-            Job::Free(meshes) => {
-                for (_, mesh) in meshes {
-                    let rejected = shared.meshes.lock().unwrap().put(mesh);
-                    drop(rejected);
+            Job::Free(mut meshes) => {
+                // Clearing large geometry vectors can take long enough to stall
+                // other workers taking recycled meshes. Do it before locking,
+                // then publish the batch under one short pool lock.
+                for (_, mesh) in &mut meshes {
+                    mesh.clear();
                 }
+                let mut rejected = Vec::new();
+                {
+                    let mut pool = shared.meshes.lock().unwrap();
+                    for (_, mesh) in meshes {
+                        if let Some(mesh) = pool.put_cleared(mesh) {
+                            rejected.push(mesh);
+                        }
+                    }
+                }
+                // Dropping oversized/rejected meshes also stays outside the lock.
+                drop(rejected);
                 return None;
             }
             Job::Light(x, z, region, seq, sky) => {
@@ -1347,6 +1372,7 @@ impl Streaming {
             light_scratch: Vec::new(),
             gone_scratch: Vec::new(),
             mesh_candidates_scratch: Vec::new(),
+            mesh_jobs_scratch: Vec::new(),
             mesh_columns_scratch: Vec::new(),
             unload_columns_scratch: FxHashSet::default(),
             generation_batch_scratch: Vec::new(),
@@ -2497,7 +2523,7 @@ impl Streaming {
         hz_laps.lap("st_candidates");
         if room > 0 && !candidates.is_empty() {
             let settings = self.mesh_settings();
-            let mut queue = self.shared.queue.lock().unwrap();
+            self.mesh_jobs_scratch.clear();
             let submitted = submit_mesh_candidates(
                 world,
                 &mut candidates,
@@ -2507,9 +2533,15 @@ impl Streaming {
                 &mut self.meshing,
                 &mut self.sequence,
                 &mut self.order,
-                &mut queue,
+                &mut self.mesh_jobs_scratch,
             );
-            drop(queue);
+            // Region snapshots and job metadata are now ready. Workers may
+            // keep taking older jobs throughout that preparation; hold the
+            // shared queue lock only while publishing this complete batch.
+            if submitted > 0 {
+                let mut queue = self.shared.queue.lock().unwrap();
+                queue.extend(self.mesh_jobs_scratch.drain(..));
+            }
             candidates.clear();
             if submitted > 1 {
                 self.jobs.notify_all();
@@ -3832,7 +3864,7 @@ fn submit_mesh_candidates(
     meshing: &mut FxHashMap<(i32, i32, i32), u64>,
     sequence: &mut u64,
     order: &mut u64,
-    queue: &mut BinaryHeap<Queued>,
+    pending: &mut Vec<Queued>,
 ) -> usize {
     if room == 0 || candidates.is_empty() {
         return 0;
@@ -3871,7 +3903,7 @@ fn submit_mesh_candidates(
             *sequence += 1;
             *order += 1;
             meshing.insert((x, sy, z), *sequence);
-            queue.push(Queued {
+            pending.push(Queued {
                 priority,
                 at: Some((x, z)),
                 bias,
@@ -4645,6 +4677,7 @@ mod tests {
         let mut sequence = 0u64;
         let mut order = 0u64;
         let mut queue = BinaryHeap::new();
+        let mut pending = Vec::new();
 
         let drain_sections = |queue: &mut BinaryHeap<Queued>| -> Vec<(i32, i32, i32)> {
             let mut out = Vec::new();
@@ -4671,8 +4704,9 @@ mod tests {
             &mut meshing,
             &mut sequence,
             &mut order,
-            &mut queue,
+            &mut pending,
         );
+        queue.extend(pending.drain(..));
         assert_eq!(submitted, 3);
         let first_batch = drain_sections(&mut queue);
         assert_eq!(first_batch, vec![(0, 7, 0), (0, 6, 0), (0, 8, 0)]);
@@ -4703,8 +4737,9 @@ mod tests {
             &mut meshing,
             &mut sequence,
             &mut order,
-            &mut queue,
+            &mut pending,
         );
+        queue.extend(pending.drain(..));
         assert_eq!(submitted, 22);
         let second_batch = drain_sections(&mut queue);
         assert!(meshed.contains(&(0, 0)));
@@ -4730,8 +4765,9 @@ mod tests {
             &mut meshing,
             &mut sequence,
             &mut order,
-            &mut queue,
+            &mut pending,
         );
+        queue.extend(pending.drain(..));
         assert_eq!(submitted, 3);
         let third_batch = drain_sections(&mut queue);
         assert!(meshed.contains(&(1, 0)));
