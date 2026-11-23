@@ -1473,7 +1473,7 @@ impl<'a, 'w> Finder<'a, 'w> {
                 }
             }
         }
-        let reached: Vec<&Target> = targets.iter().filter(|t| t.reached).collect();
+        let has_reached_target = targets.iter().any(|t| t.reached);
         let build = |s: &Self, t: &Target, reached: bool| -> Option<Path> {
             let mut n = t.best?;
             let mut nodes = vec![];
@@ -1493,9 +1493,10 @@ impl<'a, 'w> Finder<'a, 'w> {
             nodes.reverse();
             Some(Path::new(nodes, t.pos, reached))
         };
-        if !reached.is_empty() {
-            reached
+        if has_reached_target {
+            targets
                 .iter()
+                .filter(|t| t.reached)
                 .filter_map(|t| build(&self, t, true))
                 .min_by_key(|p| p.nodes.len())
         } else {
