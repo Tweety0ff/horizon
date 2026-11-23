@@ -940,7 +940,11 @@ impl StructureState {
                 index += 1;
                 for start in starts.iter() {
                     let b = start.bounding_box;
-                    if b.max[0] >= bx && b.min[0] <= bx + 15 && b.max[2] >= bz && b.min[2] <= bz + 15 {
+                    if b.max[0] >= bx
+                        && b.min[0] <= bx + 15
+                        && b.max[2] >= bz
+                        && b.min[2] <= bz + 15
+                    {
                         out.push(start.clone());
                     }
                 }
