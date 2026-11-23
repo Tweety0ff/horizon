@@ -77,7 +77,6 @@ mod new_instance;
 mod notes_cache;
 mod owner_page;
 mod packs_page;
-mod partner;
 mod perf;
 mod picture_cache;
 mod plate;
