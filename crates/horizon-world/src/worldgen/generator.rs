@@ -447,6 +447,13 @@ fn state(
         .map_err(|e| resource(format!("block state {raw}: {e}")))
 }
 
+/// Resize a worker-owned density buffer without allocating when the next column
+/// has the same height. `sample_volume` overwrites the whole slice.
+fn density_scratch(scratch: &mut Vec<f32>, height: usize) -> &mut [f32] {
+    scratch.resize(height, 0.0);
+    scratch
+}
+
 impl<R: RandomSource + 'static> Pipeline<R>
 where
     R::Positional: Clone + Send + Sync,
@@ -1306,13 +1313,7 @@ where
             false
         });
     }
-    /// Resize a worker-owned density buffer without allocating when the next column
-/// has the same height. `sample_volume` overwrites the whole slice.
-fn density_scratch(scratch: &mut Vec<f32>, height: usize) -> &mut [f32] {
-    scratch.resize(height, 0.0);
-    scratch
-}
-/// iterateNoiseColumn from the top down until `visit` returns true.
+    /// iterateNoiseColumn from the top down until `visit` returns true.
     fn noise_column(
         &self,
         x: i32,
@@ -3189,10 +3190,11 @@ mod tests {
     #[test]
     fn density_scratch_reuses_its_allocation_for_equal_heights() {
         let mut scratch = Vec::new();
-        let (pointer, capacity) = {
+        let pointer = {
             let density = density_scratch(&mut scratch, 384);
-            (density.as_ptr(), scratch.capacity())
+            density.as_ptr()
         };
+        let capacity = scratch.capacity();
         {
             let density = density_scratch(&mut scratch, 384);
             assert_eq!(density.as_ptr(), pointer);
