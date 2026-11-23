@@ -527,7 +527,7 @@ impl Game<'_> {
                 };
                 if let Some(m) = self.mob_index.get_mut(&mut self.mobs, p.source as u32) {
                     m.extra.leash = holder;
-                } else if let Some(i) = self.boats.iter().position(|b| b.id == p.source as u32) {
+                } else if let Some(i) = self.entity_indices.boats.find(&self.boats, p.source as u32, |b| b.id) {
                     self.boats.update(i, |b| {
                         // A leashed boat or raft (AbstractBoat is Leashable).
                         b.leash = holder;
@@ -822,7 +822,7 @@ impl Game<'_> {
                     // ExperienceOrb.DATA_VALUE (the icon's size).
                     if *index == 8
                         && let Value::Int(v) = value
-                        && let Some(o) = self.orbs.iter_mut().find(|o| o.id == p.id as u32)
+                        && let Some(i) = self.entity_indices.orbs.find(&self.orbs, p.id as u32, |o| o.id)
                     {
                         o.value = *v;
                     }
@@ -879,7 +879,7 @@ impl Game<'_> {
                     .find(|o| o.id == p.item as u32)
                     .map(|o| o.position);
                 let orb = orb_at.is_some();
-                let item = self.dropped.iter().find(|d| d.id == p.item as u32);
+                let item = self.entity_indices.dropped.find(&self.dropped, p.item as u32, |d| d.id).map(|i| &self.dropped[i]);
                 let shot = self
                     .creatures
                     .projectiles
@@ -931,12 +931,12 @@ impl Game<'_> {
                 } else {
                     super::super::pickups::Collector::Mob(p.player as u32)
                 };
-                if let Some(item) = self.dropped.iter().find(|d| d.id == p.item as u32).cloned() {
+                if let Some(item) = self.entity_indices.dropped.find(&self.dropped, p.item as u32, |d| d.id).map(|i| self.dropped[i].clone()) {
                     self.add_pickup(
                         super::super::pickups::Taken::Item(Box::new(item)),
                         collector,
                     );
-                } else if let Some(orb) = self.orbs.iter().find(|o| o.id == p.item as u32).cloned()
+                } else if let Some(orb) = self.entity_indices.orbs.find(&self.orbs, p.item as u32, |o| o.id).map(|i| self.orbs[i].clone())
                 {
                     self.add_pickup(super::super::pickups::Taken::Orb(Box::new(orb)), collector);
                 } else if let Some(shot) = self
@@ -951,7 +951,7 @@ impl Game<'_> {
                         super::super::pickups::Taken::Arrow(Box::new(shot)),
                         collector,
                     );
-                } else if let Some(i) = self.tridents.iter().position(|t| t.id == p.item as u32) {
+                } else if let Some(i) = self.entity_indices.tridents.find(&self.tridents, p.item as u32, |t| t.id) {
                     // So does a trident: a server's client keeps them apart.
                     let trident = self.tridents.remove(i);
                     self.add_pickup(

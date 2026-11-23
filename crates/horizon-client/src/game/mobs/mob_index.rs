@@ -30,6 +30,7 @@ impl IdIndex {
 #[derive(Default)]
 pub(super) struct EntityIndices {
     pub(super) dropped: IdIndex,
+    pub(super) boats: IdIndex,
     pub(super) orbs: IdIndex,
     pub(super) falling: IdIndex,
     pub(super) tnts: IdIndex,

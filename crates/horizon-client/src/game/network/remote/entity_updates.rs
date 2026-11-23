@@ -11,8 +11,8 @@ impl Game<'_> {
             .remote
             .as_mut()
             .and_then(|r| r.pending_items.remove(&id));
-        if let Some(item) = self.dropped.iter_mut().find(|d| d.id == id as u32) {
-            item.stack = stack;
+        if let Some(i) = self.entity_indices.dropped.find(&self.dropped, id as u32, |d| d.id) {
+            self.dropped[i].stack = stack;
             return;
         }
         let Some((p, velocity)) = position else {
@@ -39,15 +39,15 @@ impl Game<'_> {
         if let Some(m) = self.mob_index.get_mut(&mut self.mobs, id as u32) {
             // Squid.aiStep derives its body pitch and roll from network motion.
             m.velocity = v;
-        } else if let Some(d) = self.dropped.iter_mut().find(|d| d.id == id as u32) {
-            d.velocity = v;
-        } else if let Some(i) = self.falling.iter().rposition(|f| f.id == id as u32) {
+        } else if let Some(i) = self.entity_indices.dropped.find(&self.dropped, id as u32, |d| d.id) {
+            self.dropped[i].velocity = v;
+        } else if let Some(i) = self.entity_indices.falling.find(&self.falling, id as u32, |f| f.id) {
             self.falling.update(i, |f| f.velocity = v);
-        } else if let Some(t) = self.tnts.iter_mut().rev().find(|t| t.id == id as u32) {
-            t.velocity = v;
-        } else if let Some(o) = self.orbs.iter_mut().find(|o| o.id == id as u32) {
-            o.velocity = v;
-        } else if let Some(i) = self.carts.iter().position(|c| c.id == id as u32) {
+        } else if let Some(i) = self.entity_indices.tnts.find(&self.tnts, id as u32, |t| t.id) {
+            self.tnts[i].velocity = v;
+        } else if let Some(i) = self.entity_indices.orbs.find(&self.orbs, id as u32, |o| o.id) {
+            self.orbs[i].velocity = v;
+        } else if let Some(i) = self.entity_indices.carts.find(&self.carts, id as u32, |c| c.id) {
             self.carts.update(i, |c| c.velocity = v);
         } else if let Some(i) = self
             .creatures
@@ -67,16 +67,16 @@ impl Game<'_> {
                     }
                 }
             });
-        } else if let Some(t) = self.tridents.iter_mut().find(|t| t.id == id as u32) {
-            t.velocity = v;
+        } else if let Some(i) = self.entity_indices.tridents.find(&self.tridents, id as u32, |t| t.id) {
+            self.tridents[i].velocity = v;
             // AbstractArrow.lerpMotion (ThrownTrident keeps it): `life`
             // restarts, and a trident set moving leaves its block.
             t.in_ground_time = 0;
             if t.in_ground && v.length_squared() > 0.0 {
                 t.in_ground = false;
             }
-        } else if let Some(r) = self.rockets.iter_mut().find(|r| r.id == id as u32) {
-            r.velocity = v;
+        } else if let Some(i) = self.entity_indices.rockets.find(&self.rockets, id as u32, |r| r.id) {
+            self.rockets[i].velocity = v;
         } else if self.remote_hook_motion(id as u32, v) {
         } else if let Some(p) = self
             .remote
