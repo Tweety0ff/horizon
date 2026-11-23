@@ -572,38 +572,68 @@ fn mesh_columns_with_edges<L: Look>(
     mut material: impl FnMut(&Span, Direction, [i32; 2]) -> Material<L>,
 ) -> SectionMesh {
     assert_eq!(columns.len(), CELLS * CELLS);
-    // The heightmap columns are built here and borrowed like the tile's own.
-    let heightmap_columns: [Spans; CELLS * CELLS];
-    let heightmap_refs: [&[Span]; CELLS * CELLS];
-    let heightmap_edges: [smallvec::SmallVec<[Spans; 4]>; 4];
-    let heightmap_neighbors: [EdgeColumns<'_>; 4];
-    let (columns, neighbors) = if key.level >= HEIGHTMAP_LEVEL {
-        let [ox, _, oz] = key.origin();
-        let mut fluid = |span: &Span| material(span, Direction::Up, [ox, oz]).fluid != 0;
-        heightmap_columns =
-            std::array::from_fn(|index| heightmap(columns[index], &mut fluid));
-        heightmap_edges = neighbors.each_ref().map(|side| {
-            side.iter()
-                .map(|edge| heightmap(edge.spans, &mut fluid))
-                .collect()
-        });
-        heightmap_refs = std::array::from_fn(|index| heightmap_columns[index].as_slice());
-        heightmap_neighbors = std::array::from_fn(|side| {
-            neighbors[side]
-                .iter()
-                .zip(&heightmap_edges[side])
-                .map(|(edge, spans)| EdgeColumn {
-                    start: edge.start,
-                    end: edge.end,
-                    spans: spans.as_slice(),
-                    unknown: edge.unknown,
-                })
-                .collect()
-        });
-        (&heightmap_refs[..], &heightmap_neighbors)
-    } else {
-        (columns, neighbors)
-    };
+    // Keep the ordinary path allocation-free. The heightmap path owns its
+    // temporary columns and edge spans until the shared mesher has finished.
+    if key.level < HEIGHTMAP_LEVEL {
+        return mesh_columns_prepared::<L>(
+            key,
+            columns,
+            covered,
+            covered_bounds,
+            neighbors,
+            finer,
+            finer_keys,
+            &mut material,
+        );
+    }
+
+    let [ox, _, oz] = key.origin();
+    let mut fluid = |span: &Span| material(span, Direction::Up, [ox, oz]).fluid != 0;
+    let heightmap_columns: [Spans; CELLS * CELLS] =
+        std::array::from_fn(|index| heightmap(columns[index], &mut fluid));
+    let heightmap_edges: [smallvec::SmallVec<[Spans; 4]>; 4] = neighbors.each_ref().map(|side| {
+        side.iter()
+            .map(|edge| heightmap(edge.spans, &mut fluid))
+            .collect()
+    });
+    drop(fluid);
+    let heightmap_refs: [&[Span]; CELLS * CELLS] =
+        std::array::from_fn(|index| heightmap_columns[index].as_slice());
+    let heightmap_neighbors: [EdgeColumns<'_>; 4] = std::array::from_fn(|side| {
+        neighbors[side]
+            .iter()
+            .zip(&heightmap_edges[side])
+            .map(|(edge, spans)| EdgeColumn {
+                start: edge.start,
+                end: edge.end,
+                spans: spans.as_slice(),
+                unknown: edge.unknown,
+            })
+            .collect()
+    });
+    mesh_columns_prepared::<L>(
+        key,
+        &heightmap_refs,
+        covered,
+        covered_bounds,
+        &heightmap_neighbors,
+        finer,
+        finer_keys,
+        &mut material,
+    )
+}
+
+#[inline]
+fn mesh_columns_prepared<L: Look>(
+    key: TileKey,
+    columns: &[&[Span]],
+    covered: &FxHashSet<(i32, i32)>,
+    covered_bounds: Option<[i32; 4]>,
+    neighbors: &[EdgeColumns<'_>; 4],
+    finer: &[TileKey],
+    finer_keys: &FxHashSet<TileKey>,
+    mut material: impl FnMut(&Span, Direction, [i32; 2]) -> Material<L>,
+) -> SectionMesh {
     let mut count = CELLS * CELLS;
     let edge_offsets = std::array::from_fn::<_, 4, _>(|side| {
         let start = count;
@@ -913,7 +943,6 @@ fn mesh_columns_with_edges<L: Look>(
     mesh.finish_sprite_layers();
     mesh
 }
-
 #[cfg(test)]
 mod refinement_tests {
     use super::*;

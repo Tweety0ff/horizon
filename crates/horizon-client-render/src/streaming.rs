@@ -987,7 +987,7 @@ impl GenerationScan {
                         if input.world.chunks.contains_key(&(x, z))
                             || input.generating.contains(&(x, z))
                             || input.protos.contains_key(&(x, z))
-                            || input.finishing.contains_key(&(x, z))
+                            || input.finishing.contains(&(x, z))
                         {
                             continue;
                         }
