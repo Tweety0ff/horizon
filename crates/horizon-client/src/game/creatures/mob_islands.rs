@@ -2512,21 +2512,21 @@ mod tests {
     /// serial fallback continues to count only mobs that tick.
     #[test]
     fn island_packing_accounts_for_resident_snapshot_cost() {
-        let mut a = herd(0, 100, 0.0, 0.0);
+        let mut a = herd(0, 520, 0.0, 0.0);
         for reach in a.iter_mut().skip(1) {
             reach.ticking = false;
         }
-        let b = herd(1000, 30, 1000.0, 0.0);
-        let c = herd(2000, 20, 2000.0, 0.0);
-        let d = herd(3000, 20, 3000.0, 0.0);
+        let b = herd(1000, 130, 1000.0, 0.0);
+        let c = herd(2000, 90, 2000.0, 0.0);
+        let d = herd(3000, 90, 3000.0, 0.0);
         let list: Vec<_> = a.into_iter().chain(b).chain(c).chain(d).collect();
         let plan = islands(&list, 2).expect("two groups");
         let of = group_of(&plan, list.len());
 
-        // With snapshot cost included: B+D and A+C. A tick-count-only
+        // With snapshot cost included: A+D and B+C. A tick-count-only
         // estimate would instead put A+B together and C+D together.
-        assert_eq!(of[100], of[150], "B and D share the heavier group");
-        assert_eq!(of[0], of[130], "A and C share the other group");
-        assert_ne!(of[100], of[0]);
+        assert_eq!(of[0], of[740], "A and D share one group");
+        assert_eq!(of[520], of[650], "B and C share the other group");
+        assert_ne!(of[0], of[520]);
     }
 }
