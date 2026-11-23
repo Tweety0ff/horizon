@@ -464,6 +464,7 @@ impl Decoration {
             level_random,
             structure_mobs: worker.structure_mobs.clone(),
             starts: references.clone(),
+            structures_scratch: Vec::new(),
             biome_names: data.biome_names(),
             blocks: data
                 .feature_resources
@@ -772,6 +773,8 @@ struct World<'a> {
     level_random: &'a mut dyn super::structure::legacy::PieceRandom,
     structure_mobs: Option<Arc<dyn super::generator::StructureMobs>>,
     starts: Vec<Arc<super::structure::start::StructureStart>>,
+    /// Reused while finalizing structure-spawned mobs in this region.
+    structures_scratch: Vec<String>,
     biome_names: &'a [Arc<str>],
     blocks: Option<&'a BlockBehavior>,
     region: TerrainRegion<'static, GenBlockStates>,
@@ -1341,15 +1344,15 @@ impl PlacementContext for World<'_> {
                 .biome_identity(at)
                 .ok()
                 .and_then(|b| self.biome_names.get(b.0 as usize))
-                .map_or("", |n| &**n)
-                .to_owned();
-            let structures: Vec<String> = self
-                .starts
-                .iter()
-                .filter(|s| s.pieces.iter().any(|p| p.bounding_box().is_inside(at)))
-                .map(|s| s.name.clone())
-                .collect();
-            if mobs.finalize(&mut nbt, &biome, &structures, self.level_random) {
+                .map_or("", |name| &**name);
+            self.structures_scratch.clear();
+            self.structures_scratch.extend(
+                self.starts
+                    .iter()
+                    .filter(|s| s.pieces.iter().any(|p| p.bounding_box().is_inside(at)))
+                    .map(|s| s.name.clone()),
+            );
+            if mobs.finalize(&mut nbt, biome, &self.structures_scratch, self.level_random) {
                 nbt.remove(&"horizon:finalize".into());
             }
         }
