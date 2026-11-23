@@ -12,37 +12,39 @@
 //! answer is always the linear search's.
 
 use horizon_client::fast_hash::FxHashMap;
+use std::cell::RefCell;
 use horizon_client::mobs::Mob;
 
 #[derive(Default)]
 pub struct MobIndex {
-    slots: FxHashMap<u32, u32>,
+    slots: RefCell<FxHashMap<u32, u32>>,
 }
 
 impl MobIndex {
     /// The position of the mob with this id in `mobs`, as
     /// `mobs.iter().position(|m| m.id == id)`.
-    pub fn find(&mut self, mobs: &[Mob], id: u32) -> Option<usize> {
+    pub fn find(&self, mobs: &[Mob], id: u32) -> Option<usize> {
         self.position(mobs, |m| m.id, id)
     }
 
-    fn position<T>(&mut self, items: &[T], id_of: impl Fn(&T) -> u32, id: u32) -> Option<usize> {
-        if let Some(&i) = self.slots.get(&id)
+    fn position<T>(&self, items: &[T], id_of: impl Fn(&T) -> u32, id: u32) -> Option<usize> {
+        let mut slots = self.slots.borrow_mut();
+        if let Some(&i) = slots.get(&id)
             && items.get(i as usize).is_some_and(|m| id_of(m) == id)
         {
             return Some(i as usize);
         }
         let i = items.iter().position(|m| id_of(m) == id)?;
-        self.slots.clear();
+        slots.clear();
         for (i, m) in items.iter().enumerate() {
-            self.slots.entry(id_of(m)).or_insert(i as u32);
+            slots.entry(id_of(m)).or_insert(i as u32);
         }
         Some(i)
     }
 
     /// The mob with this id, as `mobs.iter_mut().find(|m| m.id == id)`.
     pub fn get_mut<'a>(
-        &mut self,
+        &self,
         mobs: &'a mut horizon_client::join_seq::JoinList<Mob>,
         id: u32,
     ) -> Option<&'a mut Mob> {
@@ -51,7 +53,7 @@ impl MobIndex {
     }
 
     /// The mob with this id, as `mobs.iter().find(|m| m.id == id)`.
-    pub fn get<'a>(&mut self, mobs: &'a [Mob], id: u32) -> Option<&'a Mob> {
+    pub fn get<'a>(&self, mobs: &'a [Mob], id: u32) -> Option<&'a Mob> {
         let i = self.find(mobs, id)?;
         Some(&mobs[i])
     }

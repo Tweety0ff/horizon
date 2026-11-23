@@ -94,7 +94,8 @@ mod item_no_physics;
 pub mod nameplate;
 mod obstacles;
 pub use fluids::{fall_reset_hit, fluid_flow, update_entity_fluids, water_clip};
-pub use item_merge::{ItemCells, merge_with_neighbours};
+pub use item_merge::{ItemCells, OrbCells, merge_with_neighbours};
+pub(crate) use item_merge::merge_with_neighbours_scratch;
 pub use obstacles::ObstacleGrid;
 
 #[cfg(test)]
