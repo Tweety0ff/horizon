@@ -2506,4 +2506,29 @@ mod tests {
         assert_ne!(of[0], of[200]);
         assert_eq!(of[200], of[300], "both small herds fill the lighter group");
     }
+
+    /// Non-ticking residents still cost work to publish and group, so they
+    /// participate in the estimated load even though the largest-island
+    /// serial fallback continues to count only mobs that tick.
+    #[test]
+    fn island_packing_accounts_for_resident_snapshot_cost() {
+        let mut a = herd(0, 100, 0.0, 0.0);
+        for reach in a.iter_mut().skip(1) {
+            reach.ticking = false;
+        }
+        let b = herd(1000, 30, 1000.0, 0.0);
+        let c = herd(2000, 20, 2000.0, 0.0);
+        let d = herd(3000, 20, 3000.0, 0.0);
+        let list: Vec<_> = a.into_iter().chain(b).chain(c).chain(d).collect();
+        let plan = islands(&list, 2).expect("two groups");
+        let of = group_of(&plan, list.len());
+
+        // With snapshot cost included: B+D and A+C. A tick-count-only
+        // estimate would instead put A+B together and C+D together.
+        assert_eq!(of[0], of[150], "B and D share the heavier group");
+        assert_eq!(of[100], of[200], "A and C share the other group");
+        assert_ne!(of[0], of[100]);
+        assert_ne!(of[0], of[200]);
+        assert_ne!(of[100], of[300]);
+    }
 }

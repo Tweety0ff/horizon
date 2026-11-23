@@ -245,6 +245,7 @@ impl OrbCells {
 #[cfg(test)]
 mod reusable_cells_tests {
     use super::*;
+
     #[test]
     fn item_cells_reuse_bucket_allocations_after_rebuild() {
         let mut cells = ItemCells::default();
@@ -254,4 +255,32 @@ mod reusable_cells_tests {
         cells.add(1, Vec3::new(0.0, 0.0, 0.0));
         assert_eq!(cells.cells.values().next().unwrap().capacity(), capacity);
     }
+
+    #[test]
+    fn orb_cells_reuse_buckets_and_follow_moved_orbs() {
+        let mut orbs = vec![
+            ExperienceOrb::new(1, Vec3::new(0.2, 64.0, 0.2), Vec3::ZERO, 1),
+            ExperienceOrb::new(2, Vec3::new(0.4, 64.0, 0.2), Vec3::ZERO, 1),
+        ];
+        orbs[0].join = JoinSeq::next();
+        orbs[1].join = JoinSeq::next();
+
+        let mut cells = OrbCells::default();
+        cells.rebuild(&orbs);
+        let mut found = Vec::new();
+        let area = orbs[0].bounds().inflate(Vec3::new(0.5, 0.5, 0.5));
+        cells.near(area, &mut found);
+        assert_eq!(found, vec![orbs[0].join, orbs[1].join]);
+
+        let old = orbs[0].position;
+        let moved = Vec3::new(4.2, 64.0, 0.2);
+        cells.moved(orbs[0].join, old, moved);
+        cells.near(area, &mut found);
+        assert_eq!(found, vec![orbs[1].join]);
+
+        let moved_area = ExperienceOrb::box_at(moved).inflate(Vec3::new(0.5, 0.5, 0.5));
+        cells.near(moved_area, &mut found);
+        assert_eq!(found, vec![orbs[0].join]);
+    }
 }
+
