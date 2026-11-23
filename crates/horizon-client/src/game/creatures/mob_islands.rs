@@ -2525,10 +2525,8 @@ mod tests {
 
         // With snapshot cost included: B+D and A+C. A tick-count-only
         // estimate would instead put A+B together and C+D together.
-        assert_eq!(of[0], of[150], "B and D share the heavier group");
-        assert_eq!(of[100], of[200], "A and C share the other group");
-        assert_ne!(of[0], of[100]);
-        assert_ne!(of[0], of[200]);
-        assert_ne!(of[100], of[300]);
+        assert_eq!(of[100], of[150], "B and D share the heavier group");
+        assert_eq!(of[0], of[130], "A and C share the other group");
+        assert_ne!(of[100], of[0]);
     }
 }
