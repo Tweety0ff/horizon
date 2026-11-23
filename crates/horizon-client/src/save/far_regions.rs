@@ -69,24 +69,50 @@ impl FarRegions {
         path: impl FnOnce() -> PathBuf,
     ) -> Option<ChunkRecord> {
         let region = (chunk.x >> 5, chunk.z >> 5);
-        let header = {
+        // Keep only the map lookup under the shared lock: opening and
+        // reading a cold region header is disk I/O and must not serialize
+        // unrelated far-sampling workers.
+        let cached = {
             let mut regions = self.0.lock().unwrap();
             match regions.get(&region) {
                 Some(kept) if kept.written == written && kept.checked.elapsed() < HEADER_TTL => {
-                    kept.header.clone()
+                    Some(kept.header.clone())
                 }
                 _ => {
                     if regions.len() >= KEPT_HEADERS {
                         regions.retain(|_, kept| kept.checked.elapsed() < HEADER_TTL);
                     }
-                    let header = RegionHeader::read(path()).ok().map(Arc::new);
-                    let kept = FarRegion {
-                        checked: Instant::now(),
-                        written,
-                        header: header.clone(),
-                    };
-                    regions.insert(region, kept);
-                    header
+                    None
+                }
+            }
+        };
+        let header = match cached {
+            Some(header) => header,
+            None => {
+                let loaded = RegionHeader::read(path()).ok().map(Arc::new);
+                let mut regions = self.0.lock().unwrap();
+                // Another worker may have filled this entry while we were
+                // reading. Prefer its fresh value (including a cached miss).
+                match regions.get(&region) {
+                    Some(kept)
+                        if kept.written == written && kept.checked.elapsed() < HEADER_TTL =>
+                    {
+                        kept.header.clone()
+                    }
+                    _ => {
+                        if regions.len() >= KEPT_HEADERS {
+                            regions.retain(|_, kept| kept.checked.elapsed() < HEADER_TTL);
+                        }
+                        regions.insert(
+                            region,
+                            FarRegion {
+                                checked: Instant::now(),
+                                written,
+                                header: loaded.clone(),
+                            },
+                        );
+                        loaded
+                    }
                 }
             }
         };
