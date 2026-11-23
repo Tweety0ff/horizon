@@ -555,8 +555,11 @@ impl<'a, 'w> Finder<'a, 'w> {
         }
         t
     }
-    fn within_bb(&self, x: i32, y: i32, z: i32) -> Vec<PathType> {
-        let mut out = Vec::with_capacity(4);
+    /// The unique path types in declaration order. Indexing by the enum's
+    /// discriminant gives the same order as the former sort, without allocating
+    /// a Vec for every node expanded by A*.
+    fn within_bb(&self, x: i32, y: i32, z: i32) -> [Option<PathType>; PATH_TYPES] {
+        let mut out = [None; PATH_TYPES];
         let mp = self.mob.block_position();
         for dx in 0..self.entity_width {
             for dy in 0..self.entity_height {
@@ -581,9 +584,7 @@ impl<'a, 'w> Finder<'a, 'w> {
                     {
                         t = PathType::UnpassableRail;
                     }
-                    if !out.contains(&t) {
-                        out.push(t);
-                    }
+                    out[t as usize] = Some(t);
                 }
             }
         }
@@ -594,28 +595,29 @@ impl<'a, 'w> Finder<'a, 'w> {
         if let Evaluator::Swim { .. } = self.eval {
             return self.swim_path_type(x, y, z);
         }
-        let mut types = self.within_bb(x, y, z);
-        // EnumSet iteration follows declaration order.
-        types.sort_by_key(|t| *t as u8);
-        if types.len() == 1 {
-            return types[0];
+        let types = self.within_bb(x, y, z);
+        let type_count = types.iter().filter(|t| t.is_some()).count();
+        if type_count == 1 {
+            return types.into_iter().flatten().next().unwrap_or(PathType::Blocked);
         }
-        if types.contains(&PathType::Fence) {
+        if types[PathType::Fence as usize].is_some() {
             return PathType::Fence;
         }
-        if types.contains(&PathType::UnpassableRail) {
+        if types[PathType::UnpassableRail as usize].is_some() {
             return PathType::UnpassableRail;
         }
         let mut highest = PathType::Blocked;
         let mut highest_malus = self.malus(highest);
-        for t in &types {
-            let m = self.malus(*t);
+        // Flattening the discriminant-indexed array visits types in the same
+        // order as the former sorted Vec.
+        for t in types.into_iter().flatten() {
+            let m = self.malus(t);
             if m < 0.0 {
-                return *t;
+                return t;
             }
             if m >= highest_malus {
                 highest_malus = m;
-                highest = *t;
+                highest = t;
             }
         }
         let current = self.path_type(x, y, z);
@@ -1560,6 +1562,29 @@ mod tests {
         for size in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert_eq!(collision_steps(1.0, size), 1);
         }
+    }
+
+    #[test]
+    fn bounding_box_path_types_keep_the_sorted_unique_enum_order() {
+        let input = [
+            PathType::Water,
+            PathType::Open,
+            PathType::Fence,
+            PathType::Open,
+            PathType::Fire,
+            PathType::UnpassableRail,
+            PathType::Water,
+        ];
+        let mut expected = input.to_vec();
+        expected.sort_by_key(|t| *t as u8);
+        expected.dedup();
+
+        let mut indexed = [None; PATH_TYPES];
+        for t in input {
+            indexed[t as usize] = Some(t);
+        }
+        let actual: Vec<_> = indexed.into_iter().flatten().collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]
