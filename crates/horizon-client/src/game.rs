@@ -1248,6 +1248,10 @@ struct Game<'a> {
     /// Scratch outputs from the remote entity tick.
     remote_using_scratch: Vec<(ItemStack, u32, [f64; 3], f32, f32, f32)>,
     remote_entered_scratch: Vec<horizon_client::entities::ItemSplash>,
+    remote_wither_targets_scratch: HashMap<i32, ([f64; 3], f64)>,
+    remote_followed_scratch: Vec<([f64; 3], [f64; 3])>,
+    remote_sleepers_scratch: Vec<Aabb>,
+    remote_turn_scratch: HashMap<i32, (f32, u32)>,
     next_entity: u32,
     /// The last entity id when this level's entity pass began: an item with a
     /// later one was added during that pass and first ticks on the next
@@ -10742,6 +10746,10 @@ impl<'a> Game<'a> {
             item_obstacles: Default::default(),
             remote_using_scratch: Vec::new(),
             remote_entered_scratch: Vec::new(),
+            remote_wither_targets_scratch: HashMap::new(),
+            remote_followed_scratch: Vec::new(),
+            remote_sleepers_scratch: Vec::new(),
+            remote_turn_scratch: HashMap::new(),
             next_entity: 0,
             ticked_entities_through: u32::MAX,
             contact_drops: 0..0,
