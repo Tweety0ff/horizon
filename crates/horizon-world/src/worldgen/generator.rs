@@ -3191,10 +3191,10 @@ mod tests {
     #[test]
     fn density_scratch_reuses_its_allocation_for_equal_heights() {
         let mut scratch = Vec::new();
-        let (pointer, capacity) = {
+        let pointer = {
             let density = density_scratch(&mut scratch, 384);
             density.fill(7.0);
-            (density.as_ptr(), density.len())
+            density.as_ptr()
         };
         let capacity = scratch.capacity();
         {
