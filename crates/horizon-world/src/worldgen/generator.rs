@@ -1415,7 +1415,12 @@ where
         if let Some(h) = self.worker.heights.get(&(x, z, kind as u8)) {
             return *h;
         }
-        let h = self.pipeline.base_height(x, z, kind, &mut self.worker.noise_column_density);
+        let h = self.pipeline.base_height(
+            x,
+            z,
+            kind,
+            &mut self.worker.noise_column_density,
+        );
         if self.worker.heights.len() > 65536 {
             self.worker.heights.clear();
         }
@@ -1484,7 +1489,12 @@ where
         }
     }
     fn base_column(&mut self, x: i32, z: i32, kind: HeightmapType) -> Vec<bool> {
-        self.pipeline.base_column(x, z, kind, &mut self.worker.noise_column_density)
+        self.pipeline.base_column(
+            x,
+            z,
+            kind,
+            &mut self.worker.noise_column_density,
+        )
     }
     fn base_columns_by(
         &mut self,
@@ -1493,7 +1503,13 @@ where
         count: usize,
         kind: &dyn Fn(usize) -> HeightmapType,
     ) -> Vec<Vec<bool>> {
-        self.pipeline.base_columns_by(x, z, count, kind, &mut self.worker.noise_column_density)
+        self.pipeline.base_columns_by(
+            x,
+            z,
+            count,
+            kind,
+            &mut self.worker.noise_column_density,
+        )
     }
     fn noise_column_into(
         &mut self,
