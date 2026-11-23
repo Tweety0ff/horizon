@@ -385,6 +385,16 @@ impl MeshPool {
         self.meshes.push(mesh);
         None
     }
+    /// Insert a mesh whose geometry and per-section metadata were cleared outside the pool lock.
+    fn put_cleared(&mut self, mesh: SectionMesh) -> Option<SectionMesh> {
+        let bytes = mesh.capacity_bytes();
+        if bytes == 0 || self.meshes.len() == Self::COUNT || bytes > Self::BYTES - self.bytes {
+            return Some(mesh);
+        }
+        self.bytes += bytes;
+        self.meshes.push(mesh);
+        None
+    }
 }
 
 /// The chunks `wanted` in the order they decorate: by rank, lowest first. No
@@ -399,8 +409,17 @@ fn decoration_queue(
     wanted: impl Iterator<Item = (i32, i32)>,
     distance: impl Fn(i32, i32) -> i64,
 ) -> std::collections::BinaryHeap<std::cmp::Reverse<(u64, i32, i32)>> {
-    let mut ranked = Vec::new();
-    let mut fresh = Vec::new();
+    decoration_queue_with_scratch(order, &mut Vec::new(), &mut Vec::new(), wanted, distance)
+}
+fn decoration_queue_with_scratch(
+    order: &mut DecorationOrder,
+    ranked: &mut Vec<std::cmp::Reverse<(u64, i32, i32)>>,
+    fresh: &mut Vec<(i64, i32, i32)>,
+    wanted: impl Iterator<Item = (i32, i32)>,
+    distance: impl Fn(i32, i32) -> i64,
+) -> std::collections::BinaryHeap<std::cmp::Reverse<(u64, i32, i32)>> {
+    ranked.clear();
+    fresh.clear();
     for (x, z) in wanted {
         match order.rank(x, z) {
             Some(rank) => ranked.push(std::cmp::Reverse((rank, x, z))),
@@ -408,10 +427,10 @@ fn decoration_queue(
         }
     }
     fresh.sort_unstable();
-    for (_, x, z) in fresh {
+    for &(_, x, z) in fresh.iter() {
         ranked.push(std::cmp::Reverse((order.rank_or_append(x, z), x, z)));
     }
-    std::collections::BinaryHeap::from(ranked)
+    std::collections::BinaryHeap::from(std::mem::take(ranked))
 }
 
 /// Keep only decoration ranks that can still matter: within the active ranges
@@ -622,6 +641,11 @@ pub struct Streaming {
     /// Vanilla's decoration order around the player, and the centre and
     /// radius it was last ranked for.
     decoration_order: DecorationOrder,
+    /// Reused buffers for ranking chunks eligible for decoration.
+    decoration_ranked_scratch: Vec<std::cmp::Reverse<(u64, i32, i32)>>,
+    decoration_fresh_scratch: Vec<(i64, i32, i32)>,
+    /// Neighbour blocking answers, valid for one scheduling pass only.
+    decoration_waiting_scratch: FxHashMap<(i32, i32), bool>,
     order_area: Option<((i32, i32), i32)>,
     /// What the queued jobs' priorities were computed from (`requeue`): the
     /// centre, the band, the extra areas, and the forced chunks.
@@ -655,7 +679,18 @@ pub struct Streaming {
     light_scratch: Vec<(i64, i32, i32)>,
     gone_scratch: Vec<(i32, i32)>,
     mesh_candidates_scratch: Vec<(i64, i32, i32, SectionMask)>,
+    /// Staged mesh jobs are prepared off-lock and published to workers as one batch.
+    mesh_jobs_scratch: Vec<Queued>,
     mesh_columns_scratch: Vec<((i32, i32), SectionMask)>,
+    /// Far columns being unloaded in the current commit pass.
+    unload_columns_scratch: FxHashSet<(i32, i32)>,
+    /// The next bounded chunk-generation batch, reused as queue capacity opens.
+    generation_batch_scratch: Vec<(i64, i32, i32)>,
+    /// Block positions used by incremental relighting and replay.
+    light_positions_scratch: Vec<(i32, i32, i32)>,
+    /// Columns used to partition large edit batches for worker relighting.
+    light_touched_scratch: FxHashSet<(i32, i32)>,
+    light_whole_scratch: FxHashSet<(i32, i32)>,
     sequence: u64,
     pub center: (i32, i32),
     /// The view distance around `center`; below 0, no area there (a dedicated
@@ -771,6 +806,8 @@ struct GenerationScan {
     band: Option<Band>,
     chunk_revision: u64,
     plan: Vec<(i64, i32, i32)>,
+    /// Reused row-run storage for full range scans.
+    scan_runs: Vec<(i32, i32, i32)>,
     /// Entries before it are no longer missing.
     next: usize,
     /// What `plan` was made for: the ranges and decoration; the chunk
@@ -842,6 +879,20 @@ impl GenerationScan {
         input: GenerationInputs<'_>,
         capacity: usize,
     ) -> Option<Vec<(i64, i32, i32)>> {
+        let mut batch = Vec::new();
+        self.candidates_into(input, capacity, &mut batch)
+            .map(|()| batch)
+    }
+
+    /// Fills a caller-owned batch buffer, retaining its allocation between
+    /// streaming updates while preserving the same bounded, ordered result.
+    fn candidates_into(
+        &mut self,
+        input: GenerationInputs<'_>,
+        capacity: usize,
+        batch: &mut Vec<(i64, i32, i32)>,
+    ) -> Option<()> {
+        batch.clear();
         // Generation (load or proto), closest first, bounded in flight.
         let (margin, reach) = Ranges::margins(input.decorates);
         if input.remote
@@ -861,53 +912,59 @@ impl GenerationScan {
                 self.next += 1;
             }
             let room = capacity - input.generating.len();
-            let batch: Vec<_> = self.plan[self.next..]
-                .iter()
-                .filter(|c| missing(c))
-                .take(room)
-                .copied()
-                .collect();
+            batch.extend(
+                self.plan[self.next..]
+                    .iter()
+                    .filter(|c| missing(c))
+                    .take(room)
+                    .copied(),
+            );
             // Past the plan's end, the full scan below decides whether
             // anything is left (and remembers when nothing is).
             if !batch.is_empty() {
                 self.exhausted = false;
-                return Some(batch);
+                return Some(());
             }
         }
         {
-            let mut wanted = Vec::new();
+            self.plan.clear();
             // Each area's square of columns, as one run per row. Players'
             // areas overlap (a server's players often stand together), so
             // the runs of a row are merged and each column is looked at once.
-            let mut runs: Vec<(i32, i32, i32)> = Vec::new();
-            for (center, radius) in std::iter::once((input.ranges.center, input.ranges.radius))
-                .chain(input.ranges.extra.iter().copied())
             {
-                let r = radius + margin.max(reach + 1);
-                runs.extend((center.1 - r..=center.1 + r).map(|z| (z, center.0 - r, center.0 + r)));
-            }
-            if let Some(band) = input.ranges.band {
-                let r = margin.max(reach + 1);
-                runs.extend((band.z0 - r..=band.z1 + r).map(|z| (z, band.x0 - r, band.x1 + r)));
-            }
-            runs.sort_unstable();
-            let mut runs = runs.into_iter().peekable();
-            while let Some((z, x0, mut x1)) = runs.next() {
-                while let Some((_, _, next_x1)) =
-                    runs.next_if(|&(nz, nx0, _)| nz == z && nx0 <= x1.saturating_add(1))
+                let runs = &mut self.scan_runs;
+                runs.clear();
+                for (center, radius) in std::iter::once((input.ranges.center, input.ranges.radius))
+                    .chain(input.ranges.extra.iter().copied())
                 {
-                    x1 = x1.max(next_x1);
+                    let r = radius + margin.max(reach + 1);
+                    runs.extend(
+                        (center.1 - r..=center.1 + r).map(|z| (z, center.0 - r, center.0 + r)),
+                    );
                 }
-                for x in x0..=x1 {
-                    if !input.ranges.requested(x, z, input.decorates)
-                        || input.world.chunks.contains_key(&(x, z))
-                        || input.generating.contains(&(x, z))
-                        || input.protos.contains_key(&(x, z))
-                        || input.finishing.contains(&(x, z))
+                if let Some(band) = input.ranges.band {
+                    let r = margin.max(reach + 1);
+                    runs.extend((band.z0 - r..=band.z1 + r).map(|z| (z, band.x0 - r, band.x1 + r)));
+                }
+                runs.sort_unstable();
+                let mut runs = runs.drain(..).peekable();
+                while let Some((z, x0, mut x1)) = runs.next() {
+                    while let Some((_, _, next_x1)) =
+                        runs.next_if(|&(nz, nx0, _)| nz == z && nx0 <= x1.saturating_add(1))
                     {
-                        continue;
+                        x1 = x1.max(next_x1);
                     }
-                    wanted.push((input.ranges.priority(x, z), x, z));
+                    for x in x0..=x1 {
+                        if !input.ranges.requested(x, z, input.decorates)
+                            || input.world.chunks.contains_key(&(x, z))
+                            || input.generating.contains(&(x, z))
+                            || input.protos.contains_key(&(x, z))
+                            || input.finishing.contains(&(x, z))
+                        {
+                            continue;
+                        }
+                        self.plan.push((input.ranges.priority(x, z), x, z));
+                    }
                 }
             }
             // Forced chunks and their generation neighbourhood: the ring that
@@ -929,37 +986,40 @@ impl GenerationScan {
                         {
                             continue;
                         }
-                        wanted.push((input.ranges.priority(x, z), x, z));
+                        self.plan.push((input.ranges.priority(x, z), x, z));
                     }
                 }
             }
-            let ranges = Ranges {
-                center: input.ranges.center,
-                radius: input.ranges.radius,
-                extra: input.ranges.extra,
-                forced: input.ranges.forced,
-                cover: input.ranges.cover,
-                forced_cover: None,
-                band: input.ranges.band,
-            };
-            self.remember(ranges, input.world);
-            if wanted.is_empty() {
-                self.plan.clear();
-                self.plan_basis = None;
-            } else {
-                // A bounded batch may leave candidates behind: the next calls
-                // take them from the plan as capacity opens.
-                self.exhausted = false;
-                self.plan_basis = Some(input.decorates);
-            }
-            wanted.sort_unstable();
-            wanted.dedup();
-            self.plan.clear();
-            self.plan.extend_from_slice(&wanted);
-            self.next = 0;
-            wanted.truncate(capacity - input.generating.len());
-            Some(wanted)
         }
+        let ranges = Ranges {
+            center: input.ranges.center,
+            radius: input.ranges.radius,
+            extra: input.ranges.extra,
+            forced: input.ranges.forced,
+            cover: input.ranges.cover,
+            forced_cover: None,
+            band: input.ranges.band,
+        };
+        self.remember(ranges, input.world);
+        if self.plan.is_empty() {
+            self.plan.clear();
+            self.plan_basis = None;
+        } else {
+            // A bounded batch may leave candidates behind: the next calls
+            // take them from the plan as capacity opens.
+            self.exhausted = false;
+            self.plan_basis = Some(input.decorates);
+        }
+        self.plan.sort_unstable();
+        self.plan.dedup();
+        self.next = 0;
+        batch.extend(
+            self.plan
+                .iter()
+                .take(capacity - input.generating.len())
+                .copied(),
+        );
+        Some(())
     }
 }
 /// What a pool worker keeps for one streamer between its jobs: the
@@ -1153,11 +1213,24 @@ impl<G: ChunkGenerator> Jobs<G> {
                 let view = generator.light_view(&proto);
                 Done::LightView(x, z, proto, view)
             }
-            Job::Free(meshes) => {
-                for (_, mesh) in meshes {
-                    let rejected = shared.meshes.lock().unwrap().put(mesh);
-                    drop(rejected);
+            Job::Free(mut meshes) => {
+                // Clearing large geometry vectors can take long enough to stall
+                // other workers taking recycled meshes. Do it before locking,
+                // then publish the batch under one short pool lock.
+                for (_, mesh) in &mut meshes {
+                    mesh.clear();
                 }
+                let mut rejected = Vec::new();
+                {
+                    let mut pool = shared.meshes.lock().unwrap();
+                    for (_, mesh) in meshes {
+                        if let Some(mesh) = pool.put_cleared(mesh) {
+                            rejected.push(mesh);
+                        }
+                    }
+                }
+                // Dropping oversized/rejected meshes also stays outside the lock.
+                drop(rejected);
                 return None;
             }
             Job::Light(x, z, region, seq, sky) => {
@@ -1271,6 +1344,9 @@ impl Streaming {
             saving: 0,
             viewing: Default::default(),
             decoration_order: DecorationOrder::default(),
+            decoration_ranked_scratch: Vec::new(),
+            decoration_fresh_scratch: Vec::new(),
+            decoration_waiting_scratch: FxHashMap::default(),
             order_area: None,
             queue_basis: Default::default(),
             finishing: Default::default(),
@@ -1291,7 +1367,13 @@ impl Streaming {
             light_scratch: Vec::new(),
             gone_scratch: Vec::new(),
             mesh_candidates_scratch: Vec::new(),
+            mesh_jobs_scratch: Vec::new(),
             mesh_columns_scratch: Vec::new(),
+            unload_columns_scratch: FxHashSet::default(),
+            generation_batch_scratch: Vec::new(),
+            light_positions_scratch: Vec::new(),
+            light_touched_scratch: FxHashSet::default(),
+            light_whole_scratch: FxHashSet::default(),
             sequence: 0,
             center: (0, 0),
             radius: 8,
@@ -2028,7 +2110,9 @@ impl Streaming {
                     self.light_snapshots.remove(key);
                     world.dirty_sections.take_column(key.0, key.1);
                 }
-                let far_set: FxHashSet<(i32, i32)> = far.iter().copied().collect();
+                let mut far_set = std::mem::take(&mut self.unload_columns_scratch);
+                far_set.clear();
+                far_set.extend(far.iter().copied());
                 forget_pending_sections(
                     &mut self.meshing,
                     &mut self.compile_started,
@@ -2036,6 +2120,7 @@ impl Streaming {
                     &far_set,
                     world.layout().sections() as i32,
                 );
+                self.unload_columns_scratch = far_set;
             }
             // Drop far proto chunks that are not checked out.
             if !self.protos.is_empty() {
@@ -2194,6 +2279,8 @@ impl Streaming {
             };
             // Out for the call: ranking reads the streamer's ranges.
             let mut order = std::mem::take(&mut self.decoration_order);
+            let mut ranked = std::mem::take(&mut self.decoration_ranked_scratch);
+            let mut fresh = std::mem::take(&mut self.decoration_fresh_scratch);
             let mut wanted = {
                 let ranges = Ranges {
                     center: self.center,
@@ -2204,8 +2291,10 @@ impl Streaming {
                     forced_cover: self.forced_cover.as_ref().filter(|_| self.cover_current),
                     band: self.band.as_ref(),
                 };
-                decoration_queue(
+                decoration_queue_with_scratch(
                     &mut order,
+                    &mut ranked,
+                    &mut fresh,
                     self.protos
                         .iter()
                         .filter(|&(&(x, z), proto)| {
@@ -2225,17 +2314,18 @@ impl Streaming {
                 // the pass (nothing it reads changes in it but `decorated`, which
                 // updates the entry). Without it, scheduling at render distance 32
                 // took most of the thread that runs it while the world loaded.
-                let waiting: std::cell::RefCell<FxHashMap<(i32, i32), bool>> = Default::default();
+                let mut waiting = std::mem::take(&mut self.decoration_waiting_scratch);
+                waiting.clear();
                 while let Some(std::cmp::Reverse((_, x, z))) = wanted.pop() {
                     if self.decorating >= workers * 2 {
                         break;
                     }
                     if self.decoration_order.blocked(x, z, |nx, nz| {
-                        if let Some(&known) = waiting.borrow().get(&(nx, nz)) {
+                        if let Some(&known) = waiting.get(&(nx, nz)) {
                             return known;
                         }
                         let known = waits_for(self, nx, nz);
-                        waiting.borrow_mut().insert((nx, nz), known);
+                        waiting.insert((nx, nz), known);
                         known
                     }) {
                         continue;
@@ -2253,7 +2343,7 @@ impl Streaming {
                     let has_final = keys.iter().any(|k| world.chunks.contains_key(k));
                     if has_final && !self.saves_beside_final {
                         self.decorated.insert((x, z));
-                        waiting.borrow_mut().insert((x, z), false);
+                        waiting.insert((x, z), false);
                         continue;
                     }
                     if !keys.iter().all(|k| {
@@ -2282,7 +2372,10 @@ impl Streaming {
                         .extend(finals.iter().map(|(i, _)| keys[*i]));
                     self.submit(Some((x, z)), 1, Job::Decorate(x, z, region, finals));
                 }
+                self.decoration_waiting_scratch = waiting;
             }
+            self.decoration_ranked_scratch = wanted.into_vec();
+            self.decoration_fresh_scratch = fresh;
         }
         hz_laps.lap("st_decorate");
         self.schedule_generation(world, workers);
@@ -2426,7 +2519,7 @@ impl Streaming {
         hz_laps.lap("st_candidates");
         if room > 0 && !candidates.is_empty() {
             let settings = self.mesh_settings();
-            let mut queue = self.shared.queue.lock().unwrap();
+            self.mesh_jobs_scratch.clear();
             let submitted = submit_mesh_candidates(
                 world,
                 &mut candidates,
@@ -2436,9 +2529,15 @@ impl Streaming {
                 &mut self.meshing,
                 &mut self.sequence,
                 &mut self.order,
-                &mut queue,
+                &mut self.mesh_jobs_scratch,
             );
-            drop(queue);
+            // Region snapshots and job metadata are now ready. Workers may
+            // keep taking older jobs throughout that preparation; hold the
+            // shared queue lock only while publishing this complete batch.
+            if submitted > 0 {
+                let mut queue = self.shared.queue.lock().unwrap();
+                queue.extend(self.mesh_jobs_scratch.drain(..));
+            }
             candidates.clear();
             if submitted > 1 {
                 self.jobs.notify_all();
@@ -2454,29 +2553,36 @@ impl Streaming {
         (uploads, removed)
     }
     fn schedule_generation(&mut self, world: &World, workers: usize) {
-        let input = GenerationInputs {
-            ranges: Ranges {
-                center: self.center,
-                radius: self.radius,
-                extra: &self.extra,
-                forced: &self.forced,
-                cover: ExtraCover::current(&self.cover, &self.extra, self.cover_current),
-                forced_cover: self.forced_cover.as_ref().filter(|_| self.cover_current),
-                band: self.band.as_ref(),
-            },
-            world,
-            generating: &self.generating,
-            protos: &self.protos,
-            finishing: &self.finishing,
-            decorates: self.decorates,
-            remote: self.remote,
+        let mut wanted = std::mem::take(&mut self.generation_batch_scratch);
+        let has_batch = {
+            let input = GenerationInputs {
+                ranges: Ranges {
+                    center: self.center,
+                    radius: self.radius,
+                    extra: &self.extra,
+                    forced: &self.forced,
+                    cover: ExtraCover::current(&self.cover, &self.extra, self.cover_current),
+                    forced_cover: self.forced_cover.as_ref().filter(|_| self.cover_current),
+                    band: self.band.as_ref(),
+                },
+                world,
+                generating: &self.generating,
+                protos: &self.protos,
+                finishing: &self.finishing,
+                decorates: self.decorates,
+                remote: self.remote,
+            };
+            self.generation_scan
+                .candidates_into(input, workers * 3, &mut wanted)
+                .is_some()
         };
-        if let Some(wanted) = self.generation_scan.candidates(input, workers * 3) {
-            for (_, x, z) in wanted {
+        if has_batch {
+            for &(_, x, z) in &wanted {
                 self.generating.insert((x, z));
                 self.submit(Some((x, z)), 0, Job::Generate(x, z));
             }
         }
+        self.generation_batch_scratch = wanted;
     }
     /// Relight block edits on lit chunks in place (vanilla's incremental light
     /// engine) instead of recomputing the 3x3 chunks around each edit.
@@ -2485,39 +2591,41 @@ impl Streaming {
             return;
         }
         let edits = std::mem::take(&mut world.light_edits);
-        let positions: Vec<(i32, i32, i32)> = edits
-            .iter()
-            .filter(|(_, old, new)| self.light_tables.differs(*old, *new))
-            .map(|(p, _, _)| *p)
-            .collect();
-        if positions.is_empty() {
-            return;
-        }
-        let positions = if positions.len() > INLINE_RELIGHT_MAX {
-            self.relight_on_workers(world, positions)
-        } else {
-            positions
-        };
-        if positions.is_empty() {
-            return;
-        }
-        let mut changed = LightChanges::default();
-        crate::light::relight(
-            &mut world.chunks,
-            &self.light_tables,
-            self.sky_light,
-            &positions,
-            false,
-            &mut changed,
+        let mut positions = std::mem::take(&mut self.light_positions_scratch);
+        positions.clear();
+        positions.extend(
+            edits
+                .iter()
+                .filter(|(_, old, new)| self.light_tables.differs(*old, *new))
+                .map(|(p, _, _)| *p),
         );
-        Self::mark_light_changes(world, &changed);
-        Self::relight_beside_unlit(world, &changed);
-        if !self.light_snapshots.is_empty() {
-            for p in positions {
-                self.light_edit_sequence += 1;
-                self.light_log.push((self.light_edit_sequence, p));
+        if positions.is_empty() {
+            self.light_positions_scratch = positions;
+            return;
+        }
+        if positions.len() > INLINE_RELIGHT_MAX {
+            self.relight_on_workers(world, &mut positions);
+        }
+        if !positions.is_empty() {
+            let mut changed = LightChanges::default();
+            crate::light::relight(
+                &mut world.chunks,
+                &self.light_tables,
+                self.sky_light,
+                &positions,
+                false,
+                &mut changed,
+            );
+            Self::mark_light_changes(world, &changed);
+            Self::relight_beside_unlit(world, &changed);
+            if !self.light_snapshots.is_empty() {
+                for &p in &positions {
+                    self.light_edit_sequence += 1;
+                    self.light_log.push((self.light_edit_sequence, p));
+                }
             }
         }
+        self.light_positions_scratch = positions;
     }
     /// Hands a big batch of edits (a `/fill` arriving block by block) to the
     /// workers: the columns they touch and their neighbours get full light
@@ -2527,28 +2635,31 @@ impl Streaming {
     /// before they are meshed again. Returns the edits left to light in the
     /// frame: those in columns that can't be lit whole yet (the edge of the
     /// loaded area).
-    fn relight_on_workers(
-        &self,
-        world: &mut World,
-        positions: Vec<(i32, i32, i32)>,
-    ) -> Vec<(i32, i32, i32)> {
-        let (columns, inline) = whole_relight_columns(positions, |x, z| {
+    fn relight_on_workers(&mut self, world: &mut World, positions: &mut Vec<(i32, i32, i32)>) {
+        let mut touched = std::mem::take(&mut self.light_touched_scratch);
+        let mut whole = std::mem::take(&mut self.light_whole_scratch);
+        partition_whole_relight_columns(positions, &mut touched, &mut whole, |x, z| {
             self.lit.contains(&(x, z)) && self.light_region_ready(world, x, z)
         });
-        world.dirty_light.extend(columns);
-        inline
+        world.dirty_light.extend(whole.iter().flat_map(|&(x, z)| {
+            (-1..=1).flat_map(move |dz| (-1..=1).map(move |dx| (x + dx, z + dz)))
+        }));
+        self.light_touched_scratch = touched;
+        self.light_whole_scratch = whole;
     }
     /// A light job computed from blocks older than some edits: redo those
     /// edits on top of its result.
     fn replay_light_edits(&mut self, world: &mut World, x: i32, z: i32, snapshot: u64) {
-        let positions: Vec<(i32, i32, i32)> = self
-            .light_log
-            .iter()
-            .filter(|(seq, p)| {
-                *seq > snapshot && ((p.0 >> 4) - x).abs() <= 1 && ((p.2 >> 4) - z).abs() <= 1
-            })
-            .map(|(_, p)| *p)
-            .collect();
+        let mut positions = std::mem::take(&mut self.light_positions_scratch);
+        positions.clear();
+        positions.extend(
+            self.light_log
+                .iter()
+                .filter(|(seq, p)| {
+                    *seq > snapshot && ((p.0 >> 4) - x).abs() <= 1 && ((p.2 >> 4) - z).abs() <= 1
+                })
+                .map(|(_, p)| *p),
+        );
         if !positions.is_empty() {
             let mut changed = LightChanges::default();
             crate::light::relight(
@@ -2562,6 +2673,7 @@ impl Streaming {
             Self::mark_light_changes(world, &changed);
             Self::relight_beside_unlit(world, &changed);
         }
+        self.light_positions_scratch = positions;
         let oldest = self.light_snapshots.values().copied().min();
         match oldest {
             Some(oldest) => self.light_log.retain(|(seq, _)| *seq > oldest),
@@ -3638,26 +3750,43 @@ const INLINE_RELIGHT_MAX: usize = 4096;
 /// edits to relight in place. An edited column is lit whole with its
 /// neighbours (light reaches 15 blocks, never past the next column) when all
 /// nine are `ready` to be lit whole; otherwise its edits stay in place.
-fn whole_relight_columns(
-    positions: Vec<(i32, i32, i32)>,
+fn partition_whole_relight_columns(
+    positions: &mut Vec<(i32, i32, i32)>,
+    touched: &mut FxHashSet<(i32, i32)>,
+    whole: &mut FxHashSet<(i32, i32)>,
     ready: impl Fn(i32, i32) -> bool,
-) -> (FxHashSet<(i32, i32)>, Vec<(i32, i32, i32)>) {
+) {
     let around =
         |(x, z): (i32, i32)| (-1..=1).flat_map(move |dz| (-1..=1).map(move |dx| (x + dx, z + dz)));
-    let touched: FxHashSet<(i32, i32)> = positions
+    touched.clear();
+    touched.extend(positions.iter().map(|&(x, _, z)| (x >> 4, z >> 4)));
+    whole.clear();
+    whole.extend(
+        touched
+            .iter()
+            .copied()
+            .filter(|&column| around(column).all(|(x, z)| ready(x, z))),
+    );
+    positions.retain(|&(x, _, z)| !whole.contains(&(x >> 4, z >> 4)));
+}
+fn whole_relight_columns_in_place(
+    positions: &mut Vec<(i32, i32, i32)>,
+    ready: impl Fn(i32, i32) -> bool,
+) -> FxHashSet<(i32, i32)> {
+    let mut touched = FxHashSet::default();
+    let mut whole = FxHashSet::default();
+    partition_whole_relight_columns(positions, &mut touched, &mut whole, ready);
+    whole
         .iter()
-        .map(|&(x, _, z)| (x >> 4, z >> 4))
-        .collect();
-    let whole: FxHashSet<(i32, i32)> = touched
-        .into_iter()
-        .filter(|&column| around(column).all(|(x, z)| ready(x, z)))
-        .collect();
-    let columns = whole.iter().flat_map(|&column| around(column)).collect();
-    let inline = positions
-        .into_iter()
-        .filter(|&(x, _, z)| !whole.contains(&(x >> 4, z >> 4)))
-        .collect();
-    (columns, inline)
+        .flat_map(|&(x, z)| (-1..=1).flat_map(move |dz| (-1..=1).map(move |dx| (x + dx, z + dz))))
+        .collect()
+}
+fn whole_relight_columns(
+    mut positions: Vec<(i32, i32, i32)>,
+    ready: impl Fn(i32, i32) -> bool,
+) -> (FxHashSet<(i32, i32)>, Vec<(i32, i32, i32)>) {
+    let columns = whole_relight_columns_in_place(&mut positions, ready);
+    (columns, positions)
 }
 
 /// Drops the pending sections (`meshing`, `compile_started`, `waiting`) of
@@ -3725,7 +3854,7 @@ fn submit_mesh_candidates(
     meshing: &mut FxHashMap<(i32, i32, i32), u64>,
     sequence: &mut u64,
     order: &mut u64,
-    queue: &mut BinaryHeap<Queued>,
+    pending: &mut Vec<Queued>,
 ) -> usize {
     if room == 0 || candidates.is_empty() {
         return 0;
@@ -3764,7 +3893,7 @@ fn submit_mesh_candidates(
             *sequence += 1;
             *order += 1;
             meshing.insert((x, sy, z), *sequence);
-            queue.push(Queued {
+            pending.push(Queued {
                 priority,
                 at: Some((x, z)),
                 bias,
@@ -4034,6 +4163,50 @@ mod tests {
                 .collect();
             assert_eq!(popped, full_sort(&mut full, &wanted), "round {round}");
             assert_eq!(fast.ordered(), full.ordered(), "round {round}");
+        }
+    }
+
+    #[test]
+    fn decoration_queue_reuses_rank_and_fresh_buffers() {
+        let distance = |x: i32, z: i32| {
+            let (x, z) = (i64::from(x), i64::from(z));
+            x * x + z * z
+        };
+        let mut order = DecorationOrder::default();
+        order.reassign((0, 0), 6, |x, z| (x + z).rem_euclid(5) == 0);
+        let wanted: Vec<_> = (-8i32..=8)
+            .flat_map(|x| (-8i32..=8).map(move |z| (x, z)))
+            .filter(|&(x, z)| (x * 7 + z).rem_euclid(3) != 0)
+            .collect();
+        let mut ranked = Vec::new();
+        let mut fresh = Vec::new();
+        let mut expected = None;
+        let mut capacities = None;
+
+        for round in 0..3 {
+            let mut queue = decoration_queue_with_scratch(
+                &mut order,
+                &mut ranked,
+                &mut fresh,
+                wanted.iter().copied(),
+                distance,
+            );
+            let popped: Vec<_> = std::iter::from_fn(|| queue.pop())
+                .map(|std::cmp::Reverse((_, x, z))| (x, z))
+                .collect();
+            if let Some(expected) = &expected {
+                assert_eq!(&popped, expected, "round {round}");
+            } else {
+                expected = Some(popped.clone());
+            }
+            ranked = queue.into_vec();
+            let now = (ranked.capacity(), fresh.capacity());
+            if let Some(capacities) = capacities {
+                assert_eq!(now, capacities, "round {round} must reuse both allocations");
+            } else {
+                assert!(now.0 > 0 && now.1 > 0);
+                capacities = Some(now);
+            }
         }
     }
 
@@ -4494,6 +4667,7 @@ mod tests {
         let mut sequence = 0u64;
         let mut order = 0u64;
         let mut queue = BinaryHeap::new();
+        let mut pending = Vec::new();
 
         let drain_sections = |queue: &mut BinaryHeap<Queued>| -> Vec<(i32, i32, i32)> {
             let mut out = Vec::new();
@@ -4520,8 +4694,9 @@ mod tests {
             &mut meshing,
             &mut sequence,
             &mut order,
-            &mut queue,
+            &mut pending,
         );
+        queue.extend(pending.drain(..));
         assert_eq!(submitted, 3);
         let first_batch = drain_sections(&mut queue);
         assert_eq!(first_batch, vec![(0, 7, 0), (0, 6, 0), (0, 8, 0)]);
@@ -4552,8 +4727,9 @@ mod tests {
             &mut meshing,
             &mut sequence,
             &mut order,
-            &mut queue,
+            &mut pending,
         );
+        queue.extend(pending.drain(..));
         assert_eq!(submitted, 22);
         let second_batch = drain_sections(&mut queue);
         assert!(meshed.contains(&(0, 0)));
@@ -4579,8 +4755,9 @@ mod tests {
             &mut meshing,
             &mut sequence,
             &mut order,
-            &mut queue,
+            &mut pending,
         );
+        queue.extend(pending.drain(..));
         assert_eq!(submitted, 3);
         let third_batch = drain_sections(&mut queue);
         assert!(meshed.contains(&(1, 0)));
@@ -4634,6 +4811,37 @@ mod tests {
     /// Edits in two neighbouring columns light those and the ten around
     /// them again; a column next to one that can't be lit whole keeps its
     /// edits in the frame.
+    #[test]
+    fn whole_relight_in_place_keeps_the_inline_edit_buffer() {
+        let mut positions = vec![(3, 70, 4), (15, 64, 15), (16, 80, 0), (31, 64, 9)];
+        let capacity = positions.capacity();
+        let columns = whole_relight_columns_in_place(&mut positions, |x, z| (x, z) != (2, 1));
+        assert_eq!(positions, vec![(16, 80, 0), (31, 64, 9)]);
+        assert_eq!(positions.capacity(), capacity);
+        assert_eq!(columns.len(), 9);
+        assert!(columns.contains(&(-1, -1)) && columns.contains(&(1, 1)));
+    }
+
+    #[test]
+    fn whole_relight_partition_reuses_column_sets() {
+        let mut positions = vec![(3, 70, 4), (15, 64, 15), (16, 80, 0), (31, 64, 9)];
+        let mut touched = FxHashSet::default();
+        let mut whole = FxHashSet::default();
+        partition_whole_relight_columns(&mut positions, &mut touched, &mut whole, |x, z| {
+            (x, z) != (2, 1)
+        });
+        let capacities = (touched.capacity(), whole.capacity());
+        assert_eq!(positions, vec![(16, 80, 0), (31, 64, 9)]);
+        assert!(capacities.0 > 0 && capacities.1 > 0);
+
+        positions = vec![(3, 70, 4), (15, 64, 15), (16, 80, 0), (31, 64, 9)];
+        partition_whole_relight_columns(&mut positions, &mut touched, &mut whole, |x, z| {
+            (x, z) != (2, 1)
+        });
+        assert_eq!(positions, vec![(16, 80, 0), (31, 64, 9)]);
+        assert_eq!((touched.capacity(), whole.capacity()), capacities);
+    }
+
     #[test]
     fn whole_relights_cover_the_edited_columns_and_their_neighbours() {
         // Blocks in columns (0, 0) and (1, 0).
@@ -4941,6 +5149,48 @@ mod tests {
             let result = gate.candidates(self.input(), capacity);
             assert_eq!(result.as_deref().unwrap_or(&[]), expected);
             result.is_some()
+        }
+    }
+
+    #[test]
+    fn generation_batch_and_full_scan_buffers_reuse_capacity_in_order() {
+        for decorates in [false, true] {
+            let mut fixture = GenerationFixture::new(2, decorates);
+            let mut gate = GenerationScan::default();
+            let mut batch = Vec::with_capacity(3);
+
+            let expected = baseline_candidates(fixture.input(), 3);
+            assert_eq!(expected.len(), 3);
+            assert!(
+                gate.candidates_into(fixture.input(), 3, &mut batch)
+                    .is_some()
+            );
+            assert_eq!(batch, expected);
+            let capacities = (
+                batch.capacity(),
+                gate.plan.capacity(),
+                gate.scan_runs.capacity(),
+            );
+            assert!(capacities.1 > 0 && capacities.2 > 0);
+
+            // A changed view forces another full scan, but each scratch
+            // allocation is retained and the exact same ordering is produced.
+            fixture.center = (1, -1);
+            batch.clear();
+            let expected = baseline_candidates(fixture.input(), 3);
+            assert!(
+                gate.candidates_into(fixture.input(), 3, &mut batch)
+                    .is_some()
+            );
+            assert_eq!(batch, expected);
+            assert_eq!(
+                (
+                    batch.capacity(),
+                    gate.plan.capacity(),
+                    gate.scan_runs.capacity()
+                ),
+                capacities
+            );
         }
     }
 

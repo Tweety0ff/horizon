@@ -266,7 +266,16 @@ impl QueuedWriter {
         if !self.alive.load(Ordering::Acquire) {
             return Err(Error::new("client writer disconnected"));
         }
-        let owned = body.to_vec();
+        self.enqueue_packet(body.to_vec())
+    }
+    /// Queue an owned packet without cloning its encoded body.
+    pub(crate) fn send_owned(&self, body: Vec<u8>) -> Result<()> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Err(Error::new("client writer disconnected"));
+        }
+        self.enqueue_packet(body)
+    }
+    fn enqueue_packet(&self, owned: Vec<u8>) -> Result<()> {
         let capacity = owned.capacity();
         let sender = self.sender.lock().unwrap();
         let Some(sender) = sender.as_ref() else {

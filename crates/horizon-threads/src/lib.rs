@@ -174,30 +174,34 @@ mod par_chunks_tests {
 
 /// The chunk worker pool's automatic size (`jobs::default_threads`, Graphics > Worker
 /// threads on Auto): every core but one, as vanilla's `Util.maxAllowedExecutorThreads`,
-/// counting on Apple silicon only its performance cores. Its efficiency cores are slower,
+/// counting only performance cores on Apple silicon, hybrid Linux and Windows CPUs where detected.
+/// Its efficiency cores are slower,
 /// and workers there kept the render and server threads waiting for a performance core: on
 /// a base M4 (4 performance and 6 efficiency cores) a fast flight's p99 frame went from
 /// 20 ms with 9 workers to 7 ms with 3 (#11294).
 pub fn default_workers() -> usize {
-    workers_for(worker_count(), performance_cores)
+    usable_cores().saturating_sub(1).max(1)
 }
 
-/// The cores this process has for its pools: [`worker_count`]'s share, narrowed to
-/// the performance cores where the machine tells them apart (its efficiency cores
-/// don't carry a worker, see [`default_workers`]).
-pub(crate) fn usable_cores() -> usize {
-    usable_cores_for(worker_count(), performance_cores)
+/// The cores this process has for its foreground CPU-bound pools: [`worker_count`]'s
+/// share, narrowed to the performance cores where the machine tells them apart (its
+/// efficiency cores don't carry foreground workers). Detection is cached: Linux reads the
+/// process's CPU affinity and sysfs frequencies; Windows reads CPU-set efficiency classes.
+
+pub fn usable_cores() -> usize {
+    static USABLE: OnceLock<usize> = OnceLock::new();
+    *USABLE.get_or_init(|| usable_cores_for(worker_count(), performance_cores))
 }
 
-/// [`usable_cores`] for `cores` cores, of which `performance` (asked only here, the
-/// sysctl) are performance cores where the machine tells them apart (`None` elsewhere).
+/// [`usable_cores`] for `cores` cores, of which `performance` (asked only here by the
+/// platform probe) are performance cores where the machine tells them apart (`None` elsewhere).
 fn usable_cores_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usize {
     let fast = performance().filter(|&n| n > 0).unwrap_or(cores);
     cores.min(fast)
 }
 
-/// [`default_workers`] for `cores` cores, of which `performance` (asked only here, the
-/// sysctl) are performance cores where the machine tells them apart (`None` elsewhere):
+/// [`default_workers`] for `cores` cores, of which `performance` (asked only here by the
+/// platform probe) are performance cores where the machine tells them apart (`None` elsewhere):
 /// one less than the smaller count, at least 1.
 fn workers_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usize {
     usable_cores_for(cores, performance)
@@ -205,10 +209,7 @@ fn workers_for(cores: usize, performance: impl FnOnce() -> Option<usize>) -> usi
         .max(1)
 }
 
-/// The machine's performance cores:
-/// - on Apple silicon via `hw.perflevel0.physicalcpu`
-/// - on Linux by comparing max frequencies in `/sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq`
-///   (Intel Alder Lake, Raptor Lake, Meteor Lake, big.LITTLE ARM)
+/// The Apple Silicon performance cores, via `hw.perflevel0.physicalcpu`.
 #[cfg(target_vendor = "apple")]
 fn performance_cores() -> Option<usize> {
     let mut count: libc::c_int = 0;
@@ -226,44 +227,19 @@ fn performance_cores() -> Option<usize> {
     (read == 0 && count > 0).then_some(count as usize)
 }
 
+/// Linux performance cores among the CPUs allowed to this process, using sysfs frequencies.
 #[cfg(target_os = "linux")]
 fn performance_cores() -> Option<usize> {
-    // Read max frequencies across CPUs from sysfs
-    let mut max_freq = 0u64;
-    let mut freqs = Vec::new();
-    let mut cpu_idx = 0;
-    loop {
-        let path = format!("/sys/devices/system/cpu/cpu{cpu_idx}/cpufreq/cpuinfo_max_freq");
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                if let Ok(freq) = content.trim().parse::<u64>() {
-                    max_freq = max_freq.max(freq);
-                    freqs.push(freq);
-                }
-                cpu_idx += 1;
-            }
-            Err(_) => break,
-        }
-    }
-
-    if freqs.is_empty() {
-        return None;
-    }
-
-    // Check if there is frequency disparity indicating asymmetric cores (hybrid architecture)
-    let min_freq = *freqs.iter().min()?;
-    if min_freq < max_freq {
-        // Count performance cores (within 5% of max frequency)
-        let threshold = max_freq.saturating_sub(max_freq / 20);
-        let p_threads = freqs.iter().filter(|&&f| f >= threshold).count();
-        if p_threads > 0 && p_threads < freqs.len() {
-            return Some(p_threads);
-        }
-    }
-    None
+    server_core::performance_cores()
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+/// Windows performance cores, using CPU-set efficiency classes.
+#[cfg(windows)]
+fn performance_cores() -> Option<usize> {
+    server_core::performance_cores()
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", windows)))]
 fn performance_cores() -> Option<usize> {
     None
 }

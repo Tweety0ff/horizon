@@ -1209,7 +1209,7 @@ or posted; `.local/` remains untracked; all tagged numbers are either
   core relationship of the default runs. SMT accounts for the ~x1.3 on noise/
   surface at 8 threads (12 SMT threads on 6 physical cores), and for zero of
   the structures excess.
-- **[VERIFIED]** The stage timer (`StageTimings`, `generator.rs:2355, //` 
+- **[VERIFIED]** The stage timer (`StageTimings`, `generator.rs:2355, //`
   `structures`) is wall-clock (`lap(&mut clock)` with `Instant::now()`,
   `generator.rs:2341`), so wait time lands in it. The measured signature —
   per-chunk wall inflation with flat process CPU — is the classic

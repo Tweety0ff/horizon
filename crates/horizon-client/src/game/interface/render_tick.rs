@@ -926,7 +926,7 @@ impl Game<'_> {
         self.tick_pickups();
         laps.lap("tp_pickups");
         let camera = self.particles.camera;
-        for (name, at, volume, pitch, delayed) in std::mem::take(&mut self.particles.sounds) {
+        for (name, at, volume, pitch, delayed) in self.particles.sounds.drain(..) {
             if delayed {
                 self.audio
                     .play_distance_delayed(name, at, volume, pitch, camera);

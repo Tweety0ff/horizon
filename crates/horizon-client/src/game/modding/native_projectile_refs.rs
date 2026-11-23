@@ -26,14 +26,20 @@ enum Backing {
 impl Game<'_> {
     fn native_projectile_backing(&self, projectile: ProjectileRef) -> Option<Backing> {
         match self.native_entity_target(projectile.entity())? {
-            Target::Projectile(id) => (self.creatures.projectiles.iter())
-                .position(|p| p.id == id)
+            Target::Projectile(id) => self
+                .entity_indices
+                .projectiles
+                .find(&self.creatures.projectiles, id, |p| p.id)
                 .map(Backing::List),
-            Target::Trident(id) => (self.tridents.iter())
-                .position(|t| t.id == id)
+            Target::Trident(id) => self
+                .entity_indices
+                .tridents
+                .find(&self.tridents, id, |t| t.id)
                 .map(Backing::Trident),
-            Target::Rocket(id) => (self.rockets.iter())
-                .position(|r| r.id == id)
+            Target::Rocket(id) => self
+                .entity_indices
+                .rockets
+                .find(&self.rockets, id, |r| r.id)
                 .map(Backing::Rocket),
             _ => None,
         }

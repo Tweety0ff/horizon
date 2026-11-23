@@ -1176,19 +1176,21 @@ fn islands_why(
             sets.join(first, i as u32);
         }
     }
-    // Islands, in the order of their first mob; their ticking mobs are their weight.
-    let mut islands: Vec<(usize, Vec<usize>)> = Vec::new();
+    // Islands, in the order of their first mob. Every resident contributes a
+    // small scheduling/snapshot cost; a ticking mob contributes four units.
+    let mut islands: Vec<(usize, usize, Vec<usize>)> = Vec::new();
     let mut slot = FxHashMap::<u32, usize>::default();
     for (i, r) in reaches.iter().enumerate() {
         let root = sets.find(i as u32);
         let k = *slot.entry(root).or_insert_with(|| {
-            islands.push((0, Vec::new()));
+            islands.push((0, 0, Vec::new()));
             islands.len() - 1
         });
-        islands[k].1.push(i);
-        islands[k].0 += usize::from(r.ticking);
+        islands[k].2.push(i);
+        islands[k].0 += 1 + 3 * usize::from(r.ticking);
+        islands[k].1 += usize::from(r.ticking);
     }
-    let largest = islands.iter().map(|i| i.0).max().unwrap_or(0);
+    let largest = islands.iter().map(|i| i.1).max().unwrap_or(0);
     (census.islands, census.largest) = (islands.len(), largest);
     if largest * 4 > ticking * 3 {
         return Err(Verdict::OneIsland);
@@ -1196,7 +1198,7 @@ fn islands_why(
     // Heaviest first (stable: ties keep the list's order), each to the lightest group.
     islands.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut groups: Vec<(usize, Vec<usize>)> = vec![(0, Vec::new()); lanes];
-    for (weight, members) in islands {
+    for (weight, _, members) in islands {
         let g = groups
             .iter_mut()
             .min_by_key(|g| g.0)
@@ -2503,5 +2505,28 @@ mod tests {
         let of = group_of(&plan, list.len());
         assert_ne!(of[0], of[200]);
         assert_eq!(of[200], of[300], "both small herds fill the lighter group");
+    }
+
+    /// Non-ticking residents still cost work to publish and group, so they
+    /// participate in the estimated load even though the largest-island
+    /// serial fallback continues to count only mobs that tick.
+    #[test]
+    fn island_packing_accounts_for_resident_snapshot_cost() {
+        let mut a = herd(0, 520, 0.0, 0.0);
+        for reach in a.iter_mut().skip(1) {
+            reach.ticking = false;
+        }
+        let b = herd(1000, 130, 1000.0, 0.0);
+        let c = herd(2000, 90, 2000.0, 0.0);
+        let d = herd(3000, 90, 3000.0, 0.0);
+        let list: Vec<_> = a.into_iter().chain(b).chain(c).chain(d).collect();
+        let plan = islands(&list, 2).expect("two groups");
+        let of = group_of(&plan, list.len());
+
+        // With snapshot cost included: A+D and B+C. A tick-count-only
+        // estimate would instead put A+B together and C+D together.
+        assert_eq!(of[0], of[740], "A and D share one group");
+        assert_eq!(of[520], of[650], "B and C share the other group");
+        assert_ne!(of[0], of[520]);
     }
 }

@@ -978,13 +978,13 @@ impl Hub {
         );
     }
     fn broadcast_to<'g>(&self, packet: &C, guests: impl IntoIterator<Item = &'g Guest>) {
-        let mut body = None;
+        let mut body: Option<super::Body> = None;
         for g in guests {
             if let C::RemoveEntities(p) = packet {
                 self.send_ordered_removal(g, &p.ids);
             } else {
-                g.sender
-                    .send(body.get_or_insert_with(|| packet.encode()).clone());
+                let body = body.get_or_insert_with(|| super::Body::shared(packet.encode()));
+                g.sender.send_many([body.clone()]);
             }
         }
     }
@@ -1124,29 +1124,30 @@ impl Hub {
     }
     /// `PlayerList.broadcastAll(packet, dimension)`: the players in the level in place.
     pub fn broadcast_level(&self, packet: &C) {
-        let mut body = None;
+        let mut body: Option<super::Body> = None;
         for g in self.guests.simulation_iter().filter(|g| self.watches(g)) {
-            g.sender
-                .send(body.get_or_insert_with(|| packet.encode()).clone());
+            let body = body.get_or_insert_with(|| super::Body::shared(packet.encode()));
+            g.sender.send_many([body.clone()]);
         }
     }
     /// `DedicatedServer.sendLowDiskSpaceWarning`: the players with
     /// `PermissionLevel.ADMINS` (3) or more get `ClientboundLowDiskSpaceWarningPacket`.
     pub fn send_low_disk_space_warning(&self) {
-        let body = C::LowDiskSpaceWarning(horizon_protocol::packets::Empty).encode();
+        let body =
+            super::Body::shared(C::LowDiskSpaceWarning(horizon_protocol::packets::Empty).encode());
         for g in self.guests.iter().filter(|g| g.placed && g.permission >= 3) {
-            g.sender.send(body.clone());
+            g.sender.send_many([body.clone()]);
         }
     }
     pub fn broadcast_except(&self, conn: u32, packet: &C) {
-        let mut body = None;
+        let mut body: Option<super::Body> = None;
         for g in self
             .guests
             .simulation_iter()
             .filter(|g| g.placed && g.conn != conn && g.participates_online())
         {
-            g.sender
-                .send(body.get_or_insert_with(|| packet.encode()).clone());
+            let body = body.get_or_insert_with(|| super::Body::shared(packet.encode()));
+            g.sender.send_many([body.clone()]);
         }
     }
     /// PlayerList.broadcastSystemMessage.
@@ -1165,17 +1166,19 @@ impl Hub {
     /// `ServerPlayer.sendSystemMessage(Component, false)` to the placed guests `to` picks: not to one whose
     /// chat is hidden (`acceptsSystemMessages`: HIDDEN, 2, takes only an overlay).
     fn send_system(&self, content: Tag, to: impl Fn(&Guest) -> bool) {
-        let body = C::SystemChat(play::SystemChat {
-            content,
-            overlay: false,
-        })
-        .encode();
+        let body = super::Body::shared(
+            C::SystemChat(play::SystemChat {
+                content,
+                overlay: false,
+            })
+            .encode(),
+        );
         for g in self
             .guests
             .iter()
             .filter(|g| g.placed && g.info.chat_visibility != 2 && to(g))
         {
-            g.sender.send(body.clone());
+            g.sender.send_many([body.clone()]);
         }
     }
     /// `ServerPlayer.sendOverlayMessage` to every guest (the action bar).
@@ -1646,18 +1649,20 @@ impl Hub {
         // a native mod hides it from). A held player is not announced, and
         // not placed.
         if !held {
-            let joined = C::SystemChat(play::SystemChat {
-                content: self.joined_line(uuid, &name),
-                overlay: false,
-            })
-            .encode();
+            let joined = super::Body::shared(
+                C::SystemChat(play::SystemChat {
+                    content: self.joined_line(uuid, &name),
+                    overlay: false,
+                })
+                .encode(),
+            );
             for g in self
                 .guests
                 .iter()
                 .filter(|g| g.placed && g.conn != conn && g.participates_online())
             {
                 if self.sees(g.permission, uuid) {
-                    g.sender.send(joined.clone());
+                    g.sender.send_many([joined.clone()]);
                 }
             }
             {
@@ -1695,14 +1700,16 @@ impl Hub {
         }
         self.guests.update(i, |g| g.tab_hidden.extend(hidden));
         self.send_player_list(i, entries);
-        let newcomer = C::PlayerInfoUpdate(play::PlayerInfoUpdate {
-            actions: Self::INFO_ACTIONS,
-            entries: vec![self.player_info(uuid, &name, mode, 0)],
-        })
-        .encode();
+        let newcomer = super::Body::shared(
+            C::PlayerInfoUpdate(play::PlayerInfoUpdate {
+                actions: Self::INFO_ACTIONS,
+                entries: vec![self.player_info(uuid, &name, mode, 0)],
+            })
+            .encode(),
+        );
         if held {
             // Its own list has itself in it; the others' lists do not.
-            self.guests[i].sender.send(newcomer);
+            self.guests[i].sender.send_many([newcomer]);
         } else {
             let level = self.hidden.get(&uuid).copied();
             // A held player is shown the entities around it, so it must know the players
@@ -1713,7 +1720,7 @@ impl Hub {
                     if level.is_some_and(|l| g.permission < l) {
                         g.tab_hidden.insert(uuid);
                     } else {
-                        g.sender.send(newcomer.clone());
+                        g.sender.send_many([newcomer.clone()]);
                     }
                 }
             });
@@ -1829,18 +1836,20 @@ impl Hub {
             (g.name.clone(), g.uuid, g.game_mode, g.conn)
         };
         if announce {
-            let joined = C::SystemChat(play::SystemChat {
-                content: self.joined_line(uuid, &name),
-                overlay: false,
-            })
-            .encode();
+            let joined = super::Body::shared(
+                C::SystemChat(play::SystemChat {
+                    content: self.joined_line(uuid, &name),
+                    overlay: false,
+                })
+                .encode(),
+            );
             for g in self
                 .guests
                 .iter()
                 .filter(|g| g.placed && g.participates_online() && g.conn != conn)
             {
                 if self.sees(g.permission, uuid) {
-                    g.sender.send(joined.clone());
+                    g.sender.send_many([joined.clone()]);
                 }
             }
         }
@@ -1853,18 +1862,20 @@ impl Hub {
             g.last_reported = (g.position, [g.yaw, g.pitch]);
         });
         // The player list entry of the newcomer, to everyone placed or held (itself included).
-        let newcomer = C::PlayerInfoUpdate(play::PlayerInfoUpdate {
-            actions: Self::INFO_ACTIONS,
-            entries: vec![self.player_info(uuid, &name, mode, 0)],
-        })
-        .encode();
+        let newcomer = super::Body::shared(
+            C::PlayerInfoUpdate(play::PlayerInfoUpdate {
+                actions: Self::INFO_ACTIONS,
+                entries: vec![self.player_info(uuid, &name, mode, 0)],
+            })
+            .encode(),
+        );
         let level = self.hidden.get(&uuid).copied();
         self.guests.update_all(|g| {
             if g.participates_online() && (g.placed || g.held) {
                 if level.is_some_and(|l| g.permission < l) {
                     g.tab_hidden.insert(uuid);
                 } else {
-                    g.sender.send(newcomer.clone());
+                    g.sender.send_many([newcomer.clone()]);
                 }
             }
         });
@@ -2736,17 +2747,19 @@ impl Hub {
         self.broadcast_watching(&C::RemoveEntities(play::RemoveEntities {
             ids: vec![g.entity_id],
         }));
-        let left = C::SystemChat(play::SystemChat {
-            content: yellow_names(
-                "multiplayer.player.left",
-                vec![self.player_display_name(g.uuid, &g.name)],
-            ),
-            overlay: false,
-        })
-        .encode();
+        let left = super::Body::shared(
+            C::SystemChat(play::SystemChat {
+                content: yellow_names(
+                    "multiplayer.player.left",
+                    vec![self.player_display_name(g.uuid, &g.name)],
+                ),
+                overlay: false,
+            })
+            .encode(),
+        );
         self.guests.update_all(|o| {
             if o.placed && !o.tab_hidden.remove(&g.uuid) && !g.quiet_leave {
-                o.sender.send(left.clone());
+                o.sender.send_many([left.clone()]);
             }
         });
         g

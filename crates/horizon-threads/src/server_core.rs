@@ -122,6 +122,46 @@ fn whole_count(plan: &Plan) -> usize {
         .len()
 }
 
+#[cfg(any(target_os = "linux", windows, test))]
+fn fastest_allowed_cpu_count(cores: &[Core], allowed: &[usize], tolerance: u64) -> Option<usize> {
+    let allowed: BTreeSet<usize> = allowed.iter().copied().collect();
+    let fastest_rank = cores
+        .iter()
+        .filter(|core| core.cpus.iter().any(|cpu| allowed.contains(cpu)))
+        .map(|core| core.rank)
+        .max()?;
+    let threshold = fastest_rank.saturating_sub(tolerance);
+    let fastest = cores
+        .iter()
+        .filter(|core| core.rank >= threshold)
+        .flat_map(|core| core.cpus.iter())
+        .filter(|cpu| allowed.contains(cpu))
+        .count();
+    (fastest > 0 && fastest < allowed.len()).then_some(fastest)
+}
+
+/// The process's performance-core logical CPUs on Linux. The topology probe uses
+/// `Cpus_allowed_list`, so containers and explicit affinity cannot count unavailable
+/// performance cores. A 5% frequency band keeps preferred cores in the same fast class.
+#[cfg(target_os = "linux")]
+pub(crate) fn performance_cores() -> Option<usize> {
+    let (cores, allowed) = os::topology()?;
+    let fastest_rank = cores
+        .iter()
+        .filter(|core| core.cpus.iter().any(|cpu| allowed.contains(cpu)))
+        .map(|core| core.rank)
+        .max()?;
+    fastest_allowed_cpu_count(&cores, &allowed, fastest_rank / 20)
+}
+
+/// The process's performance-core logical CPUs on Windows, from the CPU-set
+/// efficiency classes that also guide server-core reservation.
+#[cfg(windows)]
+pub(crate) fn performance_cores() -> Option<usize> {
+    let (cores, allowed) = os::topology()?;
+    fastest_allowed_cpu_count(&cores, &allowed, 0)
+}
+
 struct WorkerState {
     generation: u64,
     previous: Option<os::State>,
@@ -178,8 +218,10 @@ pub fn take() -> Option<ServerCore> {
     }
     let (cores, allowed) = os::topology()?;
     let plan = plan(&cores, &allowed)?;
-    // A lazily initialized pool must not size itself from the server's temporary pin.
+    // Lazily initialized worker budgets must use the process affinity before this thread
+    // is pinned to the server core, not the server thread's temporary two-CPU mask.
     let _ = crate::worker_count();
+    let _ = crate::usable_cores();
     let core = begin(plan)?;
     *active = Some(core.plan.clone());
     GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -908,6 +950,53 @@ mod tests {
         let mut cpus: Vec<usize> = cores.iter().flat_map(|c| c.cpus.clone()).collect();
         cpus.sort_unstable();
         cpus
+    }
+
+    #[test]
+    fn fastest_allowed_cpu_count_uses_efficiency_class_and_affinity() {
+        let cores = [
+            Core {
+                cpus: vec![0, 1],
+                rank: 5,
+            },
+            Core {
+                cpus: vec![2, 3],
+                rank: 5,
+            },
+            Core {
+                cpus: vec![4],
+                rank: 2,
+            },
+            Core {
+                cpus: vec![5],
+                rank: 2,
+            },
+        ];
+        assert_eq!(
+            fastest_allowed_cpu_count(&cores, &[0, 1, 2, 3, 4, 5], 0),
+            Some(4)
+        );
+        assert_eq!(fastest_allowed_cpu_count(&cores, &[1, 2, 4, 5], 0), Some(2));
+        assert_eq!(fastest_allowed_cpu_count(&cores, &[0, 1], 0), None);
+        assert_eq!(fastest_allowed_cpu_count(&[], &[0, 1], 0), None);
+        let close = [
+            Core {
+                cpus: vec![0, 1],
+                rank: 5_000,
+            },
+            Core {
+                cpus: vec![2, 3],
+                rank: 4_800,
+            },
+            Core {
+                cpus: vec![4, 5],
+                rank: 3_500,
+            },
+        ];
+        assert_eq!(
+            fastest_allowed_cpu_count(&close, &[0, 1, 2, 3, 4, 5], 250),
+            Some(4)
+        );
     }
 
     #[test]

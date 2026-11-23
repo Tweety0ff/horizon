@@ -1120,6 +1120,8 @@ pub struct ParticleEngine {
     pending: Vec<PendingParticle>,
     /// Particle spawns deferred until all live particles have ticked.
     spawned_in_tick: Option<Vec<(ParticleOptions, [f64; 3], [f64; 3])>>,
+    /// Reused storage for the deferred-spawn pass between particle ticks.
+    spawned_scratch: Vec<(ParticleOptions, [f64; 3], [f64; 3])>,
     /// `ParticleEngine.random`, handed to every `ParticleProvider`.
     random: LegacyRandom,
     /// `ClientLevel.random` as particle constructors use it (`level.getRandom()`).
@@ -1152,6 +1154,8 @@ pub struct ParticleEngine {
     /// How many live particles it takes to tick them on several threads (`tick_all`), and how many threads.
     parallel_min: usize,
     parallel_threads: usize,
+    /// Scratch results for independent particle ticks; kept across frames.
+    simple_handled: Vec<simple::Simple>,
     /// Resource packs' Polytone custom particle types (#11486).
     polytone: Option<std::sync::Arc<polytone::Registry>>,
     /// Vanilla particle types a pack replaces with a custom one of the same id
@@ -1363,6 +1367,7 @@ impl ParticleEngine {
             group_defs: groups::registered(),
             pending: Vec::new(),
             spawned_in_tick: None,
+            spawned_scratch: Vec::new(),
             random: LegacyRandom::new(0x7061_7274),
             level_random: LegacyRandom::new(0x6c65_7665),
             spell_random: LegacyRandom::new(0x7370_656c),
@@ -1380,6 +1385,7 @@ impl ParticleEngine {
             parallel_min: PARALLEL_MIN,
             live_limit: None,
             parallel_threads: parallel_threads(),
+            simple_handled: Vec::new(),
             polytone: None,
             polytone_overrides: FxHashMap::default(),
             polytone_gpu: Vec::new(),
@@ -3745,7 +3751,7 @@ impl ParticleEngine {
         }
         let has_live_groups = self.groups.iter().any(|g| !g.particles.is_empty());
         if !self.particles.is_empty() || has_live_groups {
-            self.spawned_in_tick = Some(Vec::new());
+            self.spawned_in_tick = Some(std::mem::take(&mut self.spawned_scratch));
             if !self.particles.is_empty() {
                 let mut particles = std::mem::take(&mut self.particles);
                 self.tick_all(&mut particles, level);
@@ -3765,10 +3771,11 @@ impl ParticleEngine {
                     self.groups[handle].particles = particles;
                 }
             }
-            if let Some(spawned) = self.spawned_in_tick.take() {
-                for (options, pos, velocity) in spawned {
+            if let Some(mut spawned) = self.spawned_in_tick.take() {
+                for (options, pos, velocity) in spawned.drain(..) {
                     self.add(&options, pos, velocity);
                 }
+                self.spawned_scratch = spawned;
             }
         }
         if !self.pending.is_empty() {

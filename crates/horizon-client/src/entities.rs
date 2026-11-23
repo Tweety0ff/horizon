@@ -76,10 +76,8 @@ fn slime_at(world: &World, facts: &BlockFacts, position: BlockPos) -> bool {
         .get(world.block(position.x, position.y, position.z))
         .name;
     let moving_moved = world
-        .moving_pistons
-        .iter()
-        .find(|(pos, _)| *pos == [position.x, position.y, position.z])
-        .map(|(_, piston)| &*facts.get(piston.moved_state).name);
+        .moving_piston_at([position.x, position.y, position.z])
+        .map(|piston| &*facts.get(piston.moved_state).name);
     slime_support_name(block, moving_moved)
 }
 
@@ -94,7 +92,8 @@ mod item_no_physics;
 pub mod nameplate;
 mod obstacles;
 pub use fluids::{fall_reset_hit, fluid_flow, update_entity_fluids, water_clip};
-pub use item_merge::{ItemCells, merge_with_neighbours};
+pub use item_merge::merge_with_neighbours_scratch;
+pub use item_merge::{ItemCells, OrbCells, merge_with_neighbours};
 pub use obstacles::ObstacleGrid;
 
 #[cfg(test)]

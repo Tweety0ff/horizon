@@ -202,9 +202,8 @@ impl Game<'_> {
                 continue;
             }
             if let Some(driver) = self
-                .mobs
-                .iter()
-                .find(|m| m.id == vehicle as u32)
+                .mob_index
+                .get(&self.mobs, vehicle as u32)
                 .and_then(|m| m.extra.rider)
                 && let Some(pos) = pass.iter().position(|&p| p == driver as i32)
                 && pos != 0

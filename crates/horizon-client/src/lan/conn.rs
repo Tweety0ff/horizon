@@ -541,7 +541,7 @@ impl PlayerSender {
             match &self.to {
                 To::Disabled => {}
                 To::Channel(tx) => drop(tx.send(Out::Packet(body.into_vec()))),
-                To::Pool(outbox, _) => outbox.send(vec![body], None),
+                To::Pool(outbox, _) => outbox.send_one(body, None),
             }
         }
     }
@@ -613,7 +613,7 @@ impl PlayerSender {
                     return;
                 }
                 self.packet_counts.add_body(&body);
-                outbox.send(vec![body], Some(io_pool::End::Disconnect));
+                outbox.send_one(body, Some(io_pool::End::Disconnect));
             }
         }
     }

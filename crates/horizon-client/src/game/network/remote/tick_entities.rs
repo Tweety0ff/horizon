@@ -1,6 +1,7 @@
 //! Abilities, pushing, and ticking the server's entities on the client.
 
 use super::*;
+use crate::game::RemoteMobPrep;
 
 impl Game<'_> {
     /// The last `ClientboundPlayerAbilities` the server sent, on a client.
@@ -136,9 +137,8 @@ impl Game<'_> {
                 .filter_map(|(i, m)| {
                     let look = match m.ai.target.filter(|_| m.extra.flag) {
                         Some(Who::Mob(id)) => self
-                            .mobs
-                            .iter()
-                            .find(|t| t.id == id)
+                            .mob_index
+                            .get(&self.mobs, id)
                             .map(|t| [t.position.x, t.eye_y(), t.position.z]),
                         _ => camera,
                     };
@@ -190,6 +190,9 @@ impl Game<'_> {
         }
     }
     pub(super) fn tick_remote_entities_body(&mut self, running: bool) {
+        if self.remote.is_none() {
+            return;
+        }
         if running {
             self.tick_text_displays();
             self.tick_remote_ominous_item_spawners();
@@ -211,35 +214,66 @@ impl Game<'_> {
                 std::mem::take(&mut r.tick_water_fx),
             )
         };
+        let players = self.remote.as_ref().map(|r| &r.level_players);
+        let mut prep = std::mem::take(&mut self.remote_prep_scratch);
+        prep.clear();
+        prep.extend(self.mobs.iter().map(|m| {
+            RemoteMobPrep {
+                bounds: m.bounds(),
+                eye_y: m.eye_y(),
+                feet_block: [
+                    m.position.x.floor() as i32,
+                    (m.position.y - 0.0001).floor() as i32,
+                    m.position.z.floor() as i32,
+                ],
+                needs_fluids: running
+                    || players.is_some_and(|p| p.contains_key(&(m.id as i32))),
+                tracks_standing: horizon_client::mobs::cem::tracks_standing(&m.kind.id),
+                fluids: None,
+                standing: None,
+            }
+        }));
+        let world = &self.world;
+        let registry = self.pack.assets.registry;
+        let facts = self.res.facts();
+        let prepare = |part: &mut [RemoteMobPrep]| {
+            for mob in part {
+                if mob.needs_fluids {
+                    mob.fluids = Some(horizon_client::mobs::living::fluids_at(
+                        world,
+                        registry,
+                        facts,
+                        mob.bounds,
+                        mob.eye_y,
+                    ));
+                }
+                if mob.tracks_standing {
+                    let [x, y, z] = mob.feet_block;
+                    mob.standing = Some(facts.get(world.block(x, y, z)).name.to_string());
+                }
+            }
+        };
+        if horizon_client::parallel::parallel_tick() > 0 && prep.len() >= 64 {
+            horizon_client::parallel::par_chunks_mut(&mut prep, 16, prepare);
+        } else {
+            prepare(&mut prep);
+        }
+        fluids.clear();
+        standings.clear();
+        for mob in &mut prep {
+            fluids.push(mob.fluids.take());
+            standings.push(mob.standing.take());
+        }
         let thundering = {
             let w = self.mob_world_base(&[]);
-            let players = self.remote.as_ref().map(|r| &r.level_players);
-            fluids.clear();
-            fluids.extend(self.mobs.iter().map(|m| {
-                (running || players.is_some_and(|p| p.contains_key(&(m.id as i32))))
-                    .then(|| w.fluids(m.bounds(), m.eye_y()))
-            }));
             rain.clear();
             rain.extend(self.mobs.iter().map(|m| {
                 m.species() == horizon_client::mobs::Species::Wolf
                     && horizon_client::mobs::tame::in_rain(m, &w)
             }));
-            // The block under each mob the packs' random-model rules read (a grazing
-            // cow), one hair below the feet like `Entity.getBlockStateOn`; nothing
-            // without rules.
-            standings.clear();
-            standings.extend(self.mobs.iter().map(|m| {
-                horizon_client::mobs::cem::tracks_standing(&m.kind.id).then(|| {
-                    let (x, y, z) = (
-                        m.position.x.floor() as i32,
-                        (m.position.y - 0.0001).floor() as i32,
-                        m.position.z.floor() as i32,
-                    );
-                    w.block_name(x, y, z).to_owned()
-                })
-            }));
             w.thundering
         };
+        self.remote_prep_scratch = prep;
         // The window's own player already splashes from its motion tick.
         let own = self.remote.as_ref().map(|r| r.entity_id);
         for i in 0..self.mobs.len() {
@@ -267,35 +301,33 @@ impl Game<'_> {
         let nether = !self.dimension_type().piglins_zombify;
         // What a wither's side heads can look at, by network entity id: the
         // mobs and the player (position and eye height).
-        let wither_targets: Vec<(i32, [f64; 3], f64)> = if self
+        let mut wither_targets = std::mem::take(&mut self.remote_wither_targets_scratch);
+        wither_targets.clear();
+        if self
             .mobs
             .iter()
             .any(|m| m.species() == horizon_client::mobs::Species::Wither)
         {
-            let own = self
+            for m in self.mobs.iter() {
+                wither_targets.insert(
+                    m.id as i32,
+                    ([m.position.x, m.position.y, m.position.z], m.eye_y()),
+                );
+            }
+            if let Some((id, eye, eye_y)) = self
                 .remote
                 .as_ref()
                 .zip(self.eye_position())
-                .map(|(r, eye)| (r.entity_id, eye, eye[1]));
-            self.mobs
-                .iter()
-                .map(|m| {
-                    (
-                        m.id as i32,
-                        [m.position.x, m.position.y, m.position.z],
-                        m.eye_y(),
-                    )
-                })
-                .chain(own)
-                .collect()
-        } else {
-            Vec::new()
-        };
+                .map(|(r, eye)| (r.entity_id, eye, eye[1]))
+            {
+                wither_targets.insert(id, (eye, eye_y));
+            }
+        }
         // ExperienceOrb.followNearbyPlayer: the players an orb may go for,
         // their feet and the point `eyeHeight / 2` above them. Skip building when no orbs exist.
-        let followed: Vec<([f64; 3], [f64; 3])> = if self.orbs.is_empty() {
-            Vec::new()
-        } else {
+        let mut followed = std::mem::take(&mut self.remote_followed_scratch);
+        followed.clear();
+        if !self.orbs.is_empty() {
             let own = self
                 .player
                 .as_ref()
@@ -323,56 +355,52 @@ impl Game<'_> {
                         )
                     })
             });
-            own.into_iter().chain(others).collect()
-        };
+            followed.extend(own.into_iter().chain(others));
+        }
         // The mount this client moves ticks in `remote_ride` instead, as its
         // authoritative side (LivingEntity.tick with travelRidden).
         let driven = self.driven_mount().map(|m| m.id);
         // Cat.handleLieDown: the sleeping players (another's, drawn lying in
         // a bed, and this client's own) a lying cat can lie on top of.
-        let sleepers: Vec<horizon_core::geometry::Aabb> = if self
+        let mut sleepers = std::mem::take(&mut self.remote_sleepers_scratch);
+        sleepers.clear();
+        if self
             .mobs
             .iter()
             .any(|m| m.species() == horizon_client::mobs::Species::Cat)
+            && let Some(r) = self.remote.as_ref()
         {
-            self.remote
-                .as_ref()
-                .map(|r| {
-                    self.mobs
-                        .iter()
-                        .filter(|m| {
-                            r.level_players.contains_key(&(m.id as i32)) && m.extra.ints[1] != 0
-                        })
-                        .map(|m| {
-                            let p = m.position;
-                            horizon_core::geometry::Aabb::new(
-                                horizon_core::geometry::Vec3::new(p.x - 0.1, p.y, p.z - 0.1),
-                                horizon_core::geometry::Vec3::new(p.x + 0.1, p.y + 0.2, p.z + 0.1),
-                            )
-                        })
-                        .chain(self.sleeping.map(|bed| {
-                            let p = horizon_core::geometry::Vec3::new(
-                                f64::from(bed[0]) + 0.5,
-                                f64::from(bed[1]) + 0.6875,
-                                f64::from(bed[2]) + 0.5,
-                            );
-                            horizon_core::geometry::Aabb::new(
-                                horizon_core::geometry::Vec3::new(p.x - 0.1, p.y, p.z - 0.1),
-                                horizon_core::geometry::Vec3::new(p.x + 0.1, p.y + 0.2, p.z + 0.1),
-                            )
-                        }))
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let Some(r) = self.remote.as_mut() else {
-            return;
-        };
+            sleepers.extend(
+                self.mobs
+                    .iter()
+                    .filter(|m| {
+                        r.level_players.contains_key(&(m.id as i32)) && m.extra.ints[1] != 0
+                    })
+                    .map(|m| {
+                        let p = m.position;
+                        horizon_core::geometry::Aabb::new(
+                            horizon_core::geometry::Vec3::new(p.x - 0.1, p.y, p.z - 0.1),
+                            horizon_core::geometry::Vec3::new(p.x + 0.1, p.y + 0.2, p.z + 0.1),
+                        )
+                    }),
+            );
+            if let Some(bed) = self.sleeping {
+                let p = horizon_core::geometry::Vec3::new(
+                    f64::from(bed[0]) + 0.5,
+                    f64::from(bed[1]) + 0.6875,
+                    f64::from(bed[2]) + 0.5,
+                );
+                sleepers.push(horizon_core::geometry::Aabb::new(
+                    horizon_core::geometry::Vec3::new(p.x - 0.1, p.y, p.z - 0.1),
+                    horizon_core::geometry::Vec3::new(p.x + 0.1, p.y + 0.2, p.z + 0.1),
+                ));
+            }
+        }
+        let r = self.remote.as_mut().expect("remote state checked at tick entry");
         let mut lerps = std::mem::take(&mut r.lerps);
         let mut cart_lerps = std::mem::take(&mut r.cart_lerps);
-        let mut using = Vec::new();
+        let mut using = std::mem::take(&mut self.remote_using_scratch);
+        using.clear();
         let mut mob_fx = water_fx;
         let tick_listened = mod_api::__private::listened(mod_api::HookId::PlayerTickPre)
             || mod_api::__private::listened(mod_api::HookId::PlayerTickPost);
@@ -605,10 +633,7 @@ impl Game<'_> {
                 // WitherBoss.aiStep: the side heads turn toward their targets.
                 horizon_client::mobs::Species::Wither => {
                     horizon_client::mobs::wither::client_tick(m, |id| {
-                        wither_targets
-                            .iter()
-                            .find(|t| t.0 == id)
-                            .map(|t| (t.1, t.2))
+                        wither_targets.get(&id).copied()
                     });
                 }
                 // Hoglin and piglin `isConverting` outside the Nether.
@@ -636,6 +661,8 @@ impl Game<'_> {
                 self.remote_entity_section_step(section_id, section_from, section_to);
             }
         }
+        self.remote_wither_targets_scratch = wither_targets;
+        self.remote_sleepers_scratch = sleepers;
         // ExperienceOrb.tick runs on a client too (all but the merges and the
         // push out of a block, which are the server's): gravity, buoyancy,
         // collisions and the pull of the nearest player between the server's
@@ -701,6 +728,7 @@ impl Game<'_> {
                 kept
             });
         }
+        self.remote_followed_scratch = followed;
         // ItemEntity.tick runs on a client too: gravity, collisions and
         // friction move the item between the server's updates (every 20
         // ticks). Ordinary removal remains server-authoritative. Mods can opt
@@ -710,14 +738,15 @@ impl Game<'_> {
             .unwrap()
             .head_lerps
             .retain(|_, (_, steps)| *steps > 0);
-        let mut entered = Vec::new();
+        let mut entered = std::mem::take(&mut self.remote_entered_scratch);
+        entered.clear();
         if running {
             entity_section_steps::tick_items(self, &mut entered);
         }
         // Entity.doWaterSplashEffect on this window: Level.addParticle draws
         // the bubbles and splashes. ClientLevel.playSeededSound drops
         // Entity.playSound, so the sound stays the server's.
-        for splash in entered {
+        for splash in entered.drain(..) {
             self.apply_item_splash(splash);
         }
         let _ = self.handle_mob_events_reusable(&mut mob_fx);
@@ -727,11 +756,13 @@ impl Game<'_> {
             r.tick_standings = standings;
             r.tick_water_fx = mob_fx;
         }
-        for (item, ticks, at, eye, pitch, yaw) in using {
+        for (item, ticks, at, eye, pitch, yaw) in using.drain(..) {
             self.remote_player_eating(&item, ticks, at, eye, pitch, yaw);
         }
         // ClientLevel.tick: the sky flash fades in a frozen level too.
         self.flash = self.flash.saturating_sub(1);
+        self.remote_using_scratch = using;
+        self.remote_entered_scratch = entered;
         if running {
             self.guardian_bubbles();
             // The dragon: LivingEntity's interpolation, inside its aiStep.
@@ -762,11 +793,14 @@ impl Game<'_> {
             }
             // The yaw of a boat eases toward the server's over the same steps
             // as its position, read before `step` counts one off.
-            let turns: HashMap<i32, (f32, u32)> = lerps
-                .iter()
-                .filter(|(_, l)| l.steps > 0)
-                .filter_map(|(id, l)| l.rotation.map(|r| (*id, (r.0, l.steps))))
-                .collect();
+            let mut turns = std::mem::take(&mut self.remote_turn_scratch);
+            turns.clear();
+            turns.extend(
+                lerps
+                    .iter()
+                    .filter(|(_, l)| l.steps > 0)
+                    .filter_map(|(id, l)| l.rotation.map(|r| (*id, (r.0, l.steps)))),
+            );
             // Boats, minecarts, projectiles and the rest ease toward the
             // server's position over three ticks (`lerps`).
             let mut step = |id: u32, at: Vec3| match lerps.get_mut(&(id as i32)) {
@@ -795,17 +829,20 @@ impl Game<'_> {
                 },
             );
             self.tick_remote_projectiles(&mut step);
+            self.remote_turn_scratch = turns;
             // LightningBolt.tick on a client.
             self.tick_bolts();
         }
         lerps.retain(|_, l| l.steps > 0);
         if let Some(r) = self.remote.as_mut() {
-            for (id, l) in lerps {
-                r.lerps.entry(id).or_insert(l);
+            for (id, l) in std::mem::take(&mut r.lerps) {
+                lerps.entry(id).or_insert(l);
             }
-            for (id, l) in cart_lerps {
-                r.cart_lerps.entry(id).or_insert(l);
+            r.lerps = lerps;
+            for (id, l) in std::mem::take(&mut r.cart_lerps) {
+                cart_lerps.entry(id).or_insert(l);
             }
+            r.cart_lerps = cart_lerps;
         }
     }
 }

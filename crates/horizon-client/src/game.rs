@@ -897,6 +897,16 @@ struct TickScratch {
     later: Vec<BlockPos>,
 }
 
+struct RemoteMobPrep {
+    bounds: Aabb,
+    eye_y: f64,
+    feet_block: [i32; 3],
+    needs_fluids: bool,
+    tracks_standing: bool,
+    fluids: Option<horizon_client::mobs::living::Fluids>,
+    standing: Option<String>,
+}
+
 struct Game<'a> {
     /// Shared with an integrated server; `collision` and `motion` borrow from it.
     res: Arc<Resources>,
@@ -1242,6 +1252,23 @@ struct Game<'a> {
     /// Remote guardian eye targets reused between ticks.
     guardian_look_scratch: Vec<(usize, [f64; 3])>,
     dropped: horizon_client::join_seq::JoinList<ItemEntity>,
+    /// Reused per-tick item spatial buckets and merge candidates.
+    item_cells: horizon_client::entities::ItemCells,
+    item_merge_candidates: Vec<u32>,
+    item_removed_scratch: Vec<bool>,
+    item_nearby_scratch: Vec<Aabb>,
+    item_bubble_tops_scratch: Vec<BlockPos>,
+    item_destroyed_scratch: Vec<(ItemStack, Vec3)>,
+    item_splash_scratch: Vec<horizon_client::entities::ItemSplash>,
+    item_obstacles: horizon_client::entities::ObstacleGrid,
+    /// Scratch outputs from the remote entity tick.
+    remote_using_scratch: Vec<(std::sync::Arc<str>, u32, [f64; 3], f64, f32, f32)>,
+    remote_entered_scratch: Vec<horizon_client::entities::ItemSplash>,
+    remote_wither_targets_scratch: HashMap<i32, ([f64; 3], f64)>,
+    remote_followed_scratch: Vec<([f64; 3], [f64; 3])>,
+    remote_sleepers_scratch: Vec<Aabb>,
+    remote_turn_scratch: HashMap<i32, (f32, u32)>,
+    remote_prep_scratch: Vec<RemoteMobPrep>,
     next_entity: u32,
     /// The last entity id when this level's entity pass began: an item with a
     /// later one was added during that pass and first ticks on the next
@@ -1293,6 +1320,7 @@ struct Game<'a> {
         horizon_client::fast_hash::FxHashMap<u32, horizon_client::lan::entity::EntityState>,
     /// `mobs` by network id, for the packets that name one (`game/mobs/mob_index.rs`).
     mob_index: mob_index::MobIndex,
+    entity_indices: mob_index::EntityIndices,
     creatures: creatures::Creatures,
     sculk: sculk::SculkState,
     raiding: raids::Raiding,
@@ -1379,6 +1407,9 @@ struct Game<'a> {
     applied_modifiers: Vec<(String, String)>,
     experience: Experience,
     orbs: horizon_client::join_seq::JoinList<ExperienceOrb>,
+    /// Spatial bins for experience orb neighbour searches.
+    orb_cells: horizon_client::entities::OrbCells,
+    orb_candidates: Vec<horizon_client::join_seq::JoinSeq>,
     xp_delay: u32,
     ordered: ordered_tick::OrderedTicks,
     level_up_sound: horizon_client::entities::LevelUpSound,
@@ -3256,7 +3287,7 @@ impl Game<'_> {
             }
         }
         self.world.moving_piston_fallback = fallback;
-        self.world.moving_pistons = current;
+        self.world.set_moving_pistons(current);
     }
     /// Side effects reported by the behaviour library, in vanilla order.
     fn process_level_events(&mut self) -> Result<()> {
@@ -10953,6 +10984,21 @@ impl<'a> Game<'a> {
             guardian_sounds: HashSet::new(),
             guardian_look_scratch: Vec::new(),
             dropped: Default::default(),
+            item_cells: Default::default(),
+            item_merge_candidates: Vec::new(),
+            item_removed_scratch: Vec::new(),
+            item_nearby_scratch: Vec::new(),
+            item_bubble_tops_scratch: Vec::new(),
+            item_destroyed_scratch: Vec::new(),
+            item_splash_scratch: Vec::new(),
+            item_obstacles: Default::default(),
+            remote_using_scratch: Vec::new(),
+            remote_entered_scratch: Vec::new(),
+            remote_wither_targets_scratch: HashMap::new(),
+            remote_followed_scratch: Vec::new(),
+            remote_sleepers_scratch: Vec::new(),
+            remote_turn_scratch: HashMap::new(),
+            remote_prep_scratch: Vec::new(),
             next_entity: 0,
             ticked_entities_through: u32::MAX,
             contact_drops: 0..0,
@@ -10976,6 +11022,7 @@ impl<'a> Game<'a> {
             mobs: Default::default(),
             stand_states: Default::default(),
             mob_index: Default::default(),
+            entity_indices: Default::default(),
             creatures: Default::default(),
             sculk: Default::default(),
             raiding: Default::default(),
@@ -11020,6 +11067,8 @@ impl<'a> Game<'a> {
             applied_modifiers: Vec::new(),
             experience: Experience::default(),
             orbs: Default::default(),
+            orb_cells: Default::default(),
+            orb_candidates: Vec::new(),
             xp_delay: 0,
             ordered: Default::default(),
             level_up_sound: Default::default(),

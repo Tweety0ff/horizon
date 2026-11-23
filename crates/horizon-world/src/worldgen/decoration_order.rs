@@ -77,7 +77,7 @@ impl DecorationOrder {
 
     /// Whether a lower-ranked chunk within two of `(x, z)` still has to be
     /// decorated (`pending`) first.
-    pub fn blocked(&self, x: i32, z: i32, pending: impl Fn(i32, i32) -> bool) -> bool {
+    pub fn blocked(&self, x: i32, z: i32, mut pending: impl FnMut(i32, i32) -> bool) -> bool {
         let Some(own) = self.rank(x, z) else {
             return false;
         };

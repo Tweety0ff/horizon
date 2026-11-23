@@ -62,7 +62,7 @@ pub fn after_tick(ms: f32, cpu_ms: Option<f32>) {
     }
     let mut auto = AUTO.lock().unwrap_or_else(PoisonError::into_inner);
     let was = auto.shared;
-    let shared = auto.after_tick(ms, cpu_ms.unwrap_or(ms), horizon_threads::worker_count());
+    let shared = auto.after_tick(ms, cpu_ms.unwrap_or(ms), horizon_threads::usable_cores());
     AUTO_STATE.store(auto.state as u8, Ordering::Relaxed);
     if shared != was {
         let ms = auto.last_median;
@@ -111,9 +111,9 @@ const SETTLE: u8 = 1;
 /// How many ticks after a trial that didn't help before the next one: 5 minutes after the
 /// first, 20 after every later one.
 const RETRY_AFTER: [u64; 2] = [5 * 60 * 20, 20 * 60 * 20];
-/// Fewer hardware threads than this and Auto never shares the tick: the helpers would run on
-/// the cores the frame and the chunk workers need.
-const MIN_THREADS: usize = 4;
+/// Fewer performance cores than this and Auto never shares the tick: helpers would take cores
+/// the frame and foreground chunk work need.
+const MIN_PERFORMANCE_CORES: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -164,9 +164,9 @@ impl Auto {
         }
     }
 
-    /// A tick took `ms`, `cpu_ms` of them on the processor, on a machine with `threads`
-    /// hardware threads: whether the next one shares its phases' work.
-    fn after_tick(&mut self, ms: f32, cpu_ms: f32, threads: usize) -> bool {
+    /// A tick took `ms`, `cpu_ms` of them on the processor, on a machine with
+    /// `performance_cores`: whether the next one shares its phases' work.
+    fn after_tick(&mut self, ms: f32, cpu_ms: f32, performance_cores: usize) -> bool {
         self.ticks += 1;
         self.window.push(ms);
         self.cpu.push(cpu_ms);
@@ -185,8 +185,9 @@ impl Auto {
         }
         match self.state {
             State::Watching => {
-                let heavy =
-                    working >= HEAVY_MS && threads >= MIN_THREADS && self.ticks >= self.retry_at;
+                let heavy = working >= HEAVY_MS
+                    && performance_cores >= MIN_PERFORMANCE_CORES
+                    && self.ticks >= self.retry_at;
                 self.streak = if heavy { self.streak + 1 } else { 0 };
                 if self.streak >= STREAK {
                     self.before = median;
@@ -271,11 +272,11 @@ pub fn mob_turn_random(id: u32, game_time: i64) -> horizon_core::random::LegacyR
 pub static OWN_RANDOM_TEST: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// How many threads a phase may share its work among: `horizon-threads`' count (at most 8) while
-/// the parallel tick is on, else 1.
+/// Total foreground tick lanes, including the server thread: one fewer than the performance-core
+/// budget (at most 8) while the parallel tick is on, else 1.
 pub fn lanes() -> usize {
     if parallel_tick() > 0 {
-        horizon_threads::worker_count().clamp(1, 8)
+        worker_lanes()
     } else {
         1
     }
@@ -290,6 +291,10 @@ fn pool() -> &'static rayon::ThreadPool {
             .num_threads(horizon_threads::sizing::for_pool(
                 horizon_threads::sizing::Pool::TickHelper,
             ))
+            // The pool may be initialized by the server thread after it has
+            // reserved a core. Rayon helpers must widen their inherited CPU
+            // mask just like the scoped tick workers did.
+            .start_handler(|_| horizon_threads::server_core::leave_reserved())
             .thread_name(|i| format!("tick-helper-{i}"))
             .build()
             .expect("the tick's helper threads start")
@@ -311,24 +316,39 @@ pub fn par_map<T: Sync, R: Send>(
 /// `horizon_threads::par_chunks_mut`, without starting threads for every call. A chunk runs on
 /// whatever thread takes it, so `f` must not depend on the order. Unlike [`par_map`] it does not
 /// wait for the parallel tick's switch (the phases that use it ran shared out before the pool
-/// existed, #8158): it shares out unless `HORIZON_SERIAL_TICK=all` or one thread is all there is.
+/// existed, #8158): it shares out unless `HORIZON_SERIAL_TICK=all` or fewer than three
+/// performance cores are available.
 /// The thread-locals the tick relies on do not follow a helper.
 pub fn par_chunks_mut<T: Send>(items: &mut [T], chunk: usize, f: impl Fn(&mut [T]) + Send + Sync) {
-    let lanes = if horizon_threads::serial_tick_all() {
-        1
-    } else {
-        horizon_threads::worker_count().clamp(1, 8)
-    };
-    par_chunks_mut_on(items, chunk, lanes, f);
+    par_chunks_mut_with_state(items, chunk, || (), |part, ()| f(part));
 }
 
-/// Worker lane count without the 8-lane cap of [`par_chunks_mut`]: 1 when `HORIZON_SERIAL_TICK=all`,
-/// else all workers configured in `horizon_threads`.
+/// The same capped parallel tick as `par_chunks_mut`, with scratch state
+/// initialized once per work lane and reused for each chunk that lane receives.
+pub fn par_chunks_mut_with_state<T: Send, S: Send>(
+    items: &mut [T],
+    chunk: usize,
+    init: impl Fn() -> S + Send + Sync,
+    f: impl Fn(&mut [T], &mut S) + Send + Sync,
+) {
+    par_chunks_mut_on_with(items, chunk, worker_lanes(), init, f);
+}
+
+/// Total tick lanes, including the server thread: one fewer than the available performance
+/// cores, capped at eight, so one performance core remains for the render thread. Fewer
+/// than three performance cores stay serial; efficiency cores do not become stragglers in a
+/// foreground tick.
+fn tick_lanes(cores: usize) -> usize {
+    cores.saturating_sub(1).clamp(1, 8)
+}
+
+/// Worker lane count (up to eight), or one when `HORIZON_SERIAL_TICK=all`
+/// or fewer than three performance cores are available.
 pub fn worker_lanes() -> usize {
     if horizon_threads::serial_tick_all() {
         1
     } else {
-        horizon_threads::worker_count().max(1)
+        tick_lanes(horizon_threads::usable_cores())
     }
 }
 
@@ -339,23 +359,46 @@ pub fn par_chunks_mut_on<T: Send>(
     lanes: usize,
     f: impl Fn(&mut [T]) + Send + Sync,
 ) {
+    par_chunks_mut_on_with(items, chunk, lanes, || (), |slice, ()| f(slice));
+}
+
+/// `par_chunks_mut_on` with state made once per participating worker and reused
+/// for every chunk that worker takes. The state is also made once on the caller;
+/// callers can keep scratch buffers here instead of allocating one per chunk.
+pub fn par_chunks_mut_on_with<T: Send, S: Send>(
+    items: &mut [T],
+    chunk: usize,
+    lanes: usize,
+    init: impl Fn() -> S + Send + Sync,
+    f: impl Fn(&mut [T], &mut S) + Send + Sync,
+) {
     let chunk = chunk.max(1);
     let count = items.len().div_ceil(chunk);
+    if count == 0 {
+        return;
+    }
     if lanes <= 1 || count < 2 {
+        let mut state = init();
         for slice in items.chunks_mut(chunk) {
-            f(slice);
+            f(slice, &mut state);
         }
         return;
     }
     // A thread takes a chunk whole; the lock is only held while a chunk is taken, never while
-    // it runs: the chunk is popped in a statement of its own, so the guard is gone before `f`
-    // (a guard in a `while let` scrutinee would live through the loop body).
-    let pending = Mutex::new(items.chunks_mut(chunk).collect::<Vec<_>>());
+    // it runs: next_back() is evaluated in its own statement, so the guard is gone before `f`
+    // (a guard in a `while let` scrutinee would live through the loop body). The iterator avoids
+    // allocating a Vec of all the mutable slices, and next_back keeps the old pop order. State is
+    // local to this worker invocation and survives all the chunks it takes.
+    let pending = Mutex::new(items.chunks_mut(chunk));
     let work = || {
+        let mut state = init();
         loop {
-            let next = pending.lock().unwrap_or_else(PoisonError::into_inner).pop();
+            let next = pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .next_back();
             let Some(slice) = next else { break };
-            f(slice);
+            f(slice, &mut state);
         }
     };
     pool().in_place_scope(|s| {
@@ -383,11 +426,15 @@ pub fn par_map_on<T: Sync, R: Send>(
         f(items, &mut out);
         return out;
     }
-    let size = items.len().div_ceil(lanes * 4);
+    let size = items.len().div_ceil(lanes.saturating_mul(4).max(1));
     let count = items.len().div_ceil(size);
     let next = AtomicUsize::new(0);
-    let slots: Vec<Mutex<Vec<R>>> = (0..count).map(|_| Mutex::new(Vec::new())).collect();
+    // Each lane accumulates its own completed parts and publishes them once:
+    // no mutex is needed for every small chunk of tick work.
+    let completed = Mutex::new(Vec::with_capacity(count));
+    let active_lanes = lanes.min(count);
     let work = || {
+        let mut local = Vec::with_capacity(count.div_ceil(active_lanes));
         loop {
             let k = next.fetch_add(1, Ordering::Relaxed);
             if k >= count {
@@ -396,18 +443,28 @@ pub fn par_map_on<T: Sync, R: Send>(
             let part = &items[k * size..((k + 1) * size).min(items.len())];
             let mut done = Vec::with_capacity(part.len());
             f(part, &mut done);
-            *slots[k].lock().unwrap_or_else(PoisonError::into_inner) = done;
+            local.push((k, done));
         }
+        completed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(local);
     };
+    // Keep the requested lane cap: other users of the persistent pool may
+    // need the remaining helpers for foreground work. Don't start idle lanes.
     pool().in_place_scope(|s| {
-        for _ in 1..lanes {
+        for _ in 1..active_lanes {
             s.spawn(|_| work());
         }
         work();
     });
+    let mut completed = completed
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    completed.sort_unstable_by_key(|(index, _)| *index);
     let mut out = Vec::with_capacity(items.len());
-    for slot in slots {
-        out.extend(slot.into_inner().unwrap_or_else(PoisonError::into_inner));
+    for (_, part) in completed {
+        out.extend(part);
     }
     out
 }
@@ -415,6 +472,15 @@ pub fn par_map_on<T: Sync, R: Send>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The server shares foreground tick work across performance cores only, leaving
+    /// one such core available for rendering and keeping fewer than three cores serial.
+    #[test]
+    fn tick_lanes_leave_a_performance_core_for_rendering() {
+        for (cores, lanes) in [(1, 1), (2, 1), (3, 2), (4, 3), (8, 7), (9, 8), (16, 8)] {
+            assert_eq!(tick_lanes(cores), lanes, "{cores} performance cores");
+        }
+    }
 
     /// Auto keeps a quiet world on one thread, shares a heavy tick only after two heavy windows,
     /// keeps the trial when the ticks got faster, goes back once they are light, and after a
@@ -447,10 +513,12 @@ mod tests {
         assert!(!run(&mut auto, 36.0, 2), "no faster: undone");
         assert!(!run(&mut auto, 36.0, 40), "waiting");
         assert!(run(&mut auto, 36.0, 20), "tried again after five minutes");
-        // Too few hardware threads: never.
-        let mut small = Auto::new();
-        for _ in 0..20 * WINDOW {
-            assert!(!small.after_tick(40.0, 40.0, 2));
+        // Fewer than four performance cores: never.
+        for performance_cores in 1..MIN_PERFORMANCE_CORES {
+            let mut small = Auto::new();
+            for _ in 0..20 * WINDOW {
+                assert!(!small.after_tick(40.0, 40.0, performance_cores));
+            }
         }
         // Ticks that are slow on the clock while the thread hardly works (a busy or swapping
         // machine) have nothing to share.
@@ -487,6 +555,25 @@ mod tests {
         }
     }
 
+    /// A caller's lane budget also caps concurrently running parts, even though
+    /// the persistent Rayon pool may have more helpers available.
+    #[test]
+    fn parallel_map_respects_the_lane_limit() {
+        use std::time::Duration;
+
+        let active = AtomicUsize::new(0);
+        let maximum = AtomicUsize::new(0);
+        let items: Vec<usize> = (0..256).collect();
+        par_map_on(&items, 1, 2, |part, out| {
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1));
+            out.extend(part);
+            active.fetch_sub(1, Ordering::SeqCst);
+        });
+        assert!(maximum.load(Ordering::SeqCst) <= 2);
+    }
+
     /// Every chunk is handled once, whole, and its items changed in place, for item counts that
     /// don't divide into chunks evenly.
     #[test]
@@ -501,6 +588,33 @@ mod tests {
             });
             assert_eq!(items, (0..n as u64).map(|x| x * 3 + 1).collect::<Vec<_>>());
         }
+    }
+
+    /// Each participating worker initializes scratch once and reuses it across chunks.
+    #[test]
+    fn chunk_worker_state_is_reused() {
+        let initialized = AtomicUsize::new(0);
+        let reused = AtomicUsize::new(0);
+        let mut items: Vec<usize> = (0..64).collect();
+        par_chunks_mut_on_with(
+            &mut items,
+            1,
+            4,
+            || {
+                initialized.fetch_add(1, Ordering::SeqCst);
+                0usize
+            },
+            |part, state| {
+                if *state > 0 {
+                    reused.fetch_add(1, Ordering::SeqCst);
+                }
+                *state += 1;
+                part[0] += 1;
+            },
+        );
+        assert_eq!(initialized.load(Ordering::SeqCst), 4);
+        assert!(reused.load(Ordering::SeqCst) >= 60);
+        assert_eq!(items, vec![1; 64]);
     }
 
     /// Chunks really run at the same time: one waits (bounded, so a serial run fails instead of

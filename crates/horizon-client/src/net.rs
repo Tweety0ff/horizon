@@ -603,7 +603,7 @@ impl Session {
             return;
         }
         if let Some(w) = writer.as_mut()
-            && w.send(&body).is_err()
+            && w.send_owned(body).is_err()
         {
             w.shutdown();
         }
@@ -648,7 +648,7 @@ impl Session {
             play::Serverbound::ResourcePack(status).encode()
         };
         if let Some(w) = writer.as_mut()
-            && w.send(&body).is_err()
+            && w.send_owned(body).is_err()
         {
             w.shutdown();
         }
@@ -667,7 +667,7 @@ impl Session {
             play::Serverbound::CustomClickAction(click).encode()
         };
         if let Some(w) = writer.as_mut()
-            && w.send(&body).is_err()
+            && w.send_owned(body).is_err()
         {
             w.shutdown();
         }
@@ -676,7 +676,7 @@ impl Session {
     pub fn accept_code_of_conduct(&self) {
         let mut writer = self.writer.lock().unwrap();
         if let Some(w) = writer.as_mut()
-            && w.send(&cfg::Serverbound::AcceptCodeOfConduct(Empty).encode())
+            && w.send_owned(cfg::Serverbound::AcceptCodeOfConduct(Empty).encode())
                 .is_err()
         {
             w.shutdown();
@@ -1250,7 +1250,7 @@ fn receive_play(
         }
         let reply = |p: play::Serverbound| {
             if let Some(w) = shared_writer.lock().unwrap().as_mut() {
-                let _ = w.send(&p.encode());
+                let _ = w.send_owned(p.encode());
             }
         };
         match packet {
@@ -1460,7 +1460,7 @@ fn configure(
         match writer.lock().unwrap().as_mut() {
             Some(w) => p
                 .try_encode_with_payload_codecs(&payloads.local.codecs)
-                .and_then(|body| w.send(&body))
+                .and_then(|body| w.send_owned(body))
                 .map_err(|e| Reason::plain(connection_lost(e, lang))),
             None => Err(Reason::plain("Disconnected")),
         }

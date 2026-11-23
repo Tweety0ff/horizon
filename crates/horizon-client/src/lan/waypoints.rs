@@ -331,10 +331,32 @@ pub struct Waypoints {
     /// A small number for each player the manager knows, which its rows index their
     /// connections by (a lookup by number is a load, by UUID a hash and a probe).
     ids: Arc<HashMap<u128, u32>>,
+    /// Current tick's UUID-to-slice-index lookup, rebuilt in its retained allocation.
+    player_indices: Arc<HashMap<u128, usize>>,
     free: Vec<u32>,
     next_id: u32,
     /// The `locator_bar` game rule as last seen.
     enabled: Option<bool>,
+    /// Scratch arrays for the per-tick movement sweep; their capacity survives quiet ticks.
+    move_scratch: Vec<Move>,
+    slot_scratch: Vec<u32>,
+    move_of_scratch: Vec<u32>,
+    changed_moves_scratch: Vec<u32>,
+    changed_slots_scratch: Vec<u32>,
+    all_moves_scratch: Vec<u32>,
+    all_slots_scratch: Vec<u32>,
+    gone_scratch: Vec<u128>,
+    view_scratch: HashMap<u128, ([i32; 2], i32)>,
+    updates_scratch: HashMap<u128, OnceLock<Option<Arc<Encoded>>>>,
+    /// Per-receiver packet vectors, drained into the returned batch and reused next tick.
+    job_out_scratch: Vec<Vec<(u32, Sent)>>,
+    /// Receiver work records, retaining the job-list allocation between movement ticks.
+    jobs_scratch: Vec<MoveJob>,
+    /// Per-waypoint snapshots for this tick; own the source data, not Player references.
+    sources_scratch: Vec<Option<Src>>,
+    own_scratch: HashMap<u128, u32>,
+    #[cfg(test)]
+    force_dense_for_test: bool,
     /// Which generation of the waypoints the rows' `watch` lists belong to: the transmitters, their
     /// numbers and the receivers change it.
     epoch: u64,
@@ -342,7 +364,8 @@ pub struct Waypoints {
 
 /// What every row reads this tick: the players, read only.
 struct Shared<'a> {
-    players: HashMap<u128, &'a Player>,
+    players: &'a [Player],
+    player_indices: Arc<HashMap<u128, usize>>,
     ids: Arc<HashMap<u128, u32>>,
     /// One waypoint update per mover and tick, encoded once for the receivers it goes to.
     updates: HashMap<u128, OnceLock<Option<Arc<Encoded>>>>,
@@ -365,6 +388,9 @@ struct Receiving<'r> {
 impl Shared<'_> {
     fn id(&self, uuid: u128) -> u32 {
         self.ids.get(&uuid).copied().unwrap_or(NONE)
+    }
+    fn player(&self, uuid: u128) -> Option<&Player> {
+        self.players.get(*self.player_indices.get(&uuid)?)
     }
     /// What `update_or_create` does for a Block connection whose source has not left its
     /// block and is not ignored: nothing. True only when that is all it would do (a pair that
@@ -415,17 +441,12 @@ impl Shared<'_> {
         icon: &Icon,
         target: WaypointTarget,
     ) {
-        let Some(conn) = self
-            .players
-            .get(&receiver)
-            .and_then(|p| p.conn)
-            .or_else(|| {
-                self.away
-                    .iter()
-                    .find(|(uuid, _)| *uuid == receiver)
-                    .map(|&(_, conn)| conn)
-            })
-        else {
+        let Some(conn) = self.player(receiver).and_then(|p| p.conn).or_else(|| {
+            self.away
+                .iter()
+                .find(|(uuid, _)| *uuid == receiver)
+                .map(|&(_, conn)| conn)
+        }) else {
             return;
         };
         out.push((conn, waypoint(source, operation, icon, target).into()));
@@ -487,7 +508,7 @@ impl Shared<'_> {
     }
     /// The source and the receiver, if both are in the level this tick.
     fn pair(&self, source: u128, receiver: u128) -> Option<(&Player, &Player)> {
-        Some((*self.players.get(&source)?, *self.players.get(&receiver)?))
+        Some((self.player(source)?, self.player(receiver)?))
     }
     /// The icon of a connection to `s`: the player's own, with the team's colour when it has none
     /// (`Waypoint.Icon.cloneAndAssignStyle`).
@@ -502,7 +523,7 @@ impl Shared<'_> {
     /// records alone: what [`Self::update_or_create`] would do for a block connection one block off
     /// that its source has not left the range of (`update`), done here. False: nothing was done.
     #[inline]
-    fn step(row: &mut Row, src: &Src, me: &Receiver, out: &mut Vec<(u32, Sent)>) -> bool {
+    fn step(&self, row: &mut Row, src: &Src, me: &Receiver, out: &mut Vec<(u32, Sent)>) -> bool {
         #[cfg(test)]
         if tests::NO_STEP.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
@@ -523,7 +544,10 @@ impl Shared<'_> {
         if !in_range {
             return false;
         }
-        let Some(e) = src.update() else {
+        let Some(player) = self.player(src.uuid) else {
+            return false;
+        };
+        let Some(e) = src.update(player) else {
             return false;
         };
         *last = s.record;
@@ -698,6 +722,16 @@ struct Move {
     block_changed: bool,
 }
 
+/// One receiver's mutable work in a movement sweep. Its row and output buffer
+/// return to the manager after each tick, so the job-list allocation can persist.
+struct MoveJob {
+    receiver: u128,
+    listed: bool,
+    view: View,
+    row: Row,
+    out: Vec<(u32, Sent)>,
+}
+
 /// A transmitter as the pair check reads it: its number, last-block record, position, range
 /// and spectator mode, apart from the `Player`.
 #[derive(Clone, Copy)]
@@ -732,19 +766,18 @@ struct Receiver {
 
 /// A transmitter for the rows to read this tick: the pair check's record of it, and its update packet,
 /// encoded once for the receivers that meet it.
-struct Src<'a> {
+struct Src {
     source: Source,
-    player: &'a Player,
+    uuid: u128,
     shared: OnceLock<Option<Arc<Encoded>>>,
 }
 
-impl Src<'_> {
+impl Src {
     /// The update of its waypoint to the block it is at: what every connection to it that moves by a
     /// block is sent (their icon is the player's own, as `Waypoints::tick_with` sees to).
-    fn update(&self) -> Option<&Arc<Encoded>> {
+    fn update(&self, p: &Player) -> Option<&Arc<Encoded>> {
         self.shared
             .get_or_init(|| {
-                let p = self.player;
                 let packet = waypoint(
                     p.uuid,
                     waypoint_operation::UPDATE,
@@ -814,7 +847,8 @@ impl Waypoints {
         if !self.waypoints.contains(&source) {
             self.waypoints.push(source);
         }
-        for receiver in self.players.clone() {
+        for index in 0..self.players.len() {
+            let receiver = self.players[index];
             self.create_connection(t, receiver, source);
         }
     }
@@ -831,7 +865,8 @@ impl Waypoints {
     /// `untrackWaypoint`.
     fn untrack(&mut self, t: &mut Tick, source: u128) {
         self.epoch += 1;
-        for receiver in self.players.clone() {
+        for index in 0..self.players.len() {
+            let receiver = self.players[index];
             if self.take(receiver, source).is_some() {
                 t.disconnect(receiver, source);
             }
@@ -844,7 +879,8 @@ impl Waypoints {
         if !self.players.contains(&player) {
             self.players.push(player);
         }
-        for source in self.waypoints.clone() {
+        for index in 0..self.waypoints.len() {
+            let source = self.waypoints[index];
             self.create_connection(t, player, source);
         }
         if transmitting {
@@ -881,7 +917,8 @@ impl Waypoints {
     /// `breakAllConnections`.
     fn break_all(&mut self, t: &mut Tick) {
         self.epoch += 1;
-        for receiver in self.players.clone() {
+        for index in 0..self.players.len() {
+            let receiver = self.players[index];
             for source in self
                 .connections
                 .remove(&receiver)
@@ -933,46 +970,58 @@ impl Waypoints {
         by_receiver: usize,
     ) -> Vec<(u32, Sent)> {
         self.number(players);
+        let indices = Arc::make_mut(&mut self.player_indices);
+        indices.clear();
+        indices.extend(players.iter().enumerate().map(|(index, p)| (p.uuid, index)));
+        let mut updates = std::mem::take(&mut self.updates_scratch);
+        updates.clear();
+        updates.extend(players.iter().map(|p| (p.uuid, OnceLock::new())));
+        let mut view = std::mem::take(&mut self.view_scratch);
+        view.clear();
         let mut t = Tick {
             s: Shared {
-                players: players.iter().map(|p| (p.uuid, p)).collect(),
+                players,
+                player_indices: Arc::clone(&self.player_indices),
                 ids: Arc::clone(&self.ids),
-                updates: players.iter().map(|p| (p.uuid, OnceLock::new())).collect(),
+                updates,
                 away,
                 fresh: respawned,
                 enabled: locator_bar,
             },
-            view: HashMap::default(),
+            view,
             out: Vec::new(),
         };
         // Vanilla reads the rule when it connects; changing it breaks or remakes
         // every connection (MinecraftServer.onGameRuleChanged).
         let was = self.enabled.replace(locator_bar);
         for (uuid, memo) in &self.memo {
-            if let Some(p) = t.s.players.get(uuid) {
+            if let Some(p) = t.s.player(*uuid) {
                 t.view.insert(*uuid, (memo.view_center, p.view_distance));
             }
         }
-        // Players who left, and the ServerPlayer a respawn replaced: every known entity, receiver or not
-        // (`ServerLevel.EntityCallbacks.onTrackingEnd` calls `removePlayer` for each), receivers first
-        // in their order, then the rest by id.
-        let departed = |uuid: &u128| !t.s.players.contains_key(uuid) || respawned.contains(uuid);
-        let mut gone: Vec<u128> = self.players.iter().copied().filter(departed).collect();
-        let mut silent: Vec<u128> = self
-            .memo
-            .keys()
-            .copied()
-            .filter(|uuid| departed(uuid) && !self.players.contains(uuid))
-            .collect();
-        silent.sort_unstable();
-        gone.extend(silent);
-        for uuid in gone {
+        // Receivers first in their existing order, then silent entities by UUID.
+        let mut gone = std::mem::take(&mut self.gone_scratch);
+        gone.clear();
+        gone.extend(
+            self.players
+                .iter()
+                .copied()
+                .filter(|uuid| t.s.player(*uuid).is_none() || respawned.contains(uuid)),
+        );
+        let receivers_gone = gone.len();
+        gone.extend(self.memo.keys().copied().filter(|uuid| {
+            (t.s.player(*uuid).is_none() || respawned.contains(uuid))
+                && !self.players.contains(uuid)
+        }));
+        gone[receivers_gone..].sort_unstable();
+        for uuid in gone.drain(..) {
             self.remove_player(&mut t, uuid);
             self.memo.remove(&uuid);
-            if !t.s.players.contains_key(&uuid) {
+            if t.s.player(uuid).is_none() {
                 self.release(uuid);
             }
         }
+        self.gone_scratch = gone;
         if was == Some(true) && !locator_bar {
             self.break_all(&mut t);
         }
@@ -1004,7 +1053,8 @@ impl Waypoints {
             }
         }
         if was == Some(false) && locator_bar {
-            for player in self.players.clone() {
+            for index in 0..self.players.len() {
+                let player = self.players[index];
                 self.update_player(&mut t, player);
             }
         }
@@ -1020,6 +1070,8 @@ impl Waypoints {
             })
         {
             self.moves_by_receiver(&mut t, players);
+            self.view_scratch = std::mem::take(&mut t.view);
+            self.updates_scratch = std::mem::take(&mut t.s.updates);
             return t.out;
         }
         for p in players {
@@ -1080,7 +1132,8 @@ impl Waypoints {
             // ServerScoreboard: a team joined, left or recoloured remakes the connections.
             if p.team != self.memo[&p.uuid].team {
                 self.memo.get_mut(&p.uuid).unwrap().team = p.team.clone();
-                for receiver in self.players.clone() {
+                for index in 0..self.players.len() {
+                    let receiver = self.players[index];
                     self.create_connection(&mut t, receiver, p.uuid);
                 }
             }
@@ -1092,6 +1145,8 @@ impl Waypoints {
                 self.track(&mut t, p.uuid);
             }
         }
+        self.view_scratch = std::mem::take(&mut t.view);
+        self.updates_scratch = std::mem::take(&mut t.s.updates);
         t.out
     }
 
@@ -1102,7 +1157,8 @@ impl Waypoints {
     /// threads, and its packets come out as the loop sends them.
     fn moves_by_receiver(&mut self, t: &mut Tick, players: &[Player]) {
         let sparse = Self::calm(&t.s, players);
-        let mut moves = Vec::new();
+        let mut moves = std::mem::take(&mut self.move_scratch);
+        moves.clear();
         for player in players {
             let memo = self
                 .memo
@@ -1128,49 +1184,44 @@ impl Waypoints {
             });
         }
         if moves.is_empty() {
+            self.move_scratch = moves;
             return;
         }
         // Every row a move reaches: the receivers', and those of movers who receive but aren't
         // listed as receivers (`updatePlayer` runs on their own row all the same).
-        struct Job {
-            receiver: u128,
-            listed: bool,
-            view: View,
-            row: Row,
-            out: Vec<(u32, Sent)>,
-        }
-        let mut jobs: Vec<Job> = self
-            .players
-            .iter()
-            .map(|&receiver| (receiver, true))
-            .chain(
-                moves
-                    .iter()
-                    .filter(|m| m.receives && !self.players.contains(&m.uuid))
-                    .map(|m| (m.uuid, false)),
-            )
-            .map(|(receiver, listed)| Job {
+        let mut job_outs = std::mem::take(&mut self.job_out_scratch);
+        let mut jobs = std::mem::take(&mut self.jobs_scratch);
+        jobs.clear();
+        for (receiver, listed) in self.players.iter().map(|&receiver| (receiver, true)).chain(
+            moves
+                .iter()
+                .filter(|m| m.receives && !self.players.contains(&m.uuid))
+                .map(|m| (m.uuid, false)),
+        ) {
+            let mut out = job_outs.pop().unwrap_or_else(|| Vec::with_capacity(64));
+            out.clear();
+            jobs.push(MoveJob {
                 receiver,
                 listed,
                 view: t.view.get(&receiver).copied(),
                 row: self.connections.remove(&receiver).unwrap_or_default(),
                 // A receiver is sent a few dozen in a crowd: no growing by doubling.
-                out: Vec::with_capacity(64),
-            })
-            .collect();
+                out,
+            });
+        }
         // The transmitters as the rows meet them: player, number, block, and the update packet.
-        let sources: Vec<Option<Src>> = self
-            .waypoints
-            .iter()
-            .map(|u| {
-                t.s.players.get(u).map(|&p| Src {
-                    source: Source::of(t.s.id(*u), p),
-                    player: p,
-                    shared: OnceLock::new(),
-                })
+        let mut sources = std::mem::take(&mut self.sources_scratch);
+        sources.clear();
+        sources.extend(self.waypoints.iter().map(|u| {
+            t.s.player(*u).map(|p| Src {
+                source: Source::of(t.s.id(*u), p),
+                uuid: *u,
+                shared: OnceLock::new(),
             })
-            .collect();
-        let mut slot = vec![NONE; self.next_id as usize];
+        }));
+        let mut slot = std::mem::take(&mut self.slot_scratch);
+        slot.resize(self.next_id as usize, NONE);
+        slot.fill(NONE);
         for (i, src) in sources.iter().enumerate() {
             if let Some(src) = src {
                 slot[src.source.id as usize] = i as u32;
@@ -1181,15 +1232,22 @@ impl Waypoints {
         // number; where each receiver's own move is.
         let sparse = sparse && sources.iter().all(Option::is_some);
         #[cfg(test)]
-        let sparse = sparse && !tests::NO_SPARSE.load(std::sync::atomic::Ordering::Relaxed);
+        let sparse = sparse
+            && !self.force_dense_for_test
+            && !tests::NO_SPARSE.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         if sparse {
             tests::SPARSE_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let mut changed_moves: Vec<u32> = Vec::new();
-        let mut changed_slots: Vec<u32> = Vec::new();
-        let mut move_of = vec![NONE; self.next_id as usize];
-        let mut own: HashMap<u128, u32> = HashMap::default();
+        let mut changed_moves = std::mem::take(&mut self.changed_moves_scratch);
+        changed_moves.clear();
+        let mut changed_slots = std::mem::take(&mut self.changed_slots_scratch);
+        changed_slots.clear();
+        let mut move_of = std::mem::take(&mut self.move_of_scratch);
+        move_of.resize(self.next_id as usize, NONE);
+        move_of.fill(NONE);
+        let mut own = std::mem::take(&mut self.own_scratch);
+        own.clear();
         if sparse {
             for (i, m) in moves.iter().enumerate() {
                 own.insert(m.uuid, i as u32);
@@ -1209,133 +1267,149 @@ impl Waypoints {
             }
             changed_slots.sort_unstable();
         }
-        let all_moves: Vec<u32> = if sparse {
-            Vec::new()
-        } else {
-            (0..moves.len() as u32).collect()
-        };
-        let all_slots: Vec<u32> = if sparse {
-            Vec::new()
-        } else {
-            (0..sources.len() as u32).collect()
-        };
-        let epoch = self.epoch + 1;
-        let (s, waypoints, moves) = (&t.s, &self.waypoints, &moves);
-        let (sources, slot, move_of, own) = (&sources, &slot, &move_of, &own);
-        let (changed_moves, changed_slots) = (&changed_moves, &changed_slots);
-        let (all_moves, all_slots) = (&all_moves, &all_slots);
-        horizon_threads::par_chunks_mut(&mut jobs, 8, |jobs| {
-            for job in jobs {
-                let me = s.players.get(&job.receiver).map(|&p| Receiver {
-                    conn: p.conn,
-                    position: p.position,
-                    range: p.receive_range,
-                    spectator: p.spectator,
-                });
-                // The moves this row meets, in order, and the waypoints it sweeps: everything, or in a
-                // calm tick what changed, the pairs this row has no block connection for, and its own.
-                let mut own_moves: Vec<u32> = Vec::new();
-                let mut own_slots: Vec<u32> = Vec::new();
-                if sparse {
-                    let own_id = s.id(job.receiver);
-                    let watch = job.row.watch_for(epoch, own_id, sources);
-                    for &id in watch {
-                        if let Some(&mi) = move_of.get(id as usize)
-                            && mi != NONE
-                        {
-                            let m = &moves[mi as usize];
-                            if m.ticked && m.transmits && !m.block_changed {
-                                own_moves.push(mi);
-                            }
-                        }
-                        own_slots.push(slot[id as usize]);
-                    }
-                    if let Some(&mi) = own.get(&job.receiver)
-                        && changed_moves.binary_search(&mi).is_err()
-                    {
-                        own_moves.push(mi);
-                    }
-                    own_slots.retain(|k| changed_slots.binary_search(k).is_err());
-                    if !own_moves.is_empty() {
-                        own_moves.extend_from_slice(changed_moves);
-                        own_moves.sort_unstable();
-                    }
-                    if !own_slots.is_empty() {
-                        own_slots.extend_from_slice(changed_slots);
-                        own_slots.sort_unstable();
-                    }
-                }
-                let (meet, swept): (&[u32], &[u32]) = if !sparse {
-                    (all_moves, all_slots)
-                } else {
-                    (
-                        if own_moves.is_empty() {
-                            changed_moves
-                        } else {
-                            &own_moves
-                        },
-                        if own_slots.is_empty() {
-                            changed_slots
-                        } else {
-                            &own_slots
-                        },
-                    )
-                };
-                let mut to = Receiving {
-                    receiver: job.receiver,
-                    view: job.view,
-                    row: &mut job.row,
-                    out: &mut job.out,
-                };
-                for &mi in meet {
-                    let m = &moves[mi as usize];
-                    if m.uuid != job.receiver {
-                        // `updateWaypoint`: this receiver's connection to the mover.
-                        if job.listed && m.ticked && m.transmits {
-                            // Most movers stay in their block: nothing to send or remake.
-                            let done = me.as_ref().is_some_and(|me| {
-                                Shared::quiet(to.row, &m.source, me)
-                                    || slot
-                                        .get(m.source.id as usize)
-                                        .and_then(|&i| sources.get(i as usize)?.as_ref())
-                                        .is_some_and(|src| Shared::step(to.row, src, me, to.out))
-                            });
-                            if !done {
-                                s.update_or_create(&mut to, m.uuid);
-                            }
-                        }
-                        continue;
-                    }
-                    // `updatePlayer` before and after the view follows the move.
-                    let sweep = |to: &mut Receiving| {
-                        for &k in swept {
-                            let (source, known) = (waypoints[k as usize], &sources[k as usize]);
-                            if let (Some(src), Some(me)) = (known, &me)
-                                && (Shared::quiet(to.row, &src.source, me)
-                                    || Shared::step(to.row, src, me, to.out))
-                            {
-                                continue;
-                            }
-                            s.update_or_create(to, source);
-                        }
-                    };
-                    if m.ticked && m.receives {
-                        sweep(&mut to);
-                    }
-                    if m.new_view.is_some() {
-                        to.view = m.new_view;
-                    }
-                    if m.receives {
-                        sweep(&mut to);
-                    }
-                }
-            }
-        });
-        t.out.reserve(jobs.iter().map(|j| j.out.len()).sum());
-        for job in jobs {
-            t.out.extend(job.out);
-            self.connections.insert(job.receiver, job.row);
+        let mut all_moves = std::mem::take(&mut self.all_moves_scratch);
+        all_moves.clear();
+        let mut all_slots = std::mem::take(&mut self.all_slots_scratch);
+        all_slots.clear();
+        if !sparse {
+            all_moves.extend(0..moves.len() as u32);
+            all_slots.extend(0..sources.len() as u32);
         }
+        let epoch = self.epoch + 1;
+        let (s, waypoints, moves_ref) = (&t.s, &self.waypoints, &moves);
+        let (sources_ref, slot_ref, move_of_ref, own_ref) = (&sources, &slot, &move_of, &own);
+        let (changed_moves_ref, changed_slots_ref) = (&changed_moves, &changed_slots);
+        let (all_moves_view, all_slots_view) = (&all_moves, &all_slots);
+        crate::parallel::par_chunks_mut_with_state(
+            &mut jobs,
+            8,
+            || (Vec::<u32>::new(), Vec::<u32>::new()),
+            |jobs, (own_moves, own_slots)| {
+                for job in jobs {
+                    own_moves.clear();
+                    own_slots.clear();
+                    let me = s.player(job.receiver).map(|p| Receiver {
+                        conn: p.conn,
+                        position: p.position,
+                        range: p.receive_range,
+                        spectator: p.spectator,
+                    });
+                    // The moves this row meets, in order, and the waypoints it sweeps: everything, or in a
+                    // calm tick what changed, the pairs this row has no block connection for, and its own.
+                    if sparse {
+                        let own_id = s.id(job.receiver);
+                        let watch = job.row.watch_for(epoch, own_id, sources_ref);
+                        for &id in watch {
+                            if let Some(&mi) = move_of_ref.get(id as usize)
+                                && mi != NONE
+                            {
+                                let m = &moves_ref[mi as usize];
+                                if m.ticked && m.transmits && !m.block_changed {
+                                    own_moves.push(mi);
+                                }
+                            }
+                            own_slots.push(slot_ref[id as usize]);
+                        }
+                        if let Some(&mi) = own_ref.get(&job.receiver)
+                            && changed_moves_ref.binary_search(&mi).is_err()
+                        {
+                            own_moves.push(mi);
+                        }
+                        own_slots.retain(|k| changed_slots_ref.binary_search(k).is_err());
+                        if !own_moves.is_empty() {
+                            own_moves.extend_from_slice(changed_moves_ref);
+                            own_moves.sort_unstable();
+                        }
+                        if !own_slots.is_empty() {
+                            own_slots.extend_from_slice(changed_slots_ref);
+                            own_slots.sort_unstable();
+                        }
+                    }
+                    let (meet, swept): (&[u32], &[u32]) = if !sparse {
+                        (all_moves_view, all_slots_view)
+                    } else {
+                        (
+                            if own_moves.is_empty() {
+                                changed_moves_ref
+                            } else {
+                                &own_moves
+                            },
+                            if own_slots.is_empty() {
+                                changed_slots_ref
+                            } else {
+                                &own_slots
+                            },
+                        )
+                    };
+                    let mut to = Receiving {
+                        receiver: job.receiver,
+                        view: job.view,
+                        row: &mut job.row,
+                        out: &mut job.out,
+                    };
+                    for &mi in meet {
+                        let m = &moves_ref[mi as usize];
+                        if m.uuid != job.receiver {
+                            // `updateWaypoint`: this receiver's connection to the mover.
+                            if job.listed && m.ticked && m.transmits {
+                                // Most movers stay in their block: nothing to send or remake.
+                                let done = me.as_ref().is_some_and(|me| {
+                                    Shared::quiet(to.row, &m.source, me)
+                                        || slot_ref
+                                            .get(m.source.id as usize)
+                                            .and_then(|&i| sources_ref.get(i as usize)?.as_ref())
+                                            .is_some_and(|src| s.step(to.row, src, me, to.out))
+                                });
+                                if !done {
+                                    s.update_or_create(&mut to, m.uuid);
+                                }
+                            }
+                            continue;
+                        }
+                        // `updatePlayer` before and after the view follows the move.
+                        let sweep = |to: &mut Receiving| {
+                            for &k in swept {
+                                let (source, known) =
+                                    (waypoints[k as usize], &sources_ref[k as usize]);
+                                if let (Some(src), Some(me)) = (known, &me)
+                                    && (Shared::quiet(to.row, &src.source, me)
+                                        || s.step(to.row, src, me, to.out))
+                                {
+                                    continue;
+                                }
+                                s.update_or_create(to, source);
+                            }
+                        };
+                        if m.ticked && m.receives {
+                            sweep(&mut to);
+                        }
+                        if m.new_view.is_some() {
+                            to.view = m.new_view;
+                        }
+                        if m.receives {
+                            sweep(&mut to);
+                        }
+                    }
+                }
+            },
+        );
+        t.out.reserve(jobs.iter().map(|j| j.out.len()).sum());
+        for mut job in jobs.drain(..) {
+            t.out.extend(job.out.drain(..));
+            self.connections.insert(job.receiver, job.row);
+            job_outs.push(job.out);
+        }
+        self.job_out_scratch = job_outs;
+        self.jobs_scratch = jobs;
+        self.sources_scratch = sources;
+        self.move_scratch = moves;
+        self.slot_scratch = slot;
+        self.move_of_scratch = move_of;
+        self.changed_moves_scratch = changed_moves;
+        self.changed_slots_scratch = changed_slots;
+        self.all_moves_scratch = all_moves;
+        self.all_slots_scratch = all_slots;
+        self.own_scratch = own;
     }
     /// Whether this tick's moves can be met by what changed alone. A pair neither of whose players
     /// changed block, and whose connection is a block one in range, has nothing to send: the check
@@ -1393,6 +1467,91 @@ mod tests {
                 other => panic!("{other:?}"),
             })
             .collect()
+    }
+
+    #[test]
+    fn dense_waypoint_sweeps_reuse_their_index_buffers() {
+        let mut waypoints = Waypoints::default();
+        waypoints.force_dense_for_test = true;
+        let mut players = vec![
+            player(1, 10, [0.5, 100.0, 0.5]),
+            player(2, 20, [5.5, 100.0, 0.5]),
+        ];
+        // Use a zero threshold to exercise the receiver sweep without a large fixture.
+        waypoints.tick_with(&players, &[], &[], true, 0);
+        players[0].position[0] += 1.0;
+        waypoints.tick_with(&players, &[], &[], true, 0);
+        let capacities = (
+            waypoints.all_moves_scratch.capacity(),
+            waypoints.all_slots_scratch.capacity(),
+            waypoints.view_scratch.capacity(),
+            waypoints.updates_scratch.capacity(),
+            waypoints.sources_scratch.capacity(),
+            waypoints.player_indices.capacity(),
+        );
+        assert!(capacities.iter().all(|&capacity| capacity > 0));
+        let mut job_capacities: Vec<_> = waypoints
+            .job_out_scratch
+            .iter()
+            .map(Vec::capacity)
+            .collect();
+        job_capacities.sort_unstable();
+        assert_eq!(job_capacities.len(), 2);
+        assert!(job_capacities.iter().all(|&capacity| capacity >= 64));
+        let job_list_capacity = waypoints.jobs_scratch.capacity();
+        assert!(job_list_capacity >= 2);
+        // Reorder the input slice before the next moved player: the retained
+        // UUID index must be rebuilt for the new positions, not reused stale.
+        players.swap(0, 1);
+        players[0].position[0] += 1.0;
+        waypoints.tick_with(&players, &[], &[], true, 0);
+        assert_eq!(
+            (
+                waypoints.all_moves_scratch.capacity(),
+                waypoints.all_slots_scratch.capacity(),
+                waypoints.view_scratch.capacity(),
+                waypoints.updates_scratch.capacity(),
+                waypoints.sources_scratch.capacity(),
+                waypoints.player_indices.capacity(),
+            ),
+            capacities,
+            "successive dense sweeps reuse both index buffers"
+        );
+        let mut next_job_capacities: Vec<_> = waypoints
+            .job_out_scratch
+            .iter()
+            .map(Vec::capacity)
+            .collect();
+        next_job_capacities.sort_unstable();
+        assert_eq!(
+            next_job_capacities, job_capacities,
+            "receiver packet buffers retain their capacities across ticks"
+        );
+        assert!(
+            waypoints.jobs_scratch.capacity() >= job_list_capacity,
+            "the receiver job vector itself is reused"
+        );
+    }
+
+    #[test]
+    fn departed_player_scratch_reuses_its_capacity() {
+        let mut waypoints = Waypoints::default();
+        let a = player(1, 10, [0.5, 100.0, 0.5]);
+        let b = player(2, 20, [5.5, 100.0, 0.5]);
+        let c = player(3, 30, [10.5, 100.0, 0.5]);
+        waypoints.tick(&[a.clone(), b.clone(), c], &[], true);
+        waypoints.tick(&[a.clone(), b.clone()], &[], true);
+        let capacity = waypoints.gone_scratch.capacity();
+        assert!(
+            capacity > 0,
+            "removing a player should populate the scratch list"
+        );
+        waypoints.tick(&[a], &[], true);
+        assert_eq!(
+            waypoints.gone_scratch.capacity(),
+            capacity,
+            "the next removal reuses the departed-player list"
+        );
     }
 
     #[test]

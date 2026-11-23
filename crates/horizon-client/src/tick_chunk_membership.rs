@@ -1,7 +1,7 @@
 //! Tick scheduler membership, invalidated by resident key changes or resets.
 use crate::{
     chunk_map::{ChunkMap, ChunkMembershipDelta},
-    fast_hash::FxHashSet,
+    fast_hash::{FxHashMap, FxHashSet},
 };
 
 type Key = (i32, i32);
@@ -12,6 +12,11 @@ pub struct TickChunkMembership {
     revision: Option<u64>,
     added: Vec<Key>,
     removed: Vec<Key>,
+    /// Positions make a burst of add/remove cancellations linear rather than quadratic.
+    added_positions: FxHashMap<Key, usize>,
+    removed_positions: FxHashMap<Key, usize>,
+    /// A removal that cancelled an addition must restore the chunk's saved-tick wait state.
+    removed_waiting: FxHashSet<Key>,
     /// Loaded chunks with saved ticks that have not started ticking yet
     /// (`LevelChunkTicks.pendingTicks`, unpacked by `startTickingChunk`).
     waiting: FxHashSet<Key>,
@@ -25,6 +30,9 @@ impl TickChunkMembership {
         self.revision = None;
         self.added.clear();
         self.removed.clear();
+        self.added_positions.clear();
+        self.removed_positions.clear();
+        self.removed_waiting.clear();
         self.waiting.clear();
     }
 
@@ -37,33 +45,45 @@ impl TickChunkMembership {
         }
         self.added.clear();
         self.removed.clear();
+        self.added_positions.clear();
+        self.removed_positions.clear();
+        self.removed_waiting.clear();
 
         if let Some(deltas) = self.revision.and_then(|rev| chunks.deltas_since(rev)) {
-            let mut removed_waiting = FxHashSet::default();
             for (_, delta) in deltas {
                 match delta {
                     ChunkMembershipDelta::Added(key) => {
-                        if let Some(pos) = self.removed.iter().position(|&k| k == key) {
+                        if let Some(pos) = self.removed_positions.remove(&key) {
                             // The chunk is back where it was: the removal it
                             // cancels is no news, and it keeps its saved ticks.
-                            self.removed.swap_remove(pos);
+                            let removed = self.removed.swap_remove(pos);
+                            debug_assert_eq!(removed, key);
+                            if pos < self.removed.len() {
+                                self.removed_positions.insert(self.removed[pos], pos);
+                            }
                             self.keys.insert(key);
-                            if removed_waiting.remove(&key) {
+                            if self.removed_waiting.remove(&key) {
                                 self.waiting.insert(key);
                             }
                         } else if self.keys.insert(key) {
+                            self.added_positions.insert(key, self.added.len());
                             self.added.push(key);
                         }
                     }
                     ChunkMembershipDelta::Removed(key) => {
-                        if let Some(pos) = self.added.iter().position(|&k| k == key) {
-                            self.added.swap_remove(pos);
+                        if let Some(pos) = self.added_positions.remove(&key) {
+                            let removed = self.added.swap_remove(pos);
+                            debug_assert_eq!(removed, key);
+                            if pos < self.added.len() {
+                                self.added_positions.insert(self.added[pos], pos);
+                            }
                             self.keys.remove(&key);
                             self.waiting.remove(&key);
                         } else if self.keys.remove(&key) {
+                            self.removed_positions.insert(key, self.removed.len());
                             self.removed.push(key);
                             if self.waiting.remove(&key) {
-                                removed_waiting.insert(key);
+                                self.removed_waiting.insert(key);
                             }
                         }
                     }
@@ -305,6 +325,43 @@ mod tests {
                     assert_eq!(new.chunk(pos).is_some(), map.contains_key(&key));
                 }
             }
+        }
+    }
+
+    /// A whole batch of unload/reload pairs cancels without quadratic scans or losing saved waits.
+    #[test]
+    fn bulk_unload_reload_cancellations_preserve_waiting_membership() {
+        let mut map = ChunkMap::default();
+        let chunk = Arc::new(Chunk::empty(0, 0));
+        let mut cache = TickChunkMembership::default();
+        let keys: Vec<Key> = (0..100).map(|i| (i - 50, i * 3 - 170)).collect();
+
+        for &key in &keys {
+            map.insert(key, chunk.clone());
+        }
+        assert!(cache.synchronize(&map));
+        let added = cache.take_added();
+        cache.recycle_added(added);
+
+        for (i, &key) in keys.iter().enumerate() {
+            if i % 2 == 0 {
+                cache.wait(key);
+            }
+        }
+        for &key in &keys {
+            map.remove(&key);
+        }
+        for &key in &keys {
+            map.insert(key, chunk.clone());
+        }
+
+        assert!(cache.synchronize(&map));
+        assert!(cache.take_added().is_empty());
+        assert!(cache.removed().is_empty());
+        assert_eq!(cache.keys.len(), keys.len());
+        assert_eq!(cache.waiting.len(), keys.len() / 2);
+        for (i, &key) in keys.iter().enumerate() {
+            assert_eq!(cache.waiting.contains(&key), i % 2 == 0);
         }
     }
 

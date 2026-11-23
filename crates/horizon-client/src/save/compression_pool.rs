@@ -214,21 +214,27 @@ pub fn compress_records_with_pool(
         return records.iter().map(|(_, r)| compress(r)).collect();
     }
     let records_arc: Arc<[Record]> = records.iter().map(|(_, r)| (*r).clone()).collect();
-    let results: Arc<Mutex<Vec<Option<io::Result<Option<ChunkRecord>>>>>> =
-        Arc::new(Mutex::new((0..count).map(|_| None).collect()));
+    // Each worker owns one result index. Independent slots avoid making
+    // finished compression jobs contend on one batch-wide result mutex.
+    let results: Arc<Vec<Mutex<Option<io::Result<Option<ChunkRecord>>>>>> =
+        Arc::new((0..count).map(|_| Mutex::new(None)).collect());
 
     let recs = Arc::clone(&records_arc);
-    let res_lock = Arc::clone(&results);
+    let res_slots = Arc::clone(&results);
     pool.run(count, move |i| {
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compress(&recs[i])))
             .unwrap_or_else(|_| Err(io::Error::other("chunk compression worker panicked")));
-        res_lock.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(res);
+        *res_slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
     });
 
-    let mut guard = results.lock().unwrap_or_else(|e| e.into_inner());
-    guard
-        .drain(..)
-        .map(|opt| opt.unwrap_or_else(|| Err(io::Error::other("compression slot unpopulated"))))
+    results
+        .iter()
+        .map(|slot| {
+            slot.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .unwrap_or_else(|| Err(io::Error::other("compression slot unpopulated")))
+        })
         .collect()
 }
 

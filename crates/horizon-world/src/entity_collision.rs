@@ -56,6 +56,7 @@ pub fn entity_collision_shapes<W: EntityCollisionWorld>(
         .collision_candidates(source, query)
         .map_err(EntityCollisionError::World)?;
     let mut selected = Vec::new();
+    let mut shape_error = None;
     for candidate in candidates {
         if source == Some(candidate.identity)
             || !candidate.bounds.intersects(query)
@@ -66,12 +67,19 @@ pub fn entity_collision_shapes<W: EntityCollisionWorld>(
         if world
             .can_collide(source, candidate.identity)
             .map_err(EntityCollisionError::World)?
+            && shape_error.is_none()
         {
-            selected.push(candidate.bounds);
+            match VoxelShape::from_box(candidate.bounds) {
+                Ok(shape) => selected.push(shape),
+                Err(error) => shape_error = Some(error),
+            }
         }
     }
-    selected
-        .into_iter()
-        .map(|bounds| VoxelShape::from_box(bounds).map_err(EntityCollisionError::Shape))
-        .collect()
+    // can_collide for every candidate historically ran before the selected
+    // bounds were converted into shapes. Defer a shape error until that pass
+    // is complete, preserving both callback order and error precedence.
+    if let Some(error) = shape_error {
+        return Err(EntityCollisionError::Shape(error));
+    }
+    Ok(selected)
 }

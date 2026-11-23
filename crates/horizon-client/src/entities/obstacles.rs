@@ -13,32 +13,56 @@ pub struct ObstacleGrid {
     /// when none was given.
     roots: Vec<Option<u32>>,
     found: Vec<u32>,
+    spare: Vec<Vec<u32>>,
 }
 impl ObstacleGrid {
     const CELL: f64 = 8.0;
     pub fn new(boxes: Vec<Aabb>) -> Self {
-        Self::with_roots(boxes, Vec::new())
+        let mut grid = Self::default();
+        grid.rebuild(boxes);
+        grid
+    }
+    /// Rebuilds the grid without discarding bucket allocations.
+    pub fn rebuild(&mut self, boxes: Vec<Aabb>) {
+        self.rebuild_with_roots(boxes, Vec::new());
     }
     /// [`Self::new`] with the vehicle at the bottom of what each box's entity
     /// rides (`roots[i]` for `boxes[i]`), so [`Self::near_except`] can leave a
     /// mover's own riders out.
     pub fn with_roots(boxes: Vec<Aabb>, roots: Vec<Option<u32>>) -> Self {
-        let mut cells: FxHashMap<(i32, i32, i32), Vec<u32>> = Default::default();
-        for (i, b) in boxes.iter().enumerate() {
+        let mut grid = Self::default();
+        grid.rebuild_with_roots(boxes, roots);
+        grid
+    }
+    /// Rebuilds cells and entity boxes while retaining previous bucket storage.
+    pub fn rebuild_with_roots(&mut self, boxes: Vec<Aabb>, roots: Vec<Option<u32>>) {
+        self.spare.reserve(self.cells.len());
+        for (_, mut bucket) in self.cells.drain() {
+            bucket.clear();
+            self.spare.push(bucket);
+        }
+        self.boxes.clear();
+        self.boxes.extend(boxes);
+        self.roots.clear();
+        self.roots.extend(roots);
+        self.found.clear();
+        self.cells.reserve(self.boxes.len());
+        for (i, b) in self.boxes.iter().enumerate() {
             let (lo, hi) = Self::span(*b);
             for x in lo.0..=hi.0 {
                 for y in lo.1..=hi.1 {
                     for z in lo.2..=hi.2 {
-                        cells.entry((x, y, z)).or_default().push(i as u32);
+                        let key = (x, y, z);
+                        if !self.cells.contains_key(&key) {
+                            self.cells.insert(key, self.spare.pop().unwrap_or_default());
+                        }
+                        self.cells
+                            .get_mut(&key)
+                            .expect("obstacle cell inserted")
+                            .push(i as u32);
                     }
                 }
             }
-        }
-        Self {
-            cells,
-            boxes,
-            roots,
-            found: Vec::new(),
         }
     }
     fn span(b: Aabb) -> ((i32, i32, i32), (i32, i32, i32)) {

@@ -1794,8 +1794,8 @@ struct MeshInput {
     /// The tile's samples, with `overrides` replacing some of them.
     base: Arc<TileColumns>,
     overrides: [Option<ColumnSource>; CELLS * CELLS],
-    neighbors: [Vec<EdgeSource>; 4],
-    finer: Vec<TileKey>,
+    neighbors: [smallvec::SmallVec<[EdgeSource; 4]>; 4],
+    finer: smallvec::SmallVec<[TileKey; 4]>,
 }
 struct ReducedColumns {
     columns: Arc<TileColumns>,
@@ -1819,7 +1819,7 @@ impl MeshInput {
             None => self.base.spans(index),
         })
     }
-    fn edges(&self) -> [Vec<mesh::EdgeColumn<'_>>; 4] {
+    fn edges(&self) -> [mesh::EdgeColumns<'_>; 4] {
         std::array::from_fn(|side| {
             self.neighbors[side]
                 .iter()
@@ -1943,7 +1943,7 @@ struct MeshJob {
     snapshot: Arc<Snapshot>,
     key: TileKey,
     version: u64,
-    finer: Vec<TileKey>,
+    finer: smallvec::SmallVec<[TileKey; 4]>,
     covered: Arc<FxHashSet<(i32, i32)>>,
     bounds: Option<[i32; 4]>,
     canceled: Arc<AtomicBool>,
@@ -2049,6 +2049,9 @@ pub struct Lod {
     reduced_detail: bool,
     pending: FxHashSet<TileKey>,
     detail_masks: FxHashMap<TileKey, [u64; 4]>,
+    /// Reused candidates and deduplication set for periodic near-detail requests.
+    detail_request_keys_scratch: Vec<TileKey>,
+    detail_request_chunks_scratch: FxHashSet<(i32, i32)>,
     detail_request_pending: bool,
     /// Detail and visited summaries past a frame's [`DETAIL_BUDGET`], applied
     /// on the frames after it. Bounded by what the worker sends: a detail
@@ -2084,6 +2087,8 @@ pub struct Lod {
     mesh_samples: samples::Samples,
     /// Tiles needing a mesh, with the revision their job must carry.
     dirty: FxHashMap<TileKey, u64>,
+    /// Reused list of ready dirty tiles submitted to the mesh workers.
+    dispatch_keys_scratch: Vec<(TileKey, u64)>,
     /// The newest revision of each active tile's mesh.
     mesh_version: FxHashMap<TileKey, u64>,
     /// The newest revision accepted by the renderer for each active tile.
@@ -2103,10 +2108,18 @@ pub struct Lod {
     /// Tiles that left the selection. The renderer may only fade them out
     /// once every active tile overlapping them has its mesh, or a hole opens.
     removed_pending: FxHashSet<TileKey>,
+    /// Scratch for the ancestor blocking check and pending-key iteration.
+    release_blocked_scratch: FxHashSet<TileKey>,
+    release_pending_scratch: Vec<TileKey>,
     /// Released removals, returned to the renderer this update.
     removed: Vec<TileKey>,
     /// The columns left out: `full` and `retiring`.
     covered: Arc<FxHashSet<(i32, i32)>>,
+    /// Reusable next-set and delta lists for coverage changes.
+    covered_scratch: FxHashSet<(i32, i32)>,
+    covered_added_scratch: Vec<(i32, i32)>,
+    covered_changes_scratch: Vec<(i32, i32)>,
+    covered_standins_scratch: Vec<TileKey>,
     covered_bounds: Option<[i32; 4]>,
     /// The full-detail columns `update` was last given.
     full: FxHashSet<(i32, i32)>,
@@ -2124,6 +2137,12 @@ pub struct Lod {
     cutout_pending: Option<Arc<FxHashSet<(i32, i32)>>>,
     /// Active tiles whose mesh must be accepted before the cutout publishes.
     cutout_waiting: FxHashSet<TileKey>,
+    /// The previous active set, swapped with the current set during a rebuild.
+    selection_old_active_scratch: FxHashSet<TileKey>,
+    /// Reusable tile-key lists used only when the selection is rebuilt.
+    selection_keys_scratch: Vec<TileKey>,
+    selection_inactive_scratch: Vec<TileKey>,
+    selection_changed_scratch: Vec<TileKey>,
     /// Unsample final tiles, nearest first. Rebuilt when the view changes,
     /// not scanned every frame.
     wanted: std::collections::BinaryHeap<std::cmp::Reverse<Wanted>>,
@@ -2136,6 +2155,15 @@ pub struct Lod {
     kept: kept::KeptTiles,
     /// Kept tiles the plan wants again, not taken back yet (`bring_back`).
     returning: Vec<TileKey>,
+    /// Reused list of the coarsest returning tiles being brought back this update.
+    returning_now_scratch: Vec<TileKey>,
+    /// Queued sample keys removed while holding or rebuilding the view.
+    dropped_samples_scratch: Vec<TileKey>,
+    /// Reusable lists for the infrequent view-plan rebuild.
+    replan_gone_scratch: Vec<TileKey>,
+    replan_leaving_scratch: Vec<TileKey>,
+    replan_seam_scratch: Vec<TileKey>,
+    replan_standins_scratch: Vec<TileKey>,
     /// When the plan last asked kept tiles back (`RETURN_SEAM_WAIT`).
     returned_at: std::time::Instant,
     /// `LodSource::keeps_observed`: tiles sampled without an observed chunk
@@ -2465,6 +2493,8 @@ impl Lod {
             plan: Plan::default(),
             pending: FxHashSet::default(),
             detail_masks: FxHashMap::default(),
+            detail_request_keys_scratch: Vec::new(),
+            detail_request_chunks_scratch: FxHashSet::default(),
             detail_request_pending: false,
             detail_backlog: std::collections::VecDeque::new(),
             refreshes: 0,
@@ -2480,6 +2510,7 @@ impl Lod {
             active: FxHashSet::default(),
             mesh_samples: samples::Samples::default(),
             dirty: FxHashMap::default(),
+            dispatch_keys_scratch: Vec::new(),
             mesh_version: FxHashMap::default(),
             shown_version: FxHashMap::default(),
             mesh_cancel: FxHashMap::default(),
@@ -2489,16 +2520,26 @@ impl Lod {
             meshed: FxHashSet::default(),
             unmeshed: FxHashSet::default(),
             removed_pending: FxHashSet::default(),
+            release_blocked_scratch: FxHashSet::default(),
+            release_pending_scratch: Vec::new(),
             stale: FxHashSet::default(),
             restale: FxHashSet::default(),
             removed: Vec::new(),
             covered: Arc::default(),
+            covered_scratch: FxHashSet::default(),
+            covered_added_scratch: Vec::new(),
+            covered_changes_scratch: Vec::new(),
+            covered_standins_scratch: Vec::new(),
             covered_bounds: None,
             full: FxHashSet::default(),
             retiring: FxHashSet::default(),
             cutout: None,
             cutout_pending: None,
             cutout_waiting: FxHashSet::default(),
+            selection_old_active_scratch: FxHashSet::default(),
+            selection_keys_scratch: Vec::new(),
+            selection_inactive_scratch: Vec::new(),
+            selection_changed_scratch: Vec::new(),
             wanted: std::collections::BinaryHeap::new(),
             wanted_at: None,
             wanted_stale: true,
@@ -2507,6 +2548,12 @@ impl Lod {
             saved_order: VecDeque::new(),
             kept: kept::KeptTiles::new(kept::KEPT_FOR, kept::KEPT_BYTES),
             returning: Vec::new(),
+            returning_now_scratch: Vec::new(),
+            dropped_samples_scratch: Vec::new(),
+            replan_gone_scratch: Vec::new(),
+            replan_leaving_scratch: Vec::new(),
+            replan_seam_scratch: Vec::new(),
+            replan_standins_scratch: Vec::new(),
             returned_at: std::time::Instant::now(),
             keeps_observed,
         }
@@ -3000,7 +3047,8 @@ impl Lod {
     }
     fn apply_detail(&mut self, (cx, cz): (i32, i32), columns: &ReducedColumns) {
         self.apply_fine((cx, cz), &columns.columns);
-        let mut modified = Vec::new();
+        // At most one tile per level is touched below (four levels total).
+        let mut modified = smallvec::SmallVec::<[TileKey; 4]>::new();
         // A single generated chunk cannot describe a larger cell's area
         // (strides over 16 blocks, levels over 4); level 0 was applied above.
         // At each level up to 4, only the tile holding the chunk overlaps it.
@@ -3190,11 +3238,18 @@ impl Lod {
             // must not wait behind it. Larger machines keep its first
             // `SAMPLE_JOBS`, small ones none.
             let mut keep = if self.small { 0 } else { SAMPLE_JOBS };
-            let dropped = drop_queued_samples(&self.shared, &mut self.pending, |_| {
-                let kept = keep > 0;
-                keep = keep.saturating_sub(1);
-                kept
-            });
+            let mut dropped = std::mem::take(&mut self.dropped_samples_scratch);
+            dropped.clear();
+            drop_queued_samples_into(
+                &self.shared,
+                &mut self.pending,
+                |_| {
+                    let kept = keep > 0;
+                    keep = keep.saturating_sub(1);
+                    kept
+                },
+                &mut dropped,
+            );
             // Sampled again from the queue: they read what `refresh` announced.
             for key in &dropped {
                 self.restale.remove(key);
@@ -3203,7 +3258,7 @@ impl Lod {
             // start and stop loading every few frames, and rebuilding the whole
             // queue each time cost more than the samples it held back.
             let camera = self.plan.camera;
-            self.wanted.extend(dropped.into_iter().map(|key| {
+            self.wanted.extend(dropped.drain(..).map(|key| {
                 let class = if self.plan.split.contains(&key) {
                     BACKDROP
                 } else if key.reach(camera) < self.plan.first {
@@ -3219,6 +3274,7 @@ impl Lod {
                     level: key.level,
                 })
             }));
+            self.dropped_samples_scratch = dropped;
             // A sample may still be running: the held pace starts from now.
             self.held_sample_at = std::time::Instant::now();
         }
@@ -3245,14 +3301,17 @@ impl Lod {
         {
             return;
         }
-        let mut keys: Vec<_> = self
-            .active
-            .iter()
-            .filter(|key| {
-                self.wants_detail(key) && self.detail_masks.get(key) != Some(&[u64::MAX; 4])
-            })
-            .copied()
-            .collect();
+        self.detail_request_at = std::time::Instant::now();
+        let mut keys = std::mem::take(&mut self.detail_request_keys_scratch);
+        keys.clear();
+        keys.extend(
+            self.active
+                .iter()
+                .filter(|key| {
+                    self.wants_detail(key) && self.detail_masks.get(key) != Some(&[u64::MAX; 4])
+                })
+                .copied(),
+        );
         // Retiring fine columns are empty stand-ins, excluded from `active`
         // while their normal meshes still cover the gap. Request their detail
         // explicitly: neither the active-tile requests nor sampling an already
@@ -3264,8 +3323,9 @@ impl Lod {
             &self.detail_masks,
         ));
         keys.sort_unstable_by_key(|key| (key.distance(camera), *key));
-        let mut chunks = FxHashSet::default();
-        for key in keys {
+        let mut chunks_seen = std::mem::take(&mut self.detail_request_chunks_scratch);
+        chunks_seen.clear();
+        for &key in &keys {
             let [ox, _, oz] = key.origin();
             let stride = key.size() / 16;
             let mask = self.detail_masks.get(&key).copied().unwrap_or_default();
@@ -3279,15 +3339,17 @@ impl Lod {
                     if self.full.contains(&chunk) {
                         self.detail_masks.entry(key).or_default()[index / 64] |= 1 << (index % 64);
                     } else {
-                        chunks.insert(chunk);
+                        chunks_seen.insert(chunk);
                     }
                 }
             }
-            if chunks.len() >= DETAIL_REQUEST {
+            if chunks_seen.len() >= DETAIL_REQUEST {
                 break;
             }
         }
-        let mut chunks: Vec<_> = chunks.into_iter().collect();
+        let mut chunks: Vec<_> = chunks_seen.drain().collect();
+        self.detail_request_keys_scratch = keys;
+        self.detail_request_chunks_scratch = chunks_seen;
         chunks.sort_unstable_by_key(|&(x, z)| {
             let dx = i64::from(x * 16 + 8 - camera[0]);
             let dz = i64::from(z * 16 + 8 - camera[1]);
@@ -3390,61 +3452,80 @@ impl Lod {
         // A tile that leaves the range before it was drawn stops being
         // unknown to its neighbours (`Snapshot::planned_leaf`): they remesh
         // with walls against it, as against any terrain out of range.
-        let gone: Vec<_> = self
-            .plan
-            .nodes
-            .iter()
-            .filter(|key| !plan.nodes.contains(key) && !self.ready.contains_key(key))
-            .copied()
-            .collect();
+        let mut gone = std::mem::take(&mut self.replan_gone_scratch);
+        gone.clear();
+        gone.extend(
+            self.plan
+                .nodes
+                .iter()
+                .filter(|key| !plan.nodes.contains(key) && !self.ready.contains_key(key))
+                .copied(),
+        );
         self.plan = plan;
         self.kept.fit_to_view(self.plan.nodes.len());
         // Tiles leaving the plan are kept for a return, with their detail. Not
         // stale ones (their source has more), nor ones of cells a chunk wide or
         // less over the full-detail columns: never drawn there, they came back
         // as flat grey ground around the near terrain until it loaded.
-        let leaving: Vec<_> = self
-            .ready
-            .keys()
-            .filter(|key| !self.plan.nodes.contains(key))
-            .copied()
-            .collect();
-        for key in leaving {
+        let mut leaving = std::mem::take(&mut self.replan_leaving_scratch);
+        leaving.clear();
+        leaving.extend(
+            self.ready
+                .keys()
+                .filter(|key| !self.plan.nodes.contains(key))
+                .copied(),
+        );
+        for key in leaving.drain(..) {
             let columns = self.ready.remove(&key).unwrap();
             if !self.stale.contains(&key) && !self.over_covered(key) {
                 let mask = self.detail_masks.get(&key).copied();
                 self.kept.keep(key, columns, mask);
             }
         }
+        self.replan_leaving_scratch = leaving;
         self.kept.trim();
         // Those the plan wants again come back (`bring_back`) instead of being
         // sampled: a level at a time, coarsest first. Not at the seam with the
         // near chunks (`Plan::stands_in`), sampled first and fresh there: kept
         // ones drew grey ground and the near chunks' caves until they loaded.
-        let (returning, seam): (Vec<_>, Vec<_>) = self
-            .plan
-            .nodes
-            .iter()
-            .filter(|key| self.kept.contains(key) && !self.ready.contains_key(key))
-            .copied()
-            .partition(|key| self.plan.stands_in(*key));
-        for key in seam {
+        let mut returning = std::mem::take(&mut self.returning);
+        returning.clear();
+        let mut seam = std::mem::take(&mut self.replan_seam_scratch);
+        seam.clear();
+        for &key in self.plan.nodes.iter() {
+            if self.kept.contains(&key) && !self.ready.contains_key(&key) {
+                if self.plan.stands_in(key) {
+                    seam.push(key);
+                } else {
+                    returning.push(key);
+                }
+            }
+        }
+        for key in seam.drain(..) {
             self.kept.take(&key);
         }
         self.returning = returning;
+        self.replan_seam_scratch = seam;
         self.returned_at = std::time::Instant::now();
         let nodes = &self.plan.nodes;
         self.mesh_samples.retain(|key| nodes.contains(key));
         // Queued tiles the view left are not sampled; a running one is dropped (`finish_sample`).
-        drop_queued_samples(&self.shared, &mut self.pending, |key| {
-            self.plan.nodes.contains(key)
-        });
+        let mut dropped = std::mem::take(&mut self.dropped_samples_scratch);
+        dropped.clear();
+        drop_queued_samples_into(
+            &self.shared,
+            &mut self.pending,
+            |key| self.plan.nodes.contains(key),
+            &mut dropped,
+        );
+        self.dropped_samples_scratch = dropped;
         self.stale.retain(|key| self.plan.nodes.contains(key));
         self.restale.retain(|key| self.plan.nodes.contains(key));
         self.detail_masks
             .retain(|key, _| self.plan.nodes.contains(key));
         // Complete resident columns need no duplicate noise work.
-        let mut standins = Vec::new();
+        let mut standins = std::mem::take(&mut self.replan_standins_scratch);
+        standins.clear();
         let mut empty_standin: Option<Arc<TileColumns>> = None;
         for &key in &self.plan.by_level[0] {
             if self.covered.contains(&(key.x, key.z)) && !self.ready.contains_key(&key) {
@@ -3454,12 +3535,14 @@ impl Lod {
             }
         }
         self.rebuild_selection();
-        for key in standins {
+        for &key in &standins {
             self.refresh_path(key);
         }
-        for key in gone {
+        self.replan_standins_scratch = standins;
+        for key in gone.drain(..) {
             self.mark_side_neighbors_of(key);
         }
+        self.replan_gone_scratch = gone;
     }
     /// Whether a tile of cells a chunk wide or less lies over a covered column.
     fn over_covered(&self, key: TileKey) -> bool {
@@ -3510,73 +3593,91 @@ impl Lod {
         {
             return;
         }
-        let (now, later): (Vec<_>, Vec<_>) =
-            self.returning.drain(..).partition(|key| key.level == level);
-        self.returning = later;
+        let mut now = std::mem::take(&mut self.returning_now_scratch);
+        now.clear();
+        self.returning.retain(|key| {
+            if key.level == level {
+                now.push(*key);
+                false
+            } else {
+                true
+            }
+        });
         // Tiles forgotten meanwhile (`refresh`) are sampled: the queue skipped them.
         self.wanted_stale = true;
-        let mut returned = Vec::new();
-        for key in now {
-            if self.ready.contains_key(&key) || self.pending.contains(&key) {
-                continue;
+        now.retain(|key| {
+            if self.ready.contains_key(key) || self.pending.contains(key) {
+                return false;
             }
-            if let Some((columns, mask)) = self.kept.take(&key) {
-                self.ready.insert(key, columns);
-                self.sync_sample(key);
-                if let Some(mask) = mask {
-                    self.detail_masks.insert(key, mask);
-                }
-                returned.push(key);
+            let Some((columns, mask)) = self.kept.take(key) else {
+                return false;
+            };
+            self.ready.insert(*key, columns);
+            self.sync_sample(*key);
+            if let Some(mask) = mask {
+                self.detail_masks.insert(*key, mask);
             }
-        }
-        if returned.is_empty() {
+            true
+        });
+        if now.is_empty() {
+            self.returning_now_scratch = now;
             return;
         }
         self.rebuild_selection();
-        for key in returned {
+        for &key in &now {
             self.refresh_path(key);
         }
+        self.returning_now_scratch = now;
     }
     /// Recomputes every active tile after a plan change, then marks only the
     /// tiles whose selection changed (plus their neighbours).
     fn rebuild_selection(&mut self) {
         self.reselect = false;
-        let old = std::mem::take(&mut self.active);
+        let mut next_active = std::mem::take(&mut self.selection_old_active_scratch);
+        next_active.clear();
+        let old = std::mem::replace(&mut self.active, next_active);
         self.complete.clear();
         // The plan indexes nodes by level, children before parents. Plans
         // built by tests may not; sort those once.
-        let keys: Vec<TileKey> = if self.plan.by_level.iter().any(|level| !level.is_empty()) {
-            self.plan.by_level.iter().flatten().copied().collect()
+        let mut keys = std::mem::take(&mut self.selection_keys_scratch);
+        keys.clear();
+        if self.plan.by_level.iter().any(|level| !level.is_empty()) {
+            keys.extend(self.plan.by_level.iter().flatten().copied());
         } else {
-            let mut keys: Vec<_> = self.plan.nodes.iter().copied().collect();
+            keys.extend(self.plan.nodes.iter().copied());
             keys.sort_unstable_by_key(|key| (key.level, key.x, key.z));
-            keys
-        };
-        for key in keys {
+        }
+        for &key in &keys {
             let (complete, active) = self.evaluate(key);
             self.complete.insert(key, complete);
             if active {
                 self.active.insert(key);
             }
         }
+        self.selection_keys_scratch = keys;
         self.mesh_version.retain(|key, _| self.active.contains(key));
         self.shown_version
             .retain(|key, _| self.active.contains(key));
         self.dirty.retain(|key, _| self.active.contains(key));
         self.meshed.retain(|key| self.active.contains(key));
         self.unmeshed.retain(|key| self.active.contains(key));
-        let inactive_waiting: Vec<_> = self
-            .cutout_waiting
-            .iter()
-            .copied()
-            .filter(|key| !self.active.contains(key))
-            .collect();
-        for key in inactive_waiting {
+        let mut inactive_waiting = std::mem::take(&mut self.selection_inactive_scratch);
+        inactive_waiting.clear();
+        inactive_waiting.extend(
+            self.cutout_waiting
+                .iter()
+                .copied()
+                .filter(|key| !self.active.contains(key)),
+        );
+        for key in inactive_waiting.drain(..) {
             self.transfer_cutout_wait(key);
         }
+        self.selection_inactive_scratch = inactive_waiting;
         self.removed_pending
             .retain(|key| !self.active.contains(key));
-        let changed: Vec<_> = old.symmetric_difference(&self.active).copied().collect();
+        let mut changed = std::mem::take(&mut self.selection_changed_scratch);
+        changed.clear();
+        changed.extend(old.symmetric_difference(&self.active).copied());
         for &key in &changed {
             self.sync_sample(key);
             if old.contains(&key) && !self.active.contains(&key) {
@@ -3587,6 +3688,8 @@ impl Lod {
             }
             self.mark_selection_changed(key);
         }
+        self.selection_changed_scratch = changed;
+        self.selection_old_active_scratch = old;
         self.wanted_stale = true;
     }
     fn receive(&mut self, meshes: &mut Vec<(TileKey, SectionMesh)>) {
@@ -3704,34 +3807,38 @@ impl Lod {
             return;
         }
         let (plan, ready, masks) = (&self.plan, &self.ready, &self.detail_masks);
-        let keep: FxHashSet<_> = self
-            .retiring
-            .iter()
-            .copied()
-            .filter(|&column| {
-                // A saved summary alone is not detail: the tile may still be
-                // the empty covered stand-in. Only a completed mask proves
-                // its columns replaced the full-detail mesh.
-                !plan.replaces(column, ready, |key| masks.get(&key) == Some(&[u64::MAX; 4]))
-            })
-            .collect();
-        if keep.len() != self.retiring.len() {
-            self.retiring = keep;
+        let before = self.retiring.len();
+        self.retiring.retain(|&column| {
+            // A saved summary alone is not detail: the tile may still be
+            // the empty covered stand-in. Only a completed mask proves
+            // its columns replaced the full-detail mesh.
+            !plan.replaces(column, ready, |key| masks.get(&key) == Some(&[u64::MAX; 4]))
+        });
+        if self.retiring.len() != before {
             self.leave_out();
         }
     }
     fn leave_out(&mut self) {
-        let covered: FxHashSet<_> = self.full.union(&self.retiring).copied().collect();
-        if *self.covered == covered {
+        let mut covered = std::mem::take(&mut self.covered_scratch);
+        covered.clear();
+        covered.extend(self.full.union(&self.retiring).copied());
+        if self.covered.as_ref() == &covered {
+            self.covered_scratch = covered;
             return;
         }
-        let added: Vec<_> = covered.difference(&self.covered).copied().collect();
-        let changes: Vec<_> = self
-            .covered
-            .symmetric_difference(&covered)
-            .copied()
-            .collect();
-        self.covered = Arc::new(covered);
+        let mut added = std::mem::take(&mut self.covered_added_scratch);
+        added.clear();
+        added.extend(covered.difference(self.covered.as_ref()).copied());
+        let mut changes = std::mem::take(&mut self.covered_changes_scratch);
+        changes.clear();
+        changes.extend(
+            self.covered
+                .as_ref()
+                .symmetric_difference(&covered)
+                .copied(),
+        );
+        let old_covered = std::mem::replace(&mut self.covered, Arc::new(covered));
+        self.covered_scratch = Arc::try_unwrap(old_covered).unwrap_or_default();
         self.covered_bounds = self.covered.iter().fold(None, |bounds, &(x, z)| {
             Some(match bounds {
                 None => [x * 16, z * 16, (x + 1) * 16, (z + 1) * 16],
@@ -3746,7 +3853,8 @@ impl Lod {
         for &(x, z) in &changes {
             self.invalidate_chunk(x, z);
         }
-        let mut standins = Vec::new();
+        let mut standins = std::mem::take(&mut self.covered_standins_scratch);
+        standins.clear();
         let mut empty_standin: Option<Arc<TileColumns>> = None;
         for &(x, z) in &added {
             let key = TileKey { x, z, level: 0 };
@@ -3756,12 +3864,15 @@ impl Lod {
                 standins.push(key);
             }
         }
-        for key in standins {
+        for &key in &standins {
             self.refresh_path(key);
         }
+        self.covered_standins_scratch = standins;
         for &(x, z) in &changes {
             self.refresh_path(TileKey { x, z, level: 0 });
         }
+        self.covered_added_scratch = added;
+        self.covered_changes_scratch = changes;
         self.cutout_pending = Some(self.covered.clone());
         // Every active tile whose mesh clips an old/new covered column is
         // dirty now; the cutout waits for their replacement meshes, not for
@@ -3782,7 +3893,7 @@ impl Lod {
         if key.level == 0 {
             return;
         }
-        let mut descendants = Vec::new();
+        let mut descendants = smallvec::SmallVec::<[TileKey; 4]>::new();
         self.collect_active_descendants(key, &mut descendants);
         self.cutout_waiting.extend(
             descendants
@@ -3805,7 +3916,11 @@ impl Lod {
         if self.removed_pending.is_empty() {
             return;
         }
-        let mut blocked = FxHashSet::default();
+        let mut blocked = std::mem::take(&mut self.release_blocked_scratch);
+        blocked.clear();
+        let mut pending = std::mem::take(&mut self.release_pending_scratch);
+        pending.clear();
+        pending.extend(self.removed_pending.iter().copied());
         for &removed in &self.removed_pending {
             let mut node = removed;
             loop {
@@ -3831,8 +3946,7 @@ impl Lod {
                 node = node.parent();
             }
         }
-        let pending: Vec<_> = self.removed_pending.iter().copied().collect();
-        for key in pending {
+        for key in pending.drain(..) {
             if self.active.contains(&key) || blocked.contains(&key) {
                 continue;
             }
@@ -3841,6 +3955,8 @@ impl Lod {
         }
         self.removed_pending
             .retain(|key| !self.active.contains(key));
+        self.release_blocked_scratch = blocked;
+        self.release_pending_scratch = pending;
     }
     /// Queues every dirty active tile with a shared immutable snapshot. One
     /// batch used to clone all maps and serialize the whole view on one worker.
@@ -3853,20 +3969,27 @@ impl Lod {
         if self.outstanding_meshes >= self.mesh_workers * 4 {
             return;
         }
-        let keys: Vec<(TileKey, u64)> = self
-            .dirty
-            .iter()
-            .filter(|(key, _)| self.active.contains(key) && self.ready.contains_key(key))
-            .map(|(&key, &version)| (key, version))
-            .collect();
+        // As in `request_samples`: the far meshing threads run behind the render thread, so it
+        // never waits for this lock. Busy now, the dirty tiles stay dirty for the next frame.
+        let shared = self.shared.clone();
+        let mut queued = match shared.mesh_jobs.try_lock() {
+            Ok(queued) => queued,
+            Err(std::sync::TryLockError::WouldBlock) => return,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        let mut keys = std::mem::take(&mut self.dispatch_keys_scratch);
+        keys.clear();
+        keys.extend(
+            self.dirty
+                .drain()
+                .filter(|(key, _)| self.active.contains(key) && self.ready.contains_key(key)),
+        );
         if keys.is_empty() {
-            self.dirty.clear();
+            self.dispatch_keys_scratch = keys;
             return;
         }
         #[cfg(debug_assertions)]
         self.check_mesh_samples();
-        // Build the COW snapshot and job batch before taking `shared.mesh_jobs`
-        // so the render thread holds the worker mutex only for heap pushes.
         let snapshot = Arc::new(Snapshot {
             samples: self.mesh_samples.clone(),
             saved: self.saved.clone(),
@@ -3875,15 +3998,14 @@ impl Lod {
             split: self.plan.split.clone(),
         });
         let covered = self.covered.clone();
-        let mut batch = Vec::with_capacity(keys.len());
-        let mut cancels = Vec::with_capacity(keys.len());
-        for (key, version) in keys {
+        let count = keys.len();
+        for (key, version) in keys.iter().copied() {
             let finer = self.finer_of(key);
             let canceled = Arc::new(AtomicBool::new(false));
-            cancels.push((key, canceled.clone()));
+            self.mesh_cancel.insert(key, canceled.clone());
             // Screen-space urgency: nearer blocks cost more pixels per work.
             let priority = i64::from(key.distance(camera)) * 16 / i64::from(key.size());
-            batch.push(MeshQueued {
+            queued.push(MeshQueued {
                 priority,
                 order: version,
                 job: MeshJob {
@@ -3897,22 +4019,9 @@ impl Lod {
                 },
             });
         }
-        let count = batch.len();
-        // As in `request_samples`: the far meshing threads run behind the render thread, so it
-        // never waits for this lock. Busy now, the dirty tiles stay dirty for the next frame.
-        {
-            let mut queued = match self.shared.mesh_jobs.try_lock() {
-                Ok(queued) => queued,
-                Err(std::sync::TryLockError::WouldBlock) => return,
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            };
-            queued.extend(batch);
-        }
-        self.dirty.clear();
-        for (key, canceled) in cancels {
-            self.mesh_cancel.insert(key, canceled);
-        }
+        drop(queued);
         self.outstanding_meshes += count;
+        self.dispatch_keys_scratch = keys;
         self.shared.mesh_wake.notify_all();
     }
     /// Brings `mesh_samples` up to date for `key` after its `active` or `ready` changed.
@@ -3940,15 +4049,15 @@ impl Lod {
             "mesh samples keep tiles no longer active or ready"
         );
     }
-    fn finer_of(&self, key: TileKey) -> Vec<TileKey> {
+    fn finer_of(&self, key: TileKey) -> smallvec::SmallVec<[TileKey; 4]> {
         if !self.plan.split.contains(&key) {
-            return Vec::new();
+            return smallvec::SmallVec::new();
         }
-        let mut finer = Vec::new();
+        let mut finer = smallvec::SmallVec::new();
         self.collect_active_descendants(key, &mut finer);
         finer
     }
-    fn collect_active_descendants(&self, key: TileKey, out: &mut Vec<TileKey>) {
+    fn collect_active_descendants(&self, key: TileKey, out: &mut smallvec::SmallVec<[TileKey; 4]>) {
         for child in key.children() {
             if !self.plan.nodes.contains(&child) {
                 continue;
@@ -4157,7 +4266,7 @@ impl Snapshot {
             .find(|key| self.nodes.contains(key))
             .is_some_and(|key| !self.split.contains(&key))
     }
-    fn mesh_input(&self, key: TileKey, finer: Vec<TileKey>) -> MeshInput {
+    fn mesh_input(&self, key: TileKey, finer: smallvec::SmallVec<[TileKey; 4]>) -> MeshInput {
         let stride = key.size() / CELLS as i32;
         let [ox, _, oz] = key.origin();
         let base = self
@@ -4171,7 +4280,7 @@ impl Snapshot {
             self.visited_source(ox + x as i32 * stride, oz + z as i32 * stride, stride)
         });
         let neighbors = std::array::from_fn(|direction| {
-            let mut edge = Vec::new();
+            let mut edge = smallvec::SmallVec::new();
             let mut offset = 0;
             while offset < key.size() {
                 let (wx, wz) = match direction {
@@ -4235,9 +4344,19 @@ fn detail_count(mask: &[u64; 4]) -> usize {
 fn drop_queued_samples(
     shared: &Shared,
     pending: &mut FxHashSet<TileKey>,
-    mut keep: impl FnMut(&TileKey) -> bool,
+    keep: impl FnMut(&TileKey) -> bool,
 ) -> Vec<TileKey> {
     let mut dropped = Vec::new();
+    drop_queued_samples_into(shared, pending, keep, &mut dropped);
+    dropped
+}
+fn drop_queued_samples_into(
+    shared: &Shared,
+    pending: &mut FxHashSet<TileKey>,
+    mut keep: impl FnMut(&TileKey) -> bool,
+    dropped: &mut Vec<TileKey>,
+) {
+    dropped.clear();
     shared.jobs.lock().unwrap().retain(|job| match job {
         Job::Sample(key) if !keep(key) => {
             pending.remove(key);
@@ -4246,7 +4365,6 @@ fn drop_queued_samples(
         }
         _ => true,
     });
-    dropped
 }
 /// Whether `key` overlaps any chunk column in `covered`, rejecting tiles
 /// outside `bounds` in O(1) and probing the intersected chunk rectangle when
@@ -5094,6 +5212,11 @@ mod tests {
         assert!(wanted.iter().all(|key| !lod.ready.contains_key(key)));
         lod.unmeshed.clear();
         lod.bring_back();
+        let returning_scratch_capacity = lod.returning_now_scratch.capacity();
+        assert!(
+            returning_scratch_capacity > 0,
+            "the coarsest returning batch populates the reusable scratch"
+        );
         for key in &wanted {
             assert_eq!(
                 lod.ready.contains_key(key),
@@ -5126,6 +5249,10 @@ mod tests {
                 .all(|key| lod.ready.get(key).is_some_and(|s| Arc::ptr_eq(s, &filled)))
         );
         assert!(lod.pending.iter().all(|key| seam.contains(key)));
+        assert!(
+            lod.returning_now_scratch.capacity() >= returning_scratch_capacity,
+            "later return batches keep the first scratch allocation"
+        );
     }
     #[test]
     fn only_detail_a_later_refresh_covers_is_dropped() {
@@ -6026,7 +6153,7 @@ mod tests {
         lod.finish_sample(a, vec![Column::default(); CELLS * CELLS]);
         assert!(lod.active.contains(&a));
         let sides = |lod: &Lod| {
-            let input = lod.snapshot().mesh_input(a, Vec::new());
+            let input = lod.snapshot().mesh_input(a, smallvec::SmallVec::new());
             [0, 1].map(|side| {
                 input.neighbors[side]
                     .iter()
@@ -6105,6 +6232,47 @@ mod tests {
     }
 
     #[test]
+    fn finer_tile_lists_inline_four_children_and_spill_for_deeper_cuts() {
+        let mut lod = Lod::scheduler_for_test();
+        let root = TileKey {
+            x: 0,
+            z: 0,
+            level: 2,
+        };
+        lod.plan.nodes.insert(root);
+        lod.plan.split.insert(root);
+        for child in root.children() {
+            lod.plan.nodes.insert(child);
+            lod.plan.split.insert(child);
+            for grandchild in child.children() {
+                lod.plan.nodes.insert(grandchild);
+                lod.active.insert(grandchild);
+            }
+        }
+        let finer = lod.finer_of(root);
+        assert_eq!(finer.len(), 16);
+        assert!(
+            finer.spilled(),
+            "deeper cuts must spill beyond inline storage"
+        );
+
+        let parent = TileKey {
+            x: 0,
+            z: 0,
+            level: 1,
+        };
+        let mut shallow = Lod::scheduler_for_test();
+        shallow.plan.nodes.insert(parent);
+        shallow.plan.split.insert(parent);
+        let children = parent.children();
+        shallow.plan.nodes.extend(children.iter().copied());
+        shallow.active.extend(children);
+        let finer = shallow.finer_of(parent);
+        assert_eq!(finer.len(), 4);
+        assert!(!finer.spilled(), "four children fit in the inline buffer");
+    }
+
+    #[test]
     fn far_meshing_holds_while_small_machine_near_terrain_loads() {
         let mut lod = Lod::scheduler_for_test();
         let key = TileKey {
@@ -6124,6 +6292,21 @@ mod tests {
         lod.set_near_loading(false);
         lod.dispatch_meshes([0, 0]);
         assert_eq!(lod.shared.mesh_jobs.lock().unwrap().len(), 1);
+        let capacity = lod.dispatch_keys_scratch.capacity();
+        assert!(capacity > 0);
+
+        let next = TileKey {
+            x: 1,
+            z: 0,
+            level: 0,
+        };
+        lod.active.insert(next);
+        lod.ready.insert(next, TileColumns::empty());
+        lod.sync_sample(next);
+        lod.mark_mesh(next);
+        lod.dispatch_meshes([0, 0]);
+        assert_eq!(lod.shared.mesh_jobs.lock().unwrap().len(), 2);
+        assert_eq!(lod.dispatch_keys_scratch.capacity(), capacity);
     }
 
     #[test]
@@ -6194,6 +6377,8 @@ mod tests {
         assert!(queued(&lod).is_empty());
         assert!(lod.pending.is_empty());
         assert!(observing(&lod));
+        let dropped_capacity = lod.dropped_samples_scratch.capacity();
+        assert!(dropped_capacity >= 16);
         lod.set_near_loading(false);
         lod.update([100_000., 64., 100_000.], 2, 64, none(), None);
         assert_eq!(queued(&lod), after);
@@ -6203,6 +6388,10 @@ mod tests {
         lod.set_near_loading(true);
         assert_eq!(queued(&lod), after[..SAMPLE_JOBS]);
         assert_eq!(pending(&lod), sorted(after[..SAMPLE_JOBS].to_vec()));
+        assert!(
+            lod.dropped_samples_scratch.capacity() >= dropped_capacity,
+            "a later near-loading transition reuses the dropped-job list"
+        );
     }
 
     #[test]
@@ -6468,6 +6657,83 @@ mod tests {
         assert_eq!(lod.take_cutout(), Some([(3, 4)].into_iter().collect()));
     }
 
+    #[test]
+    fn leave_out_reuses_coverage_delta_buffers() {
+        let mut lod = Lod::scheduler_for_test();
+        for x in 0..8 {
+            lod.plan.nodes.insert(TileKey { x, z: 0, level: 0 });
+            lod.full.insert((x, 0));
+        }
+        lod.leave_out();
+        assert_eq!(lod.covered.len(), 8);
+        lod.full.insert((8, 0));
+        lod.plan.nodes.insert(TileKey {
+            x: 8,
+            z: 0,
+            level: 0,
+        });
+        lod.leave_out();
+        assert_eq!(lod.covered.len(), 9);
+        let capacities = (
+            lod.covered_scratch.capacity(),
+            lod.covered_added_scratch.capacity(),
+            lod.covered_changes_scratch.capacity(),
+            lod.covered_standins_scratch.capacity(),
+        );
+        assert!(capacities.1 > 0 && capacities.2 > 0 && capacities.3 > 0);
+
+        lod.full.insert((9, 0));
+        lod.plan.nodes.insert(TileKey {
+            x: 9,
+            z: 0,
+            level: 0,
+        });
+        lod.leave_out();
+        assert_eq!(lod.covered.len(), 10);
+        assert!(
+            lod.covered_scratch.capacity() >= capacities.0
+                && lod.covered_added_scratch.capacity() >= capacities.1
+                && lod.covered_changes_scratch.capacity() >= capacities.2
+                && lod.covered_standins_scratch.capacity() >= capacities.3,
+            "the next coverage change reuses all four work buffers"
+        );
+    }
+
+    #[test]
+    fn detail_request_reuses_candidate_and_chunk_buffers() {
+        let mut lod = Lod::scheduler_for_test();
+        lod.active = (0..DETAIL_REQUEST as i32 + 8)
+            .map(|x| TileKey { x, z: 0, level: 0 })
+            .collect();
+        Arc::make_mut(&mut lod.covered).insert((0, 0));
+        lod.full.insert((0, 0));
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        lod.detail_request_at = long_ago;
+        lod.request_detail([0, 0]);
+        let first = match lod.shared.jobs.lock().unwrap().pop_front() {
+            Some(Job::RequestDetail { chunks, .. }) => chunks,
+            _ => panic!("detail request was not queued"),
+        };
+        let capacities = (
+            lod.detail_request_keys_scratch.capacity(),
+            lod.detail_request_chunks_scratch.capacity(),
+        );
+        assert!(capacities.0 > 0 && capacities.1 > 0);
+        lod.detail_request_pending = false;
+        lod.detail_request_at = long_ago;
+        lod.request_detail([0, 0]);
+        let second = match lod.shared.jobs.lock().unwrap().pop_front() {
+            Some(Job::RequestDetail { chunks, .. }) => chunks,
+            _ => panic!("repeated detail request was not queued"),
+        };
+        assert_eq!(second, first, "request order must remain stable");
+        assert!(
+            lod.detail_request_keys_scratch.capacity() >= capacities.0
+                && lod.detail_request_chunks_scratch.capacity() >= capacities.1,
+            "periodic detail requests reuse both scratch buffers"
+        );
+    }
+
     /// A saved summary is not detail: a covered empty stand-in must not let
     /// the cutout release the full-detail columns under it.
     #[test]
@@ -6540,10 +6806,23 @@ mod tests {
             lod.removed().is_empty(),
             "removed before the replacement was meshed"
         );
+        let scratch_capacity = (
+            lod.release_blocked_scratch.capacity(),
+            lod.release_pending_scratch.capacity(),
+        );
+        assert!(scratch_capacity.0 > 0 && scratch_capacity.1 > 0);
         lod.meshed.insert(child);
         lod.unmeshed.remove(&child);
         lod.release_removed();
         assert_eq!(lod.removed(), [parent]);
+        assert_eq!(
+            (
+                lod.release_blocked_scratch.capacity(),
+                lod.release_pending_scratch.capacity(),
+            ),
+            scratch_capacity,
+            "the next release pass reuses both scratch allocations"
+        );
         // Out of range: nothing overlaps it, so it may fade out at once.
         let gone = TileKey {
             x: 100,
@@ -6611,6 +6890,36 @@ mod tests {
             camera[0] += 16.0;
             lod.update(camera, 2, 64, Some(FxHashSet::default()), None);
             check(&lod);
+            let scratch_capacities = (
+                lod.selection_keys_scratch.capacity(),
+                lod.selection_inactive_scratch.capacity(),
+                lod.selection_changed_scratch.capacity(),
+                lod.selection_old_active_scratch.capacity(),
+                lod.replan_gone_scratch.capacity(),
+                lod.replan_leaving_scratch.capacity(),
+                lod.replan_seam_scratch.capacity(),
+                lod.replan_standins_scratch.capacity(),
+            );
+            assert!(
+                scratch_capacities.0 > 0
+                    && scratch_capacities.2 > 0
+                    && scratch_capacities.3 > 0
+                    && scratch_capacities.4 > 0
+            );
+            camera[0] += 16.0;
+            lod.update(camera, 2, 64, Some(FxHashSet::default()), None);
+            check(&lod);
+            assert!(
+                lod.selection_keys_scratch.capacity() >= scratch_capacities.0
+                    && lod.selection_inactive_scratch.capacity() >= scratch_capacities.1
+                    && lod.selection_changed_scratch.capacity() >= scratch_capacities.2
+                    && lod.selection_old_active_scratch.capacity() >= scratch_capacities.3
+                    && lod.replan_gone_scratch.capacity() >= scratch_capacities.4
+                    && lod.replan_leaving_scratch.capacity() >= scratch_capacities.5
+                    && lod.replan_seam_scratch.capacity() >= scratch_capacities.6
+                    && lod.replan_standins_scratch.capacity() >= scratch_capacities.7,
+                "the next view-plan rebuild reuses its eight scratch lists"
+            );
         }
         // A covered level-0 stand-in completes its parent but is not drawn.
         lod.update(camera, 2, 64, Some([(0, 0)].into_iter().collect()), None);

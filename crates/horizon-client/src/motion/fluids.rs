@@ -185,12 +185,24 @@ pub fn bubble_column_surfaces(
     bounds: Aabb,
 ) -> Vec<BlockPos> {
     let mut surfaces = Vec::new();
+    bubble_column_surfaces_into(world, registry, facts, collision, bounds, &mut surfaces);
+    surfaces
+}
+
+/// Appends surface columns touched by bounds to caller-owned storage.
+pub fn bubble_column_surfaces_into(
+    world: &World,
+    registry: &horizon_world::registry::BlockRegistry,
+    facts: &crate::blocks::BlockFacts,
+    collision: &horizon_world::block_collision::BlockCollisionRegistry<'_>,
+    bounds: Aabb,
+    surfaces: &mut Vec<BlockPos>,
+) {
     bubble_columns_touching(world, registry, facts, collision, bounds, |pos, column| {
         if column.surface {
             surfaces.push(pos);
         }
     });
-    surfaces
 }
 /// Every bubble column block the box touches (`Entity.getInsideBlockPoints`).
 fn bubble_columns_touching(

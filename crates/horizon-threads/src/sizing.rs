@@ -30,7 +30,8 @@ pub enum Pool {
 pub fn sizing(battery: bool, cores: usize, pool: Pool) -> usize {
     let auto = match pool {
         Pool::Jobs => cores.saturating_sub(1).max(1),
-        Pool::TickHelper => cores.clamp(1, 8).saturating_sub(1).max(1),
+        // The server thread participates as a lane; leave one more CPU for the render thread.
+        Pool::TickHelper => cores.saturating_sub(2).clamp(1, 7),
         Pool::ChunkDecoder => cores.clamp(1, 4),
         Pool::SaveCompression => cores.div_ceil(2).max(1),
         Pool::Net => cores.div_ceil(2),
@@ -55,11 +56,17 @@ static BATTERY: OnceLock<bool> = OnceLock::new();
 
 /// [`sizing`] with this process's cores and `battery` as the caller knows it.
 pub fn for_pool_with(battery: bool, pool: Pool) -> usize {
-    let cores = match pool {
-        Pool::Jobs => crate::usable_cores(),
-        _ => crate::worker_count(),
-    };
+    let cores = pool_cores(pool, crate::worker_count(), crate::usable_cores());
     sizing(battery, cores, pool)
+}
+
+/// Foreground CPU-bound pools stay on performance cores on hybrid machines.
+/// Background and I/O-oriented pools retain the process-wide worker budget.
+fn pool_cores(pool: Pool, workers: usize, usable: usize) -> usize {
+    match pool {
+        Pool::Jobs | Pool::TickHelper => usable,
+        _ => workers,
+    }
 }
 
 /// [`for_pool_with`] under this process's Battery Mode ([`battery`]).
@@ -87,8 +94,8 @@ mod tests {
     fn the_table_sizes_every_pool_and_halves_it() {
         let table: [(usize, [usize; 6], [usize; 6]); 4] = [
             (2, [1, 1, 2, 1, 1, 1], [1, 1, 1, 1, 1, 1]),
-            (4, [3, 3, 4, 2, 2, 3], [2, 2, 2, 1, 1, 2]),
-            (8, [7, 7, 4, 4, 4, 7], [4, 4, 2, 2, 2, 4]),
+            (4, [3, 2, 4, 2, 2, 3], [2, 1, 2, 1, 1, 2]),
+            (8, [7, 6, 4, 4, 4, 7], [4, 3, 2, 2, 2, 4]),
             (16, [15, 7, 4, 8, 8, 15], [8, 4, 2, 4, 4, 8]),
         ];
         for (cores, plain, halved) in table {
@@ -107,8 +114,8 @@ mod tests {
         }
     }
 
-    /// On a 4-core machine the six pools add up to 17 threads, and to 10 under
-    /// Battery Mode: the mode takes more than a third of them away.
+    /// On a 4-core machine the six pools' configured budgets add up to 16 threads,
+    /// and to 9 under Battery Mode (pools start only when their workload needs them).
     #[test]
     fn a_four_core_machines_pools_add_up() {
         let sum = |battery_mode: bool| {
@@ -116,8 +123,8 @@ mod tests {
                 .map(|pool| sizing(battery_mode, 4, pool))
                 .sum::<usize>()
         };
-        assert_eq!(sum(false), 17);
-        assert_eq!(sum(true), 10);
+        assert_eq!(sum(false), 16);
+        assert_eq!(sum(true), 9);
     }
 
     /// The first answer wins, so a pool started before the setting changed keeps
@@ -128,6 +135,26 @@ mod tests {
         assert!(battery());
         set_battery(false);
         assert!(battery());
+    }
+
+    /// Foreground CPU-bound work uses the performance-core budget on hybrid CPUs,
+    /// while decoders and other background/I/O pools retain the full worker budget.
+    #[test]
+    fn foreground_pools_use_the_performance_core_budget() {
+        use super::pool_cores;
+
+        assert_eq!(pool_cores(Pool::Jobs, 10, 4), 4);
+        assert_eq!(pool_cores(Pool::TickHelper, 10, 4), 4);
+        assert_eq!(pool_cores(Pool::ChunkDecoder, 10, 4), 10);
+        assert_eq!(pool_cores(Pool::SaveCompression, 10, 4), 10);
+        assert_eq!(
+            sizing(false, pool_cores(Pool::TickHelper, 10, 4), Pool::TickHelper),
+            2
+        );
+        assert_eq!(
+            sizing(true, pool_cores(Pool::TickHelper, 10, 4), Pool::TickHelper),
+            1
+        );
     }
 
     /// A plain Jobs pool is the streaming pool's own automatic count, so the table

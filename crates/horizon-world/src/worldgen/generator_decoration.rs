@@ -499,6 +499,7 @@ impl Decoration {
             level_random,
             structure_mobs: worker.structure_mobs.clone(),
             starts: references.clone(),
+            structures_scratch: Vec::new(),
             biome_names: data.biome_names(),
             blocks: data
                 .feature_resources
@@ -817,6 +818,8 @@ struct World<'a> {
     level_random: &'a mut dyn super::structure::legacy::PieceRandom,
     structure_mobs: Option<Arc<dyn super::generator::StructureMobs>>,
     starts: Vec<Arc<super::structure::start::StructureStart>>,
+    /// Reused while finalizing structure-spawned mobs in this region.
+    structures_scratch: Vec<String>,
     biome_names: &'a [Arc<str>],
     blocks: Option<&'a BlockBehavior>,
     region: TerrainRegion<'static, GenBlockStates>,
@@ -1348,13 +1351,13 @@ impl PlacementContext for World<'_> {
             return Ok(behaviours.has_flag(state, crate::level::data::state_flags::CAN_OCCLUDE));
         }
         let properties = &self.blocks()?.properties;
-        let name = properties
+        let block_state = properties
             .registry()
             .state(state)
-            .ok_or(PlacementQueryError::Unavailable)?
-            .name
-            .clone();
-        Ok(properties.definition(&name).is_some_and(|d| d.can_occlude))
+            .ok_or(PlacementQueryError::Unavailable)?;
+        Ok(properties
+            .definition(&block_state.name)
+            .is_some_and(|definition| definition.can_occlude))
     }
     fn collision_full_block(
         &mut self,
@@ -1386,15 +1389,15 @@ impl PlacementContext for World<'_> {
                 .biome_identity(at)
                 .ok()
                 .and_then(|b| self.biome_names.get(b.0 as usize))
-                .map_or("", |n| &**n)
-                .to_owned();
-            let structures: Vec<String> = self
-                .starts
-                .iter()
-                .filter(|s| s.pieces.iter().any(|p| p.bounding_box().is_inside(at)))
-                .map(|s| s.name.clone())
-                .collect();
-            if mobs.finalize(&mut nbt, &biome, &structures, self.level_random) {
+                .map_or("", |name| &**name);
+            self.structures_scratch.clear();
+            self.structures_scratch.extend(
+                self.starts
+                    .iter()
+                    .filter(|s| s.pieces.iter().any(|p| p.bounding_box().is_inside(at)))
+                    .map(|s| s.name.clone()),
+            );
+            if mobs.finalize(&mut nbt, biome, &self.structures_scratch, self.level_random) {
                 nbt.remove(&"horizon:finalize".into());
             }
         }

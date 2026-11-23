@@ -1,0 +1,48 @@
+name: Multithreading Windows client
+
+on:
+  push:
+    branches:
+      - horizon-26.3-multithreading
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+      HORIZON_VERSION: 0.0.0-multithreading
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - id: rust
+        run: echo "version=$(cat tools/ci/rust-version)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
+
+      - name: Build Multithreading game
+        run: |
+          cargo build --release --locked -p horizon-official --bin horizon-official
+          cp target/release/horizon-official.exe target/release/horizon-client.exe
+
+      - name: Check Windows executable
+        run: |
+          target/release/horizon-client.exe --help | grep -q -- '--resources'
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: horizon-client-windows-x64-${{ github.sha }}
+          path: target/release/horizon-client.exe
+          if-no-files-found: error
+          retention-days: 14

@@ -77,7 +77,6 @@ mod new_instance;
 mod notes_cache;
 mod owner_page;
 mod packs_page;
-mod partner;
 mod perf;
 mod picture_cache;
 mod plate;
@@ -458,7 +457,7 @@ struct Launcher {
     settings: Settings,
     /// The last failed settings write, kept across page changes until a save succeeds.
     settings_save_error: Option<String>,
-    /// The Discord, sponsor and website links: built in until links.json on main has been read.
+    /// External support and download URLs, replaced when links.json on main has been read.
     links: backend::Links,
     preparing: bool,
     prepare_log: VecDeque<String>,

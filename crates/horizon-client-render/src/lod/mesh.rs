@@ -23,6 +23,10 @@ pub(super) struct EdgeColumn<'a> {
     pub unknown: bool,
 }
 
+/// Most LOD tile edges have only one or two neighbours. Keep those on the
+/// stack; spill only for unusually fragmented adaptive-LOD boundaries.
+pub(super) type EdgeColumns<'a> = smallvec::SmallVec<[EdgeColumn<'a>; 4]>;
+
 #[derive(Clone, Copy)]
 enum Tint {
     None,
@@ -84,6 +88,8 @@ impl Look for [u32; 2] {
 #[derive(Default)]
 pub(super) struct Mesher {
     styles: FxHashMap<(BlockStateId, u8), Styles>,
+    /// Finer active tiles used by the current mesh, reused by this worker.
+    finer_keys: FxHashSet<TileKey>,
     /// Whether quads get their looks (`crate::mesher::QuadLook`), as the section mesher's
     /// `looks`: 0 not, 1 with the Overworld's face shades, 2 with the Nether's.
     pub(super) looks: u8,
@@ -92,39 +98,56 @@ pub(super) struct Mesher {
     pub(super) shader_pack: bool,
 }
 impl Mesher {
-    pub(super) fn mesh(
+    pub(super) fn mesh<'a>(
         &mut self,
         key: TileKey,
-        columns: &[&[Span]],
+        columns: &[&'a [Span]],
         covered: &FxHashSet<(i32, i32)>,
         covered_bounds: Option<[i32; 4]>,
         context: &WorkerContext,
-        neighbors: &[Vec<EdgeColumn<'_>>; 4],
+        neighbors: &[EdgeColumns<'a>; 4],
         finer: &[TileKey],
     ) -> SectionMesh {
+        let Self {
+            styles,
+            finer_keys,
+            looks,
+            shader_pack,
+        } = self;
+        finer_keys.clear();
+        finer_keys.extend(finer.iter().copied());
         let (c, b) = (covered, covered_bounds);
-        match self.looks != 0 {
+        match *looks != 0 {
             false => {
-                let material = |s: &Span, d, at| self.material(s, d, at, context);
-                mesh_columns_with_edges::<()>(key, columns, c, b, neighbors, finer, material)
+                let material = |s: &Span, d, at| {
+                    Self::material(styles, *looks, *shader_pack, s, d, at, context)
+                };
+                mesh_columns_with_edges::<()>(
+                    key, columns, c, b, neighbors, finer, finer_keys, material,
+                )
             }
             true => {
-                let material = |s: &Span, d, at| self.material(s, d, at, context);
-                mesh_columns_with_edges::<[u32; 2]>(key, columns, c, b, neighbors, finer, material)
+                let material = |s: &Span, d, at| {
+                    Self::material(styles, *looks, *shader_pack, s, d, at, context)
+                };
+                mesh_columns_with_edges::<[u32; 2]>(
+                    key, columns, c, b, neighbors, finer, finer_keys, material,
+                )
             }
         }
     }
     /// `at`: the block column the face covers, for the grass colours that
     /// change across a biome (swamps).
     fn material<L: Look>(
-        &mut self,
+        styles_cache: &mut FxHashMap<(BlockStateId, u8), Styles>,
+        looks: u8,
+        shader_pack: bool,
         span: &Span,
         direction: Direction,
         at: [i32; 2],
         context: &WorkerContext,
     ) -> Material<L> {
-        let styles = *self
-            .styles
+        let styles = *styles_cache
             .entry((span.state, direction as u8))
             .or_insert_with(|| {
                 let assets = &context.assets;
@@ -226,7 +249,6 @@ impl Mesher {
                 }
             });
         let biome = context.biomes.get(span.biome);
-        let looks = self.looks;
         let fluid = styles.fluid != 0;
         let shade = match direction {
             Direction::Up => 1.0,
@@ -255,7 +277,7 @@ impl Mesher {
                         shade,
                         (context.tables.hdr_tier(span.state), level),
                         fluid.then_some(direction),
-                        self.shader_pack,
+                        shader_pack,
                     );
                     Paint {
                         look: L::make(|| far_look(looks, rgb, direction, fluid)),
@@ -465,6 +487,7 @@ fn mesh_columns_with_neighbors(
         covered_bounds,
         &edges,
         &[],
+        &FxHashSet::default(),
         material,
     )
 }
@@ -499,50 +522,104 @@ fn heightmap(column: &[Span], mut fluid: impl FnMut(&Span) -> bool) -> Spans {
     }
     spans
 }
-fn mesh_columns_with_edges<L: Look>(
+/// Small descendant sets are quicker to scan directly. Once a coarse fallback has many
+/// active descendants, index the smallest descendant tile touching each of its 256 cells
+/// in one pass instead of rescanning the whole set for every cell.
+fn finer_cell_steps(key: TileKey, finer: &[TileKey], stride: i32) -> [i32; CELLS * CELLS] {
+    let [ox, _, oz] = key.origin();
+    let mut steps = [stride; CELLS * CELLS];
+    for other in finer {
+        let size = other.size();
+        // A tile at least as wide as one cell cannot make that cell's step smaller.
+        if size >= stride {
+            continue;
+        }
+        let [x, _, z] = other.origin();
+        let (x, z) = (x - ox, z - oz);
+        // Descendant tiles are aligned to the parent grid. Since size < stride,
+        // each one belongs wholly to exactly one of its cells.
+        if x < 0 || z < 0 || x >= key.size() || z >= key.size() {
+            continue;
+        }
+        let index = (z / stride) as usize * CELLS + (x / stride) as usize;
+        steps[index] = steps[index].min(size);
+    }
+    steps
+}
+
+fn mesh_columns_with_edges<'a, L: Look>(
     key: TileKey,
-    columns: &[&[Span]],
+    columns: &[&'a [Span]],
     covered: &FxHashSet<(i32, i32)>,
     covered_bounds: Option<[i32; 4]>,
-    neighbors: &[Vec<EdgeColumn<'_>>; 4],
+    neighbors: &[EdgeColumns<'a>; 4],
     finer: &[TileKey],
+    finer_keys: &FxHashSet<TileKey>,
     mut material: impl FnMut(&Span, Direction, [i32; 2]) -> Material<L>,
 ) -> SectionMesh {
     assert_eq!(columns.len(), CELLS * CELLS);
-    // The heightmap columns are built here and borrowed like the tile's own.
-    let heightmap_columns: Vec<Spans>;
-    let heightmap_refs: Vec<&[Span]>;
-    let heightmap_edges: [Vec<Spans>; 4];
-    let heightmap_neighbors: [Vec<EdgeColumn<'_>>; 4];
-    let (columns, neighbors) = if key.level >= HEIGHTMAP_LEVEL {
-        let [ox, _, oz] = key.origin();
-        let mut fluid = |span: &Span| material(span, Direction::Up, [ox, oz]).fluid != 0;
-        heightmap_columns = columns
+    // Keep the ordinary path allocation-free. The heightmap path owns its
+    // temporary columns and edge spans until the shared mesher has finished.
+    if key.level < HEIGHTMAP_LEVEL {
+        return mesh_columns_prepared::<L>(
+            key,
+            columns,
+            covered,
+            covered_bounds,
+            neighbors,
+            finer,
+            finer_keys,
+            &mut material,
+        );
+    }
+
+    let [ox, _, oz] = key.origin();
+    let mut fluid = |span: &Span| material(span, Direction::Up, [ox, oz]).fluid != 0;
+    let heightmap_columns: [Spans; CELLS * CELLS] =
+        std::array::from_fn(|index| heightmap(columns[index], &mut fluid));
+    let heightmap_edges: [smallvec::SmallVec<[Spans; 4]>; 4] = neighbors.each_ref().map(|side| {
+        side.iter()
+            .map(|edge| heightmap(edge.spans, &mut fluid))
+            .collect()
+    });
+    drop(fluid);
+    let heightmap_refs: [&[Span]; CELLS * CELLS] =
+        std::array::from_fn(|index| heightmap_columns[index].as_slice());
+    let heightmap_neighbors: [EdgeColumns<'_>; 4] = std::array::from_fn(|side| {
+        neighbors[side]
             .iter()
-            .map(|column| heightmap(column, &mut fluid))
-            .collect();
-        heightmap_edges = neighbors.each_ref().map(|side| {
-            side.iter()
-                .map(|edge| heightmap(edge.spans, &mut fluid))
-                .collect()
-        });
-        heightmap_refs = heightmap_columns.iter().map(Spans::as_slice).collect();
-        heightmap_neighbors = std::array::from_fn(|side| {
-            neighbors[side]
-                .iter()
-                .zip(&heightmap_edges[side])
-                .map(|(edge, spans)| EdgeColumn {
-                    start: edge.start,
-                    end: edge.end,
-                    spans: spans.as_slice(),
-                    unknown: edge.unknown,
-                })
-                .collect()
-        });
-        (&heightmap_refs[..], &heightmap_neighbors)
-    } else {
-        (columns, neighbors)
-    };
+            .zip(&heightmap_edges[side])
+            .map(|(edge, spans)| EdgeColumn {
+                start: edge.start,
+                end: edge.end,
+                spans: spans.as_slice(),
+                unknown: edge.unknown,
+            })
+            .collect()
+    });
+    mesh_columns_prepared::<L>(
+        key,
+        &heightmap_refs,
+        covered,
+        covered_bounds,
+        &heightmap_neighbors,
+        finer,
+        finer_keys,
+        &mut material,
+    )
+}
+
+#[inline]
+fn mesh_columns_prepared<'a, L: Look>(
+    key: TileKey,
+    columns: &[&'a [Span]],
+    covered: &FxHashSet<(i32, i32)>,
+    covered_bounds: Option<[i32; 4]>,
+    neighbors: &[EdgeColumns<'a>; 4],
+    finer: &[TileKey],
+    finer_keys: &FxHashSet<TileKey>,
+    mut material: impl FnMut(&Span, Direction, [i32; 2]) -> Material<L>,
+) -> SectionMesh {
     let mut count = CELLS * CELLS;
     let edge_offsets = std::array::from_fn::<_, 4, _>(|side| {
         let start = count;
@@ -552,17 +629,28 @@ fn mesh_columns_with_edges<L: Look>(
     let stride = key.size() / CELLS as i32;
     let [ox, _, oz] = key.origin();
     // A cell meets full-detail or finer terrain: it is meshed in smaller steps.
+    // A deep cut can leave hundreds of active descendants under one coarse
+    // fallback. Index those once; for the usual four-or-fewer children, the
+    // direct scan avoids building the table.
+    let finer_steps = (finer.len() > CELLS).then(|| finer_cell_steps(key, finer, stride));
     let cell_step = |x: usize, z: usize| {
         let (wx, wz) = (ox + x as i32 * stride, oz + z as i32 * stride);
         let overlaps = covered_bounds.is_some_and(|[x0, z0, x1, z1]| {
             wx < x1 && wx + stride > x0 && wz < z1 && wz + stride > z0
         });
         let mut step = if overlaps { stride.min(16) } else { stride };
-        for other in finer {
-            let [x, _, z] = other.origin();
-            if wx < x + other.size() && x < wx + stride && wz < z + other.size() && z < wz + stride
-            {
-                step = step.min(other.size());
+        if let Some(finer_steps) = &finer_steps {
+            step = step.min(finer_steps[z * CELLS + x]);
+        } else {
+            for other in finer {
+                let [x, _, z] = other.origin();
+                if wx < x + other.size()
+                    && x < wx + stride
+                    && wz < z + other.size()
+                    && z < wz + stride
+                {
+                    step = step.min(other.size());
+                }
             }
         }
         // The cells of the coarsest tiles are thousands of blocks wide: a
@@ -589,8 +677,8 @@ fn mesh_columns_with_edges<L: Look>(
             [ox, oz]
         }
     };
-    let mut materials = Vec::new();
-    let prepared: Vec<Vec<Segment<'_, L>>> = filled
+    let mut materials = smallvec::SmallVec::<[Material<L>; 4]>::new();
+    let prepared: Vec<smallvec::SmallVec<[Segment<'_, L>; 2]>> = filled
         .iter()
         .map(FilledSpans::as_slice)
         .chain(neighbors.iter().flatten().map(|edge| edge.spans))
@@ -629,8 +717,8 @@ fn mesh_columns_with_edges<L: Look>(
         })
         .collect();
     let mut faces = Faces::<L>::new();
-    let finer_keys: FxHashSet<_> = finer.iter().copied().collect();
-    let mut finer_levels: Vec<_> = finer.iter().map(|key| key.level).collect();
+    let mut finer_levels = smallvec::SmallVec::<[u8; 4]>::new();
+    finer_levels.extend(finer.iter().map(|key| key.level));
     finer_levels.sort_unstable();
     finer_levels.dedup();
     let is_covered = |x: i32, z: i32| {
@@ -841,10 +929,72 @@ fn mesh_columns_with_edges<L: Look>(
     mesh.finish_sprite_layers();
     mesh
 }
-
 #[cfg(test)]
 mod refinement_tests {
     use super::*;
+
+    #[test]
+    fn deep_refinement_cell_steps_match_the_overlap_scan() {
+        let key = TileKey {
+            x: -2,
+            z: 3,
+            level: 8,
+        };
+        let stride = key.size() / CELLS as i32;
+        let [ox, _, oz] = key.origin();
+        let mut finer = Vec::new();
+
+        // Four 128-block descendants fit inside each of these 256-block cells.
+        // This deliberately exceeds the indexing threshold while spanning
+        // negative and positive world coordinates.
+        for cell_z in 0..4 {
+            for cell_x in 0..4 {
+                for sub_z in 0..2 {
+                    for sub_x in 0..2 {
+                        let x = ox + cell_x * stride + sub_x * 128;
+                        let z = oz + cell_z * stride + sub_z * 128;
+                        finer.push(TileKey {
+                            x: x.div_euclid(128),
+                            z: z.div_euclid(128),
+                            level: 3,
+                        });
+                    }
+                }
+            }
+        }
+        // Equal-sized and larger descendants must not reduce a cell's step.
+        finer.push(TileKey {
+            x: (ox + 4 * stride).div_euclid(stride),
+            z: oz.div_euclid(stride),
+            level: 4,
+        });
+        finer.push(TileKey {
+            x: (ox + 6 * stride).div_euclid(512),
+            z: oz.div_euclid(512),
+            level: 5,
+        });
+
+        assert!(finer.len() > CELLS);
+        let indexed = finer_cell_steps(key, &finer, stride);
+        for cell_z in 0..CELLS {
+            for cell_x in 0..CELLS {
+                let wx = ox + cell_x as i32 * stride;
+                let wz = oz + cell_z as i32 * stride;
+                let mut expected = stride;
+                for other in &finer {
+                    let [x, _, z] = other.origin();
+                    if wx < x + other.size()
+                        && x < wx + stride
+                        && wz < z + other.size()
+                        && z < wz + stride
+                    {
+                        expected = expected.min(other.size());
+                    }
+                }
+                assert_eq!(indexed[cell_z * CELLS + cell_x], expected);
+            }
+        }
+    }
     #[test]
     fn fallback_mesh_leaves_exactly_the_fine_tiles_footprints_empty() {
         let parent = TileKey {
@@ -873,6 +1023,7 @@ mod refinement_tests {
             256
         ];
         let columns: Vec<&[Span]> = columns.iter().map(|c| c.spans.as_slice()).collect();
+        let finer_keys = [fine].into_iter().collect();
         let mesh = mesh_columns_with_edges::<()>(
             parent,
             &columns,
@@ -880,6 +1031,7 @@ mod refinement_tests {
             None,
             &[Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             &[fine],
+            &finer_keys,
             |_, _, _| Material {
                 faces: [
                     Some(Paint {
@@ -960,7 +1112,12 @@ mod refinement_tests {
                 spans: empty.spans.as_slice(),
                 unknown,
             };
-            let neighbors = [Vec::new(), vec![edge], Vec::new(), Vec::new()];
+            let neighbors = [
+                smallvec::SmallVec::new(),
+                smallvec::smallvec![edge],
+                smallvec::SmallVec::new(),
+                smallvec::SmallVec::new(),
+            ];
             let mesh = mesh_columns_with_edges::<()>(
                 key,
                 &columns,
@@ -968,6 +1125,7 @@ mod refinement_tests {
                 None,
                 &neighbors,
                 &[],
+                &FxHashSet::default(),
                 |_, _, _| Material {
                     faces: [
                         Some(Paint {
@@ -1021,8 +1179,8 @@ impl FilledSpans<'_> {
 /// block. Unknown neighbours, and cells that `whole` rejects (they meet
 /// full-detail or finer terrain), count as open; those cells keep their gaps.
 fn fill_buried_gaps<'a>(
-    columns: &'a [&'a [Span]],
-    neighbors: &'a [Vec<EdgeColumn<'a>>; 4],
+    columns: &[&'a [Span]],
+    neighbors: &[EdgeColumns<'a>; 4],
     stride: i32,
     whole: impl Fn(usize, usize) -> bool,
     mut fluid: impl FnMut(&Span) -> bool,
@@ -1034,8 +1192,10 @@ fn fill_buried_gaps<'a>(
             .find(|span| span.min < span.max)
             .map_or(i16::MIN, |span| span.max)
     };
-    // Each column's gaps: the index of the span above, the gap's bottom and top.
-    let gaps_of = |spans: &[Span]| -> Vec<(usize, i16, i16)> {
+    // Most columns have at most four gaps. Keep their descriptors inline;
+    // highly fragmented columns still spill without truncating the geometry.
+    type Gaps = smallvec::SmallVec<[(usize, i16, i16); 4]>;
+    let gaps_of = |spans: &[Span]| -> Gaps {
         spans
             .windows(2)
             .enumerate()
@@ -1052,12 +1212,12 @@ fn fill_buried_gaps<'a>(
             i16::MIN
         }
     });
-    let gaps: Vec<Vec<(usize, i16, i16)>> = (0..CELLS * CELLS)
+    let gaps: Vec<Gaps> = (0..CELLS * CELLS)
         .map(|i| {
             if whole(i % CELLS, i / CELLS) {
                 gaps_of(columns[i])
             } else {
-                Vec::new()
+                Gaps::new()
             }
         })
         .collect();
@@ -1093,8 +1253,12 @@ fn fill_buried_gaps<'a>(
         .into_iter()
         .flatten()
     };
-    let mut open: Vec<Vec<bool>> = gaps.iter().map(|g| vec![false; g.len()]).collect();
-    let mut reached = Vec::new();
+    let mut open: Vec<smallvec::SmallVec<[bool; 4]>> = gaps
+        .iter()
+        .map(|g| smallvec::smallvec![false; g.len()])
+        .collect();
+    // The common case reaches only a few gaps; retain a larger inline stack for a tile.
+    let mut reached: smallvec::SmallVec<[(usize, usize); 64]> = smallvec::SmallVec::new();
     for i in 0..CELLS * CELLS {
         let (x, z) = (i % CELLS, i / CELLS);
         let lowest = [
@@ -1372,6 +1536,33 @@ fn emit_quad(mesh: &mut SectionMesh, grouped: (FaceKey, impl Look), rect: Rect, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_neighbor_edges_stay_in_inline_storage() {
+        let mut edges = EdgeColumns::new();
+        for index in 0..4 {
+            edges.push(EdgeColumn {
+                start: index,
+                end: index + 1,
+                spans: &[],
+                unknown: false,
+            });
+        }
+        assert!(
+            !edges.spilled(),
+            "four edge segments fit without a heap allocation"
+        );
+        edges.push(EdgeColumn {
+            start: 4,
+            end: 5,
+            spans: &[],
+            unknown: false,
+        });
+        assert!(
+            edges.spilled(),
+            "larger adaptive boundaries may grow safely"
+        );
+    }
     fn span(min: i16, max: i16, state: u32) -> Span {
         Span {
             min,
@@ -1581,9 +1772,16 @@ mod tests {
         };
         let (no_edges, set) = (Default::default(), FxHashSet::default());
         let mesh = |levels: [u8; 2]| {
-            mesh_columns_with_edges::<()>(key, &refs, &set, None, &no_edges, &[], |s, _, _| {
-                painted(s, levels)
-            })
+            mesh_columns_with_edges::<()>(
+                key,
+                &refs,
+                &set,
+                None,
+                &no_edges,
+                &[],
+                &FxHashSet::default(),
+                |s, _, _| painted(s, levels),
+            )
         };
         // The top faces: each one's cell (from its centre) and level.
         let tops = |mesh: &SectionMesh| {
@@ -1698,6 +1896,7 @@ mod tests {
             None,
             &no_edges,
             &[],
+            &FxHashSet::default(),
             looked,
         );
         mesh.sort_solid();
@@ -1786,10 +1985,26 @@ mod tests {
         let refs: Vec<&[Span]> = columns.iter().map(|c| c.spans.as_slice()).collect();
         let no_edges = Default::default();
         let set = FxHashSet::default();
-        let plain_mesh =
-            mesh_columns_with_edges::<()>(key, &refs, &set, None, &no_edges, &[], plain);
-        let looked =
-            mesh_columns_with_edges::<[u32; 2]>(key, &refs, &set, None, &no_edges, &[], plain);
+        let plain_mesh = mesh_columns_with_edges::<()>(
+            key,
+            &refs,
+            &set,
+            None,
+            &no_edges,
+            &[],
+            &FxHashSet::default(),
+            plain,
+        );
+        let looked = mesh_columns_with_edges::<[u32; 2]>(
+            key,
+            &refs,
+            &set,
+            None,
+            &no_edges,
+            &[],
+            &FxHashSet::default(),
+            plain,
+        );
         assert!(plain_mesh.solid.len() > 80 && !plain_mesh.translucent.is_empty());
         for (a, b) in [
             (&plain_mesh.solid, &looked.solid),
@@ -1984,7 +2199,12 @@ mod tests {
             spans: hill_column.spans.as_slice(),
             unknown: false,
         };
-        let neighbors = [vec![hill()], vec![hill()], vec![hill()], vec![hill()]];
+        let neighbors = [
+            smallvec::smallvec![hill()],
+            smallvec::smallvec![hill()],
+            smallvec::smallvec![hill()],
+            smallvec::smallvec![hill()],
+        ];
         let fill = |columns: &[Column]| -> Vec<Vec<Span>> {
             let columns: Vec<&[Span]> = columns.iter().map(|c| c.spans.as_slice()).collect();
             fill_buried_gaps(&columns, &neighbors, 1, |_, _| true, |_| false)
@@ -2119,8 +2339,8 @@ mod tests {
             z: -1,
             level: 1,
         };
-        let mut neighbors: [Vec<EdgeColumn<'_>>; 4] = std::array::from_fn(|_| {
-            vec![EdgeColumn {
+        let mut neighbors: [EdgeColumns<'_>; 4] = std::array::from_fn(|_| {
+            smallvec::smallvec![EdgeColumn {
                 start: 0,
                 end: 32,
                 spans: columns[0].spans.as_slice(),
@@ -2133,7 +2353,7 @@ mod tests {
             surface: None,
             spans: vec![span(0, 8, 1)].into(),
         };
-        neighbors[0] = vec![
+        neighbors[0] = smallvec::smallvec![
             EdgeColumn {
                 start: 0,
                 end: 1,
@@ -2161,6 +2381,7 @@ mod tests {
             None,
             &neighbors,
             &[],
+            &FxHashSet::default(),
             material,
         );
         let walls: Vec<_> = mesh

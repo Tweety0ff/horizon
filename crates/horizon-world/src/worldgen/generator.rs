@@ -623,6 +623,14 @@ fn state(
         .map_err(|e| resource(format!("block state {raw}: {e}")))
 }
 
+/// Reuse a worker-owned density buffer while preserving fresh-Vec zeroes:
+/// some samplers leave parts of the output slice untouched.
+fn density_scratch(scratch: &mut Vec<f32>, height: usize) -> &mut [f32] {
+    scratch.resize(height, 0.0);
+    scratch.fill(0.0);
+    scratch
+}
+
 impl<R: RandomSource + 'static> Pipeline<R>
 where
     R::Positional: Clone + Send + Sync,
@@ -1521,9 +1529,7 @@ where
                 self.data.registry.default_state("minecraft:air").unwrap(),
             )),
         };
-        let density = &mut worker.column_density;
-        density.clear();
-        density.resize(height as usize, 0.0);
+        let density = density_scratch(&mut worker.column_density, height as usize);
         if self
             .router
             .get(RouterField::FinalDensity)
@@ -3425,6 +3431,26 @@ mod tests {
     use super::super::biome_chunks::CACHE_LIMIT;
     use super::*;
     use std::collections::HashMap;
+    #[test]
+    fn density_scratch_reuses_its_allocation_for_equal_heights() {
+        let mut scratch = Vec::new();
+        let pointer = {
+            let density = density_scratch(&mut scratch, 384);
+            density.fill(7.0);
+            density.as_ptr()
+        };
+        let capacity = scratch.capacity();
+        {
+            let density = density_scratch(&mut scratch, 384);
+            assert_eq!(density.as_ptr(), pointer);
+            assert_eq!(density.len(), 384);
+            assert!(density.iter().all(|value| *value == 0.0));
+        }
+        assert_eq!(scratch.capacity(), capacity);
+        let _ = density_scratch(&mut scratch, 256);
+        assert_eq!(scratch.capacity(), capacity);
+    }
+
     #[test]
     fn out_from_origin_preserves_order_and_handles_extreme_positive_steps() {
         assert_eq!(out_from_origin(4, 0, 8, 2), [4, 6, 2, 8, 0]);

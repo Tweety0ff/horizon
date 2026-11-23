@@ -123,6 +123,7 @@ pub mod surface;
 pub use fluids::{
     BubbleColumn, FluidResources, FluidTags, LAVA, PlayerFluids, RiddenBoat, WATER,
     bubble_column_at, bubble_column_push, bubble_column_push_over, bubble_column_surfaces,
+    bubble_column_surfaces_into,
 };
 pub(crate) use surface::ModBlockFactors;
 pub use surface::{

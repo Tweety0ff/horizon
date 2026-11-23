@@ -398,7 +398,7 @@ impl Game<'_> {
                 // Entity.recreateFromPacket: objects must exist before applying motion.
                 self.remote_motion(p.id, p.velocity);
                 if self.minecart_improvements()
-                    && self.carts.iter().any(|c| c.id == p.id as u32)
+                    && self.entity_indices.carts.find(&self.carts, p.id as u32, |c| c.id).is_some()
                     && let Some(r) = self.remote.as_mut()
                 {
                     r.cart_lerps.insert(p.id, CartLerp::new());
@@ -519,7 +519,7 @@ impl Game<'_> {
                         Some(&block) => Some(Holder::Knot(block)),
                         // Not a known knot yet: kept by id until the knot
                         // arrives (game/network/remote_objects.rs).
-                        None if self.boats.iter().any(|b| b.id == d as u32) => {
+                        None if self.entity_indices.boats.find(&self.boats, d as u32, |b| b.id).is_some() => {
                             Some(Holder::Boat(d as u32))
                         }
                         None => Some(Holder::Mob(d as u32)),
@@ -527,7 +527,7 @@ impl Game<'_> {
                 };
                 if let Some(m) = self.mob_index.get_mut(&mut self.mobs, p.source as u32) {
                     m.extra.leash = holder;
-                } else if let Some(i) = self.boats.iter().position(|b| b.id == p.source as u32) {
+                } else if let Some(i) = self.entity_indices.boats.find(&self.boats, p.source as u32, |b| b.id) {
                     self.boats.update(i, |b| {
                         // A leashed boat or raft (AbstractBoat is Leashable).
                         b.leash = holder;
@@ -822,9 +822,9 @@ impl Game<'_> {
                     // ExperienceOrb.DATA_VALUE (the icon's size).
                     if *index == 8
                         && let Value::Int(v) = value
-                        && let Some(o) = self.orbs.iter_mut().find(|o| o.id == p.id as u32)
+                        && let Some(i) = self.entity_indices.orbs.find(&self.orbs, p.id as u32, |o| o.id)
                     {
-                        o.value = *v;
+                        self.orbs[i].value = *v;
                     }
                 }
                 self.remote_object_data(p.id, &p.values);
@@ -885,7 +885,7 @@ impl Game<'_> {
                     .find(|o| o.id == p.item as u32)
                     .map(|o| o.position);
                 let orb = orb_at.is_some();
-                let item = self.dropped.iter().find(|d| d.id == p.item as u32);
+                let item = self.entity_indices.dropped.find(&self.dropped, p.item as u32, |d| d.id).map(|i| &self.dropped[i]);
                 let shot = self
                     .creatures
                     .projectiles
@@ -937,12 +937,12 @@ impl Game<'_> {
                 } else {
                     super::super::pickups::Collector::Mob(p.player as u32)
                 };
-                if let Some(item) = self.dropped.iter().find(|d| d.id == p.item as u32).cloned() {
+                if let Some(item) = self.entity_indices.dropped.find(&self.dropped, p.item as u32, |d| d.id).map(|i| self.dropped[i].clone()) {
                     self.add_pickup(
                         super::super::pickups::Taken::Item(Box::new(item)),
                         collector,
                     );
-                } else if let Some(orb) = self.orbs.iter().find(|o| o.id == p.item as u32).cloned()
+                } else if let Some(orb) = self.entity_indices.orbs.find(&self.orbs, p.item as u32, |o| o.id).map(|i| self.orbs[i].clone())
                 {
                     self.add_pickup(super::super::pickups::Taken::Orb(Box::new(orb)), collector);
                 } else if let Some(shot) = self
@@ -957,7 +957,7 @@ impl Game<'_> {
                         super::super::pickups::Taken::Arrow(Box::new(shot)),
                         collector,
                     );
-                } else if let Some(i) = self.tridents.iter().position(|t| t.id == p.item as u32) {
+                } else if let Some(i) = self.entity_indices.tridents.find(&self.tridents, p.item as u32, |t| t.id) {
                     // So does a trident: a server's client keeps them apart.
                     let trident = self.tridents.remove(i);
                     self.add_pickup(
@@ -1181,7 +1181,7 @@ impl Game<'_> {
                     self.remote_totem(p.id);
                 }
                 // Mob.handleEntityEvent 20: the spawn poof.
-                if p.event == 20 && self.mobs.iter().any(|m| m.id == p.id as u32) {
+                if p.event == 20 && self.mob_index.get(&self.mobs, p.id as u32).is_some() {
                     self.poof_particles(p.id as u32);
                 }
                 // The particle bursts of Villager 12 to 14 and 42, TamableAnimal
@@ -1224,9 +1224,8 @@ impl Game<'_> {
                             .as_ref()
                             .map(|q| [q.position.x, q.position.y, q.position.z])
                     } else {
-                        self.mobs
-                            .iter()
-                            .find(|m| m.id == p.id as u32)
+                        self.mob_index
+                            .get(&self.mobs, p.id as u32)
                             .map(|m| [m.position.x, m.position.y, m.position.z])
                     };
                     if let Some(at) = at {

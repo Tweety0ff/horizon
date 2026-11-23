@@ -169,6 +169,8 @@ impl Game<'_> {
     pub(super) fn begin_ordered_ticks(&mut self) {
         let _span = horizon_client::spans::guard("ordered_ticks");
         self.restart_woken_entities();
+        self.orb_cells.rebuild(&self.orbs);
+        self.orb_candidates.clear();
         let pending_buf = std::mem::take(&mut self.ordered.pending_buf);
         let mut falling_ticked = std::mem::take(&mut self.ordered.falling_ticked);
         falling_ticked.clear();
@@ -411,6 +413,8 @@ impl Game<'_> {
                     self.orb_moved(i, step);
                     // `ExperienceOrb.tick`'s `applyEffectsFromBlocks`: a cactus pricks it.
                     if !stays || self.orb_cactus_hits(i) {
+                        let (join, at) = (self.orbs[i].join, self.orbs[i].position);
+                        self.orb_cells.remove(join, at);
                         self.orbs.remove(i);
                     }
                 }
@@ -443,6 +447,8 @@ impl Game<'_> {
     /// HIT_GROUND, then forgets it.
     pub(super) fn orb_moved(&mut self, i: usize, step: horizon_client::entities::OrbMove) {
         let o = &self.orbs[i];
+        let (join, position) = (o.join, o.position);
+        self.orb_cells.moved(join, step.from, position);
         let mut fall = self.vehicle_fall_reset(o.fall_distance, step.from, step.moved);
         if !step.in_water && step.moved.y < 0.0 {
             fall -= f64::from(step.moved.y as f32);

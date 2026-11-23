@@ -125,16 +125,25 @@ impl SaveDir {
                 };
                 let folder = kind.name();
                 // IOWorker.pendingWrites: a chunk queued again since is
-                // written once, by its newest batch.
-                let newest = |k: &(i32, i32), seq: u64| {
-                    pending.lock().map_or(true, |p| {
-                        p.get(&(kind, k.0, k.1)).is_none_or(|p| p.0 <= seq)
-                    })
+                // written once, by its newest batch. Snapshot this batch's
+                // newest entries under one lock, then release it before POI
+                // reads and encoding so queueing newer saves stays unblocked.
+                let current: Vec<_> = match pending.lock() {
+                    Ok(pending) => batch
+                        .iter()
+                        .filter(|(k, _, seq)| {
+                            pending
+                                .get(&(kind, k.0, k.1))
+                                .is_none_or(|pending| pending.0 <= *seq)
+                        })
+                        .collect(),
+                    Err(_) => batch.iter().collect(),
                 };
-                let resolved: Vec<_> = batch
-                    .iter()
-                    .filter(|(k, _, seq)| newest(k, *seq))
-                    .filter_map(|(k, r, _)| Some((*k, resolve_poi(&root, cache, *k, r)?)))
+                let resolved: Vec<_> = current
+                    .into_iter()
+                    .filter_map(|(k, r, _)| {
+                        resolve_poi(&root, cache, *k, r).map(|record| (*k, record))
+                    })
                     .collect();
                 let records: Vec<_> = resolved.iter().map(|(k, r)| (*k, r)).collect();
                 let result = write_region_records(&root, cache, folder, &records);
