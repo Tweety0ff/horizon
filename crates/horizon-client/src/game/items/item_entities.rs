@@ -355,7 +355,7 @@ impl Game<'_> {
         items.retain(|_| !*removed_iter.next().unwrap_or(&false));
         let Some(p) = self.player.as_ref() else {
             self.put_back_dropped(items);
-            self.spawn_destroyed_contents(std::mem::take(&mut destroyed));
+            self.spawn_destroyed_contents_reusing(&mut destroyed);
             self.item_cells = cells;
             self.item_merge_candidates = merge_near;
             self.item_removed_scratch = removed;
@@ -368,7 +368,7 @@ impl Game<'_> {
         };
         if p.health.dead_or_dying() || self.spectator() {
             self.put_back_dropped(items);
-            self.spawn_destroyed_contents(std::mem::take(&mut destroyed));
+            self.spawn_destroyed_contents_reusing(&mut destroyed);
             self.item_cells = cells;
             self.item_merge_candidates = merge_near;
             self.item_removed_scratch = removed;
@@ -396,7 +396,7 @@ impl Game<'_> {
         let own = self.level.ensure_player_uuid();
         self.native_player_pickups(&mut items, (min, max), feet, own);
         self.put_back_dropped(items);
-        self.spawn_destroyed_contents(std::mem::take(&mut destroyed));
+        self.spawn_destroyed_contents_reusing(&mut destroyed);
         self.item_cells = cells;
         self.item_merge_candidates = merge_near;
         self.item_removed_scratch = removed;
@@ -409,8 +409,12 @@ impl Game<'_> {
     }
     /// `ItemUtils.onContainerDestroyed`: spilled stacks use their own constructor
     /// motion (0.2 up and ±0.1 sideways), leaving the level random untouched.
-    pub(super) fn spawn_destroyed_contents(&mut self, destroyed: Vec<(ItemStack, Vec3)>) {
-        for (stack, at) in destroyed {
+    pub(super) fn spawn_destroyed_contents(&mut self, mut destroyed: Vec<(ItemStack, Vec3)>) {
+        self.spawn_destroyed_contents_reusing(&mut destroyed);
+    }
+    /// The item pass retains this cleared vector for the next tick.
+    fn spawn_destroyed_contents_reusing(&mut self, destroyed: &mut Vec<(ItemStack, Vec3)>) {
+        for (stack, at) in destroyed.drain(..) {
             self.spawn_item_own(stack, [at.x, at.y, at.z], 0);
         }
     }
