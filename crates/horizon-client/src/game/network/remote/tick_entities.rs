@@ -372,7 +372,8 @@ impl Game<'_> {
         };
         let mut lerps = std::mem::take(&mut r.lerps);
         let mut cart_lerps = std::mem::take(&mut r.cart_lerps);
-        let mut using = Vec::new();
+        let mut using = std::mem::take(&mut self.remote_using_scratch);
+        using.clear();
         let mut mob_fx = water_fx;
         let tick_listened = mod_api::__private::listened(mod_api::HookId::PlayerTickPre)
             || mod_api::__private::listened(mod_api::HookId::PlayerTickPost);
@@ -710,14 +711,15 @@ impl Game<'_> {
             .unwrap()
             .head_lerps
             .retain(|_, (_, steps)| *steps > 0);
-        let mut entered = Vec::new();
+        let mut entered = std::mem::take(&mut self.remote_entered_scratch);
+        entered.clear();
         if running {
             entity_section_steps::tick_items(self, &mut entered);
         }
         // Entity.doWaterSplashEffect on this window: Level.addParticle draws
         // the bubbles and splashes. ClientLevel.playSeededSound drops
         // Entity.playSound, so the sound stays the server's.
-        for splash in entered {
+        for splash in entered.drain(..) {
             self.apply_item_splash(splash);
         }
         let _ = self.handle_mob_events_reusable(&mut mob_fx);
@@ -727,11 +729,13 @@ impl Game<'_> {
             r.tick_standings = standings;
             r.tick_water_fx = mob_fx;
         }
-        for (item, ticks, at, eye, pitch, yaw) in using {
+        for (item, ticks, at, eye, pitch, yaw) in using.drain(..) {
             self.remote_player_eating(&item, ticks, at, eye, pitch, yaw);
         }
         // ClientLevel.tick: the sky flash fades in a frozen level too.
         self.flash = self.flash.saturating_sub(1);
+        self.remote_using_scratch = using;
+        self.remote_entered_scratch = entered;
         if running {
             self.guardian_bubbles();
             // The dragon: LivingEntity's interpolation, inside its aiStep.

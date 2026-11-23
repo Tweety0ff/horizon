@@ -1236,6 +1236,12 @@ struct Game<'a> {
     /// Remote guardian eye targets reused between ticks.
     guardian_look_scratch: Vec<(usize, [f64; 3])>,
     dropped: horizon_client::join_seq::JoinList<ItemEntity>,
+    /// Reused per-tick item spatial buckets and merge candidates.
+    item_cells: horizon_client::entities::ItemCells,
+    item_merge_candidates: Vec<u32>,
+    /// Scratch outputs from the remote entity tick.
+    remote_using_scratch: Vec<(ItemStack, u32, [f64; 3], f32, f32, f32)>,
+    remote_entered_scratch: Vec<horizon_client::entities::ItemSplash>,
     next_entity: u32,
     /// The last entity id when this level's entity pass began: an item with a
     /// later one was added during that pass and first ticks on the next
@@ -1281,6 +1287,7 @@ struct Game<'a> {
     mobs: horizon_client::join_seq::JoinList<Mob>,
     /// `mobs` by network id, for the packets that name one (`game/mobs/mob_index.rs`).
     mob_index: mob_index::MobIndex,
+    entity_indices: mob_index::EntityIndices,
     creatures: creatures::Creatures,
     sculk: sculk::SculkState,
     raiding: raids::Raiding,
@@ -1367,6 +1374,9 @@ struct Game<'a> {
     applied_modifiers: Vec<(String, String)>,
     experience: Experience,
     orbs: horizon_client::join_seq::JoinList<ExperienceOrb>,
+    /// Spatial bins for experience orb neighbour searches.
+    orb_cells: horizon_client::entities::OrbCells,
+    orb_candidates: Vec<horizon_client::join_seq::JoinSeq>,
     xp_delay: u32,
     ordered: ordered_tick::OrderedTicks,
     level_up_sound: horizon_client::entities::LevelUpSound,
@@ -10716,6 +10726,10 @@ impl<'a> Game<'a> {
             guardian_sounds: HashSet::new(),
             guardian_look_scratch: Vec::new(),
             dropped: Default::default(),
+            item_cells: Default::default(),
+            item_merge_candidates: Vec::new(),
+            remote_using_scratch: Vec::new(),
+            remote_entered_scratch: Vec::new(),
             next_entity: 0,
             ticked_entities_through: u32::MAX,
             contact_drops: 0..0,
@@ -10737,6 +10751,7 @@ impl<'a> Game<'a> {
             spawn_wait: Vec::new(),
             mobs: Default::default(),
             mob_index: Default::default(),
+            entity_indices: Default::default(),
             creatures: Default::default(),
             sculk: Default::default(),
             raiding: Default::default(),
@@ -10781,6 +10796,8 @@ impl<'a> Game<'a> {
             applied_modifiers: Vec::new(),
             experience: Experience::default(),
             orbs: Default::default(),
+            orb_cells: Default::default(),
+            orb_candidates: Vec::new(),
             xp_delay: 0,
             ordered: Default::default(),
             level_up_sound: Default::default(),

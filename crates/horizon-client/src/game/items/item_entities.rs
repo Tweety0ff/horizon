@@ -101,7 +101,10 @@ impl Game<'_> {
         // ServerLevel.tick: only entities in entity-ticking chunks tick.
         let ticking = self.entity_ticking_area();
         let mut removed = vec![false; items.len()];
-        let mut cells = horizon_client::entities::ItemCells::new(&items);
+        let mut cells = std::mem::take(&mut self.item_cells);
+        cells.rebuild(&items);
+        let mut merge_near = std::mem::take(&mut self.item_merge_candidates);
+        merge_near.clear();
         // A LAN or server guest only shows the host's items.
         let merging = self.remote.is_none();
         // `Entity.checkBelowWorld`: below `Level.getMinY() - 64`.
@@ -299,12 +302,13 @@ impl Game<'_> {
                 && item.ticks.is_multiple_of(rate)
             {
                 let max_stack = |stack: &ItemStack| self.stack_max_size(stack).max(1);
-                horizon_client::entities::merge_with_neighbours(
+                horizon_client::entities::merge_with_neighbours_scratch(
                     &mut items,
                     &mut removed,
                     &mut cells,
                     i,
                     true,
+                    &mut merge_near,
                     &max_stack,
                 );
             }
@@ -342,11 +346,15 @@ impl Game<'_> {
         let Some(p) = self.player.as_ref() else {
             self.put_back_dropped(items);
             self.spawn_destroyed_contents(destroyed);
+            self.item_cells = cells;
+            self.item_merge_candidates = merge_near;
             return original_moves;
         };
         if p.health.dead_or_dying() || self.spectator() {
             self.put_back_dropped(items);
             self.spawn_destroyed_contents(destroyed);
+            self.item_cells = cells;
+            self.item_merge_candidates = merge_near;
             return original_moves;
         }
         let w = f64::from(p.dimensions.width) / 2.0;
@@ -367,6 +375,8 @@ impl Game<'_> {
         self.native_player_pickups(&mut items, (min, max), feet, own);
         self.put_back_dropped(items);
         self.spawn_destroyed_contents(destroyed);
+        self.item_cells = cells;
+        self.item_merge_candidates = merge_near;
         original_moves
     }
     /// `ItemUtils.onContainerDestroyed`: spilled stacks use their own constructor
@@ -494,15 +504,16 @@ impl Game<'_> {
         }
         let into_join = self.orbs[i].join;
         let area = self.orbs[i].bounds().inflate(Vec3::new(0.5, 0.5, 0.5));
-        let candidates: Vec<_> = self
-            .orbs
-            .iter()
-            .filter(|o| o.join != into_join && o.bounds().intersects(area))
-            .map(|o| o.join)
-            .collect();
-        for from_join in candidates {
+        self.orb_cells.near(area, &mut self.orb_candidates);
+        let mut candidate = 0;
+        while candidate < self.orb_candidates.len() {
+            let from_join = self.orb_candidates[candidate];
+            candidate += 1;
+            if from_join == into_join {
+                continue;
+            }
             let Some(i) = self.orbs.locate(into_join) else {
-                return;
+                break;
             };
             let Some(j) = self.orbs.locate(from_join) else {
                 continue;
@@ -518,7 +529,7 @@ impl Game<'_> {
                 continue;
             }
             let Some(i) = self.orbs.locate(into_join) else {
-                return;
+                break;
             };
             let written = (self.orbs[i].value, self.orbs[i].count) != (into_value, into_count);
             let fresh = self.orbs.locate(from_join).filter(|&j| {
@@ -544,6 +555,8 @@ impl Game<'_> {
             let age = self.orbs[j].age;
             self.orbs[i].count = count;
             self.orbs[i].age = self.orbs[i].age.min(age);
+            let from_at = self.orbs[j].position;
+            self.orb_cells.remove(from_join, from_at);
             self.orbs.remove(j);
         }
     }
@@ -612,6 +625,11 @@ impl Game<'_> {
             following: None,
             fire_ticks: 0,
         });
+        // Keep the index current when an orb is spawned during this ordered pass.
+        // Join ids are resolved again before use, so a listener removing it is safe.
+        if let Some(orb) = self.orbs.last() {
+            self.orb_cells.insert(orb.join, orb.position);
+        }
         // ServerLevel.addFreshEntity.
         self.native_joins_flush(false, 0);
     }
