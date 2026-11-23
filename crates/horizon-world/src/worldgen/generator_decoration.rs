@@ -1303,13 +1303,13 @@ impl PlacementContext for World<'_> {
             return Ok(behaviours.has_flag(state, crate::level::data::state_flags::CAN_OCCLUDE));
         }
         let properties = &self.blocks()?.properties;
-        let name = properties
+        let state = properties
             .registry()
             .state(state)
-            .ok_or(PlacementQueryError::Unavailable)?
-            .name
-            .clone();
-        Ok(properties.definition(&name).is_some_and(|d| d.can_occlude))
+            .ok_or(PlacementQueryError::Unavailable)?;
+        Ok(properties
+            .definition(&state.name)
+            .is_some_and(|definition| definition.can_occlude))
     }
     fn collision_full_block(
         &mut self,
