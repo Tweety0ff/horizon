@@ -193,6 +193,24 @@ mod tests {
         Some((field("xPos"), field("zPos"), field("version")))
     }
 
+    /// A cold header read must not hold the shared cache lock: other far
+    /// sampling workers need to load unrelated region files at the same time.
+    #[test]
+    fn a_cold_header_is_loaded_outside_the_shared_cache_lock() {
+        let regions = FarRegions::default();
+        let path = std::env::temp_dir()
+            .join(format!("horizon-far-header-lock-{}", std::process::id()))
+            .join("r.0.0.mca");
+        let record = regions.read(ChunkPos::new(0, 0), 0, || {
+            assert!(
+                regions.0.try_lock().is_ok(),
+                "cold region header I/O held the shared far-region cache lock"
+            );
+            path
+        });
+        assert!(record.is_none());
+    }
+
     /// The writer puts a chunk in the first free sectors and then frees its
     /// old ones: the header kept from before names a place that now holds
     /// another chunk.
