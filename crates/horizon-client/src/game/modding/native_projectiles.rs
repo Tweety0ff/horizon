@@ -241,7 +241,8 @@ impl Game<'_> {
         if let Some(mob) = self.mob_index.get(&self.mobs, id) {
             return (id, mob_kind(mob));
         }
-        if let Some(cart) = self.carts.iter().find(|c| c.id == id) {
+        if let Some(i) = self.entity_indices.carts.find(&self.carts, id, |c| c.id) {
+            let cart = &self.carts[i];
             return (id, cart.kind.id().into());
         }
         if self.lan_guest_entities().iter().any(|&(_, e)| e == id) {

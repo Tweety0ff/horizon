@@ -398,7 +398,7 @@ impl Game<'_> {
                 // Entity.recreateFromPacket: objects must exist before applying motion.
                 self.remote_motion(p.id, p.velocity);
                 if self.minecart_improvements()
-                    && self.carts.iter().any(|c| c.id == p.id as u32)
+                    && self.entity_indices.carts.find(&self.carts, p.id as u32, |c| c.id).is_some()
                     && let Some(r) = self.remote.as_mut()
                 {
                     r.cart_lerps.insert(p.id, CartLerp::new());
@@ -519,7 +519,7 @@ impl Game<'_> {
                         Some(&block) => Some(Holder::Knot(block)),
                         // Not a known knot yet: kept by id until the knot
                         // arrives (game/network/remote_objects.rs).
-                        None if self.boats.iter().any(|b| b.id == d as u32) => {
+                        None if self.entity_indices.boats.find(&self.boats, d as u32, |b| b.id).is_some() => {
                             Some(Holder::Boat(d as u32))
                         }
                         None => Some(Holder::Mob(d as u32)),
@@ -1175,7 +1175,7 @@ impl Game<'_> {
                     self.remote_totem(p.id);
                 }
                 // Mob.handleEntityEvent 20: the spawn poof.
-                if p.event == 20 && self.mobs.iter().any(|m| m.id == p.id as u32) {
+                if p.event == 20 && self.mob_index.get(&self.mobs, p.id as u32).is_some() {
                     self.poof_particles(p.id as u32);
                 }
                 // The particle bursts of Villager 12 to 14 and 42, TamableAnimal
