@@ -243,13 +243,14 @@ impl Game<'_> {
             // Entity.handleOnAboveBubbleColumn: the server sends the particles of
             // the surface of a bubble column the item is at the top of.
             if merging {
-                bubble_tops.extend(horizon_client::motion::bubble_column_surfaces(
+                horizon_client::motion::bubble_column_surfaces_into(
                     &self.world,
                     self.pack.assets.registry,
                     self.res.facts(),
                     self.collision,
                     item.bounds(),
-                ));
+                    &mut bubble_tops,
+                );
             }
             // `Entity.applyEffectsFromBlocks` after the move, before the merge
             // and the lifetime check; an item below the world was discarded
