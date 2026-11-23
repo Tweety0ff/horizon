@@ -35,6 +35,32 @@ struct FarRegion {
 #[derive(Default)]
 pub(super) struct FarRegions(Mutex<crate::fast_hash::FxHashMap<(i32, i32), FarRegion>>);
 
+impl FarRegions {
+    /// Keep the cache strictly bounded. A region's header is read from disk
+    /// outside this lock, so concurrent cold misses can arrive together;
+    /// evict the oldest checked entry rather than letting a burst of fresh
+    /// regions grow the cache beyond its memory budget.
+    fn make_room(
+        regions: &mut crate::fast_hash::FxHashMap<(i32, i32), FarRegion>,
+        incoming: (i32, i32),
+    ) {
+        regions.retain(|_, kept| kept.checked.elapsed() < HEADER_TTL);
+        if regions.contains_key(&incoming) {
+            return;
+        }
+        while regions.len() >= KEPT_HEADERS {
+            let oldest = regions
+                .iter()
+                .min_by_key(|(_, kept)| kept.checked)
+                .map(|(key, _)| *key);
+            let Some(oldest) = oldest else {
+                break;
+            };
+            regions.remove(&oldest);
+        }
+    }
+}
+
 /// The writer at work on a region, from `writing` until it is dropped.
 pub(super) struct Writing<'a>(&'a RegionCache, (i32, i32));
 
@@ -78,12 +104,7 @@ impl FarRegions {
                 Some(kept) if kept.written == written && kept.checked.elapsed() < HEADER_TTL => {
                     Some(kept.header.clone())
                 }
-                _ => {
-                    if regions.len() >= KEPT_HEADERS {
-                        regions.retain(|_, kept| kept.checked.elapsed() < HEADER_TTL);
-                    }
-                    None
-                }
+                _ => None
             }
         };
         let header = match cached {
@@ -100,9 +121,7 @@ impl FarRegions {
                         kept.header.clone()
                     }
                     _ => {
-                        if regions.len() >= KEPT_HEADERS {
-                            regions.retain(|_, kept| kept.checked.elapsed() < HEADER_TTL);
-                        }
+                        Self::make_room(&mut regions, region);
                         regions.insert(
                             region,
                             FarRegion {
@@ -191,6 +210,29 @@ mod tests {
         let root = save.far_record(x, z)?;
         let field = |name| number(root.tag.get(name)).unwrap();
         Some((field("xPos"), field("zPos"), field("version")))
+    }
+
+    /// Fresh negative and positive header entries share the same strict
+    /// memory budget; a fast traversal cannot retain every region it visits.
+    #[test]
+    fn kept_region_headers_never_exceed_the_cache_limit() {
+        let regions = FarRegions::default();
+        for x in 0..(KEPT_HEADERS as i32 + 32) {
+            let chunk = ChunkPos::new(x * 32, 0);
+            assert!(regions
+                .read(chunk, 0, || {
+                    PathBuf::from(format!(
+                        "horizon-missing-far-region-{}-{x}.mca",
+                        std::process::id()
+                    ))
+                })
+                .is_none());
+            assert!(
+                regions.0.lock().unwrap().len() <= KEPT_HEADERS,
+                "far-region header cache exceeded {KEPT_HEADERS} entries"
+            );
+        }
+        assert_eq!(regions.0.lock().unwrap().len(), KEPT_HEADERS);
     }
 
     /// A cold header read must not hold the shared cache lock: other far
