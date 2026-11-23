@@ -447,10 +447,11 @@ fn state(
         .map_err(|e| resource(format!("block state {raw}: {e}")))
 }
 
-/// Resize a worker-owned density buffer without allocating when the next column
-/// has the same height. `sample_volume` overwrites the whole slice.
+/// Reuse a worker-owned density buffer while preserving fresh-Vec zeroes:
+/// some samplers leave parts of the output slice untouched.
 fn density_scratch(scratch: &mut Vec<f32>, height: usize) -> &mut [f32] {
     scratch.resize(height, 0.0);
+    scratch.fill(0.0);
     scratch
 }
 
@@ -3190,15 +3191,17 @@ mod tests {
     #[test]
     fn density_scratch_reuses_its_allocation_for_equal_heights() {
         let mut scratch = Vec::new();
-        let pointer = {
+        let (pointer, capacity) = {
             let density = density_scratch(&mut scratch, 384);
-            density.as_ptr()
+            density.fill(7.0);
+            (density.as_ptr(), density.len())
         };
         let capacity = scratch.capacity();
         {
             let density = density_scratch(&mut scratch, 384);
             assert_eq!(density.as_ptr(), pointer);
             assert_eq!(density.len(), 384);
+            assert!(density.iter().all(|value| *value == 0.0));
         }
         assert_eq!(scratch.capacity(), capacity);
         let _ = density_scratch(&mut scratch, 256);
