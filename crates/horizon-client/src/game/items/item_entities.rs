@@ -353,6 +353,7 @@ impl Game<'_> {
         }
         let mut removed_iter = removed.iter();
         items.retain(|_| !*removed_iter.next().unwrap_or(&false));
+        drop(removed_iter);
         let Some(p) = self.player.as_ref() else {
             self.put_back_dropped(items);
             self.spawn_destroyed_contents_reusing(&mut destroyed);
@@ -551,6 +552,12 @@ impl Game<'_> {
                 continue;
             };
             let (a, b) = (&self.orbs[i], &self.orbs[j]);
+            // The spatial grid is deliberately coarse; keep the exact box
+            // filter that the original full-list scan performed before mods
+            // are asked whether these two orbs may merge.
+            if !b.bounds().intersects(area) {
+                continue;
+            }
             let (into, into_value, into_count, into_age) = (a.id, a.value, a.count, a.age);
             let (from, from_value, from_count) = (b.id, b.value, b.count);
             let vanilla = b.can_merge(a.id, a.value);
