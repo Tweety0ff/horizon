@@ -238,7 +238,7 @@ impl Game<'_> {
             };
             return (entity, kind.into());
         }
-        if let Some(mob) = self.mobs.iter().find(|m| m.id == id) {
+        if let Some(mob) = self.mob_index.get(&self.mobs, id) {
             return (id, mob_kind(mob));
         }
         if let Some(cart) = self.carts.iter().find(|c| c.id == id) {

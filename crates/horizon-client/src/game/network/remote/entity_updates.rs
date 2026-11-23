@@ -108,9 +108,9 @@ impl Game<'_> {
     /// Put the copy under the landing spot.
     pub(super) fn place_ghast_under_body(&mut self, id: u32, spot: Vec3) {
         let Some(m) = self
-            .mobs
-            .iter_mut()
-            .find(|m| m.id == id && m.species() == horizon_client::mobs::Species::HappyGhast)
+            .mob_index
+            .get_mut(&mut self.mobs, id)
+            .filter(|m| m.species() == horizon_client::mobs::Species::HappyGhast)
         else {
             return;
         };
@@ -148,7 +148,7 @@ impl Game<'_> {
             .entity
             .as_ref()
             .and_then(|e| {
-                let m = self.mobs.iter().find(|m| m.id == e.id as u32)?;
+                let m = self.mob_index.get(&self.mobs, e.id as u32)?;
                 let y = if e.anchor == EYES {
                     m.eye_y()
                 } else {

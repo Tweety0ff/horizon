@@ -136,9 +136,8 @@ impl Game<'_> {
                 .filter_map(|(i, m)| {
                     let look = match m.ai.target.filter(|_| m.extra.flag) {
                         Some(Who::Mob(id)) => self
-                            .mobs
-                            .iter()
-                            .find(|t| t.id == id)
+                            .mob_index
+                            .get(&self.mobs, id)
                             .map(|t| [t.position.x, t.eye_y(), t.position.z]),
                         _ => camera,
                     };

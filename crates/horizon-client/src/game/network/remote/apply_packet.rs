@@ -1218,9 +1218,8 @@ impl Game<'_> {
                             .as_ref()
                             .map(|q| [q.position.x, q.position.y, q.position.z])
                     } else {
-                        self.mobs
-                            .iter()
-                            .find(|m| m.id == p.id as u32)
+                        self.mob_index
+                            .get(&self.mobs, p.id as u32)
                             .map(|m| [m.position.x, m.position.y, m.position.z])
                     };
                     if let Some(at) = at {

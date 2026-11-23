@@ -203,7 +203,7 @@ impl Game<'_> {
             ),
         )?;
         // A jockey's other mob comes after it: this one is found by its id.
-        if let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) {
+        if let Some(m) = self.mob_index.get_mut(&mut self.mobs, id) {
             m.no_ai = options.no_ai;
             m.invisible = options.invisible;
             m.silent = options.silent;
@@ -232,7 +232,7 @@ impl Game<'_> {
         if !self.native_mob_level(dimension) {
             return None;
         }
-        let mob = self.mobs.iter().find(|m| m.id == id && !m.removed)?;
+        let mob = self.mob_index.get(&self.mobs, id).filter(|m| !m.removed)?;
         mob.alive().then(|| self.native_mob_of(mob))
     }
     /// The living mobs in the level in place, `dimension`; none on a client's
