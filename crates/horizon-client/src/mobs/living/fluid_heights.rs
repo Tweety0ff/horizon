@@ -5,7 +5,6 @@ use super::Fluids;
 use crate::blocks::Fluid;
 use horizon_core::geometry::{Aabb, Vec3};
 
-
 /// FluidState.getHeight: a full block under the same fluid, else amount / 9.
 fn fluid_height_at(
     world: &crate::world::World,

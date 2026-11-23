@@ -41,3 +41,26 @@ pub(super) struct EntityIndices {
     pub(super) armor_stands: IdIndex,
     pub(super) remote_hooks: IdIndex,
 }
+
+#[cfg(test)]
+mod id_index_tests {
+    use super::IdIndex;
+
+    #[derive(Clone, Copy)]
+    struct Row(u32);
+
+    #[test]
+    fn cached_lookup_recovers_after_reorder_remove_and_reinsert() {
+        let index = IdIndex::default();
+        let mut rows = vec![Row(9), Row(3), Row(7)];
+        let id = |row: &Row| row.0;
+
+        assert_eq!(index.find(&rows, 3, id), Some(1));
+        rows.swap(1, 2);
+        assert_eq!(index.find(&rows, 3, id), Some(2));
+        rows.remove(2);
+        assert_eq!(index.find(&rows, 3, id), None);
+        rows.push(Row(3));
+        assert_eq!(index.find(&rows, 3, id), Some(2));
+    }
+}

@@ -186,7 +186,11 @@ pub struct OrbCells {
 impl OrbCells {
     const SIDE: f64 = 2.0;
     fn cell(at: Vec3) -> (i32, i32, i32) {
-        ((at.x / Self::SIDE).floor() as i32, (at.y / Self::SIDE).floor() as i32, (at.z / Self::SIDE).floor() as i32)
+        (
+            (at.x / Self::SIDE).floor() as i32,
+            (at.y / Self::SIDE).floor() as i32,
+            (at.z / Self::SIDE).floor() as i32,
+        )
     }
     pub fn rebuild(&mut self, orbs: &[ExperienceOrb]) {
         self.spare.reserve(self.cells.len());
