@@ -918,23 +918,31 @@ impl StructureState {
         chunk: ChunkPos,
     ) -> Vec<Arc<StructureStart>> {
         let (bx, bz) = (chunk.x * 16, chunk.z * 16);
-        let around: Vec<ChunkPos> = (chunk.x - 8..=chunk.x + 8)
-            .flat_map(|sx| (chunk.z - 8..=chunk.z + 8).map(move |sz| ChunkPos::new(sx, sz)))
-            .collect();
-        // Workers generating neighbouring chunks ask for the same starts in the
-        // same order: build those no other worker is building first, and wait
-        // for the others only then, rather than all queueing behind each one.
-        let found: Vec<Option<Starts>> = around
-            .iter()
-            .map(|&at| self.build_starts(context, at, false))
-            .collect();
+        // The search is always 17×17. Keep its nonblocking first pass on the
+        // stack instead of allocating the coordinate list and result Vec for
+        // every chunk. Both passes retain the same X-major, then Z-major order.
+        let mut found: [Option<Starts>; 17 * 17] = std::array::from_fn(|_| None);
+        let mut index = 0;
+        for x in chunk.x - 8..=chunk.x + 8 {
+            for z in chunk.z - 8..=chunk.z + 8 {
+                found[index] = self.build_starts(context, ChunkPos::new(x, z), false);
+                index += 1;
+            }
+        }
         let mut out = Vec::new();
-        for (&at, found) in around.iter().zip(found) {
-            let starts = found.unwrap_or_else(|| self.starts_at(context, at));
-            for start in starts.iter() {
-                let b = start.bounding_box;
-                if b.max[0] >= bx && b.min[0] <= bx + 15 && b.max[2] >= bz && b.min[2] <= bz + 15 {
-                    out.push(start.clone());
+        index = 0;
+        for x in chunk.x - 8..=chunk.x + 8 {
+            for z in chunk.z - 8..=chunk.z + 8 {
+                let at = ChunkPos::new(x, z);
+                let starts = found[index]
+                    .take()
+                    .unwrap_or_else(|| self.starts_at(context, at));
+                index += 1;
+                for start in starts.iter() {
+                    let b = start.bounding_box;
+                    if b.max[0] >= bx && b.min[0] <= bx + 15 && b.max[2] >= bz && b.min[2] <= bz + 15 {
+                        out.push(start.clone());
+                    }
                 }
             }
         }
