@@ -74,10 +74,13 @@ struct Cached {
 #[derive(Default)]
 pub struct RandomTickSections {
     chunks: FxHashMap<(i32, i32), Cached>,
+    /// Reused work list for the masks prepared on each server tick.
+    todo: Vec<((i32, i32), usize, Arc<Chunk>)>,
 }
 impl RandomTickSections {
     pub fn clear(&mut self) {
         self.chunks.clear();
+        self.todo.clear();
     }
     pub fn remove(&mut self, key: &(i32, i32)) {
         self.chunks.remove(key);
@@ -129,27 +132,31 @@ impl RandomTickSections {
         facts: &BlockFacts,
         candidate: &(impl Fn(u32) -> bool + Sync),
     ) {
-        let mut todo: Vec<((i32, i32), usize, Arc<Chunk>)> = Vec::new();
-        for &key in keys {
-            let Some(chunk) = chunk_of(key) else {
-                continue;
-            };
-            let cached = Self::refresh(&mut self.chunks, key, &chunk, &mut |id| {
-                facts.get(BlockStateId(id)).random_ticks
-            });
-            for i in cached.sections.mask.iter() {
-                if cached.masks.get(i).is_some_and(Option::is_none) {
-                    todo.push((key, i, Arc::clone(&chunk)));
+        self.todo.clear();
+        {
+            let chunks = &mut self.chunks;
+            let todo = &mut self.todo;
+            for &key in keys {
+                let Some(chunk) = chunk_of(key) else {
+                    continue;
+                };
+                let cached = Self::refresh(chunks, key, &chunk, &mut |id| {
+                    facts.get(BlockStateId(id)).random_ticks
+                });
+                for i in cached.sections.mask.iter() {
+                    if cached.masks.get(i).is_some_and(Option::is_none) {
+                        todo.push((key, i, Arc::clone(&chunk)));
+                    }
                 }
             }
         }
-        let masks = crate::parallel::par_map(&todo, 128, |part, out| {
+        let masks = crate::parallel::par_map(&self.todo, 128, |part, out| {
             out.extend(
-                (part.iter())
+                part.iter()
                     .map(|(_, i, chunk)| Self::candidate_mask(&chunk.sections[*i], candidate)),
             );
         });
-        for ((key, i, _), mask) in todo.into_iter().zip(masks) {
+        for ((key, i, _), mask) in self.todo.drain(..).zip(masks) {
             if let Some(cached) = self.chunks.get_mut(&key) {
                 cached.masks[i] = Some(Rc::new(mask));
             }
