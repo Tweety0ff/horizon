@@ -1411,12 +1411,10 @@ impl Launcher {
             page = page.child(self.problem_notice(p, cx));
         }
         if self.servers.list.is_empty() {
-            return page
-                .child(centered(
-                    tr("No server yet. Create one: it takes a few seconds, and with the defaults (accept Minecraft's terms, press Create) you get a friends-only survival world."),
-                    &t,
-                ))
-                ;
+            return page.child(centered(
+                tr("No server yet. Create one: it takes a few seconds, and with the defaults (accept Minecraft's terms, press Create) you get a friends-only survival world."),
+                &t,
+            ));
         }
         let mut list = div().flex().flex_col().border_t_1().border_color(t.rule);
         for (i, e) in self.servers.list.clone().into_iter().enumerate() {
