@@ -1239,6 +1239,12 @@ struct Game<'a> {
     /// Reused per-tick item spatial buckets and merge candidates.
     item_cells: horizon_client::entities::ItemCells,
     item_merge_candidates: Vec<u32>,
+    item_removed_scratch: Vec<bool>,
+    item_nearby_scratch: Vec<Aabb>,
+    item_bubble_tops_scratch: Vec<BlockPos>,
+    item_destroyed_scratch: Vec<(ItemStack, Vec3)>,
+    item_splash_scratch: Vec<horizon_client::entities::ItemSplash>,
+    item_obstacles: horizon_client::entities::ObstacleGrid,
     /// Scratch outputs from the remote entity tick.
     remote_using_scratch: Vec<(ItemStack, u32, [f64; 3], f32, f32, f32)>,
     remote_entered_scratch: Vec<horizon_client::entities::ItemSplash>,
@@ -3135,7 +3141,7 @@ impl Game<'_> {
             }
         }
         self.world.moving_piston_fallback = fallback;
-        self.world.moving_pistons = current;
+        self.world.set_moving_pistons(current);
     }
     /// Side effects reported by the behaviour library, in vanilla order.
     fn process_level_events(&mut self) -> Result<()> {
@@ -10728,6 +10734,12 @@ impl<'a> Game<'a> {
             dropped: Default::default(),
             item_cells: Default::default(),
             item_merge_candidates: Vec::new(),
+            item_removed_scratch: Vec::new(),
+            item_nearby_scratch: Vec::new(),
+            item_bubble_tops_scratch: Vec::new(),
+            item_destroyed_scratch: Vec::new(),
+            item_splash_scratch: Vec::new(),
+            item_obstacles: Default::default(),
             remote_using_scratch: Vec::new(),
             remote_entered_scratch: Vec::new(),
             next_entity: 0,

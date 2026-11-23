@@ -193,6 +193,8 @@ pub struct World {
     /// The moving-piston block entities of the level, by position, copied
     /// from the block ticks after each tick: collision and rendering read them.
     pub moving_pistons: Vec<([i32; 3], horizon_world::piston_shape::MovingPistonState)>,
+    /// Position-to-slot index for item collision checks against moving pistons.
+    moving_piston_index: FxHashMap<[i32; 3], usize>,
     /// The `ShulkerBoxBlockEntity` lid state of the level, by position, copied
     /// from the block entities after each tick: the collision queries read it
     /// (`ShulkerBoxBlockEntity.getBoundingBox`), as `moving_pistons` for pistons.
@@ -295,6 +297,34 @@ impl Weather {
     }
 }
 impl World {
+    /// Replace the live piston snapshot and rebuild its position index.
+    pub fn set_moving_pistons(
+        &mut self,
+        pistons: Vec<([i32; 3], horizon_world::piston_shape::MovingPistonState)>,
+    ) {
+        self.moving_piston_index.clear();
+        self.moving_piston_index.reserve(pistons.len());
+        for (i, (position, _)) in pistons.iter().enumerate() {
+            self.moving_piston_index.entry(*position).or_insert(i);
+        }
+        self.moving_pistons = pistons;
+    }
+
+    /// A live moving piston at a block position. Validate the slot because
+    /// existing callers may still edit the public vector directly.
+    pub fn moving_piston_at(
+        &self,
+        position: [i32; 3],
+    ) -> Option<&horizon_world::piston_shape::MovingPistonState> {
+        if let Some(&i) = self.moving_piston_index.get(&position)
+            && let Some((p, state)) = self.moving_pistons.get(i)
+            && *p == position
+        {
+            return Some(state);
+        }
+        self.moving_pistons.iter().find(|(p, _)| *p == position).map(|(_, state)| state)
+    }
+
     /// Install loaded instances, retiring an existing column's block entities even
     /// when the new payload omits their positions. Initial loads need no world scan.
     pub fn load_chunk_block_entities(
@@ -376,6 +406,7 @@ impl World {
             light_log: None,
             moving_piston_fallback: Vec::new(),
             moving_pistons: Vec::new(),
+            moving_piston_index: FxHashMap::default(),
             shulkers: FxHashMap::default(),
             pois: Default::default(),
         }
