@@ -75,7 +75,6 @@ const INDEX: [&[&str]; 10] = [
     &["No AI", "Agents", "MCP"],
     &[
         "Credits",
-        "GitHub",
         "Version",
         "Data folder",
         "Logs",
