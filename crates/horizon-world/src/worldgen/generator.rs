@@ -2285,7 +2285,7 @@ where
             }
             false
         };
-        self.noise_column(x, z, &mut visit);
+        self.noise_column(x, z, &mut worker.noise_column_density, &mut visit);
         let (height, state) = top?;
         // A superflat surface is its top layer, with its one biome.
         if self.flat.is_some() {
