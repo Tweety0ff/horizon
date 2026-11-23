@@ -123,11 +123,7 @@ fn whole_count(plan: &Plan) -> usize {
 }
 
 #[cfg(any(target_os = "linux", windows, test))]
-fn fastest_allowed_cpu_count(
-    cores: &[Core],
-    allowed: &[usize],
-    tolerance: u64,
-) -> Option<usize> {
+fn fastest_allowed_cpu_count(cores: &[Core], allowed: &[usize], tolerance: u64) -> Option<usize> {
     let allowed: BTreeSet<usize> = allowed.iter().copied().collect();
     let fastest_rank = cores
         .iter()
@@ -165,7 +161,6 @@ pub(crate) fn performance_cores() -> Option<usize> {
     let (cores, allowed) = os::topology()?;
     fastest_allowed_cpu_count(&cores, &allowed, 0)
 }
-
 
 struct WorkerState {
     generation: u64,
@@ -960,21 +955,48 @@ mod tests {
     #[test]
     fn fastest_allowed_cpu_count_uses_efficiency_class_and_affinity() {
         let cores = [
-            Core { cpus: vec![0, 1], rank: 5 },
-            Core { cpus: vec![2, 3], rank: 5 },
-            Core { cpus: vec![4], rank: 2 },
-            Core { cpus: vec![5], rank: 2 },
+            Core {
+                cpus: vec![0, 1],
+                rank: 5,
+            },
+            Core {
+                cpus: vec![2, 3],
+                rank: 5,
+            },
+            Core {
+                cpus: vec![4],
+                rank: 2,
+            },
+            Core {
+                cpus: vec![5],
+                rank: 2,
+            },
         ];
-        assert_eq!(fastest_allowed_cpu_count(&cores, &[0, 1, 2, 3, 4, 5], 0), Some(4));
+        assert_eq!(
+            fastest_allowed_cpu_count(&cores, &[0, 1, 2, 3, 4, 5], 0),
+            Some(4)
+        );
         assert_eq!(fastest_allowed_cpu_count(&cores, &[1, 2, 4, 5], 0), Some(2));
         assert_eq!(fastest_allowed_cpu_count(&cores, &[0, 1], 0), None);
         assert_eq!(fastest_allowed_cpu_count(&[], &[0, 1], 0), None);
         let close = [
-            Core { cpus: vec![0, 1], rank: 5_000 },
-            Core { cpus: vec![2, 3], rank: 4_800 },
-            Core { cpus: vec![4, 5], rank: 3_500 },
+            Core {
+                cpus: vec![0, 1],
+                rank: 5_000,
+            },
+            Core {
+                cpus: vec![2, 3],
+                rank: 4_800,
+            },
+            Core {
+                cpus: vec![4, 5],
+                rank: 3_500,
+            },
         ];
-        assert_eq!(fastest_allowed_cpu_count(&close, &[0, 1, 2, 3, 4, 5], 250), Some(4));
+        assert_eq!(
+            fastest_allowed_cpu_count(&close, &[0, 1, 2, 3, 4, 5], 250),
+            Some(4)
+        );
     }
 
     #[test]

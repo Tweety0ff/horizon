@@ -185,10 +185,9 @@ impl Auto {
         }
         match self.state {
             State::Watching => {
-                let heavy =
-                    working >= HEAVY_MS
-                        && performance_cores >= MIN_PERFORMANCE_CORES
-                        && self.ticks >= self.retry_at;
+                let heavy = working >= HEAVY_MS
+                    && performance_cores >= MIN_PERFORMANCE_CORES
+                    && self.ticks >= self.retry_at;
                 self.streak = if heavy { self.streak + 1 } else { 0 };
                 if self.streak >= STREAK {
                     self.before = median;

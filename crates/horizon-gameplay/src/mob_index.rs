@@ -12,8 +12,8 @@
 //! answer is always the linear search's.
 
 use horizon_client::fast_hash::FxHashMap;
-use std::cell::RefCell;
 use horizon_client::mobs::Mob;
+use std::cell::RefCell;
 
 #[derive(Default)]
 pub struct MobIndex {

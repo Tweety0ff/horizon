@@ -26,7 +26,16 @@ mod parallel_sizing_tests {
 
     #[test]
     fn particle_lanes_leave_two_cpus_for_foreground_work() {
-        for (cpus, lanes) in [(1, 1), (2, 1), (3, 1), (4, 2), (6, 4), (8, 6), (12, 6), (32, 6)] {
+        for (cpus, lanes) in [
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 2),
+            (6, 4),
+            (8, 6),
+            (12, 6),
+            (32, 6),
+        ] {
             assert_eq!(parallel_lanes(cpus), lanes, "{cpus} CPUs");
         }
     }

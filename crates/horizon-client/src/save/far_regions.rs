@@ -104,7 +104,7 @@ impl FarRegions {
                 Some(kept) if kept.written == written && kept.checked.elapsed() < HEADER_TTL => {
                     Some(kept.header.clone())
                 }
-                _ => None
+                _ => None,
             }
         };
         let header = match cached {
@@ -219,14 +219,16 @@ mod tests {
         let regions = FarRegions::default();
         for x in 0..(KEPT_HEADERS as i32 + 32) {
             let chunk = ChunkPos::new(x * 32, 0);
-            assert!(regions
-                .read(chunk, 0, || {
-                    PathBuf::from(format!(
-                        "horizon-missing-far-region-{}-{x}.mca",
-                        std::process::id()
-                    ))
-                })
-                .is_none());
+            assert!(
+                regions
+                    .read(chunk, 0, || {
+                        PathBuf::from(format!(
+                            "horizon-missing-far-region-{}-{x}.mca",
+                            std::process::id()
+                        ))
+                    })
+                    .is_none()
+            );
             assert!(
                 regions.0.lock().unwrap().len() <= KEPT_HEADERS,
                 "far-region header cache exceeded {KEPT_HEADERS} entries"

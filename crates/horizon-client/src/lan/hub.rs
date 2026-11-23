@@ -1127,9 +1127,8 @@ impl Hub {
     /// `DedicatedServer.sendLowDiskSpaceWarning`: the players with
     /// `PermissionLevel.ADMINS` (3) or more get `ClientboundLowDiskSpaceWarningPacket`.
     pub fn send_low_disk_space_warning(&self) {
-        let body = super::Body::shared(
-            C::LowDiskSpaceWarning(horizon_protocol::packets::Empty).encode(),
-        );
+        let body =
+            super::Body::shared(C::LowDiskSpaceWarning(horizon_protocol::packets::Empty).encode());
         for g in self.guests.iter().filter(|g| g.placed && g.permission >= 3) {
             g.sender.send_many([body.clone()]);
         }
@@ -1870,7 +1869,7 @@ impl Hub {
                 if level.is_some_and(|l| g.permission < l) {
                     g.tab_hidden.insert(uuid);
                 } else {
-                    g.sender.send(newcomer.clone());
+                    g.sender.send_many([newcomer.clone()]);
                 }
             }
         });
@@ -4721,11 +4720,24 @@ impl Hub {
             if self.ticks - g.teleport_tick > 20 {
                 self.resend_teleport(i, Some(at));
             }
-            return;
+            return self.snap_rotation(i, rot);
         }
         let to = pos.unwrap_or(g.position);
         let rot = rot.unwrap_or((g.yaw, g.pitch));
         self.position_change(i, to, rot, flags, shape, Hearing::Heard, ctx, events);
+    }
+
+    /// `handleMovePlayer` while a teleport awaits its accept (`updateAwaitingTeleport`): the move's
+    /// position is ignored, its turn is not: `absSnapRotationTo(Mth.wrapDegrees(yRot),
+    /// Mth.wrapDegrees(xRot))`, which clamps the pitch to 90 degrees either way. A move without a
+    /// turn carries the player's own, so it changes nothing.
+    fn snap_rotation(&mut self, i: usize, rot: Option<(f32, f32)>) {
+        if let Some((yaw, pitch)) = rot {
+            self.guests.update(i, |g| {
+                g.yaw = wrap_degrees(yaw);
+                g.pitch = wrap_degrees(pitch).clamp(-90.0, 90.0);
+            });
+        }
     }
 
     /// ServerGamePacketListenerImpl.handlePlayerPositionChange.
@@ -4818,14 +4830,16 @@ impl Hub {
         // The anticheat's `ground`: a claim of the ground with nothing to
         // stand on is dropped (no-fall, walking on water).
         let client_on_ground = flags & 1 != 0;
-        let (mut flags, mut corrected) = (flags, false);
+        let (mut flags, mut corrected, mut again) = (flags, false, false);
         if flags & 1 != 0 && self.anticheat.is_some() {
+            use super::anticheat::GroundRefusal;
             match self.anticheat_ground(i, to, stands, ctx, events) {
-                Some(true) => {
+                Some(GroundRefusal::Kicked) => {
                     self.guests.update(i, |g| (g.yaw, g.pitch) = (yaw, pitch));
                     return;
                 }
-                Some(false) => (flags, corrected) = (flags & !1, true),
+                Some(GroundRefusal::Dropped) => (flags, corrected) = (flags & !1, true),
+                Some(GroundRefusal::Again) => (flags, again) = (flags & !1, true),
                 None => {}
             }
         }
@@ -4834,6 +4848,7 @@ impl Hub {
         // that lets the player hover (the server's allow-flight, mayfly,
         // levitation, gliding, riptide). A move whose ground claim the anticheat dropped never counts:
         // a false claim ends in the anticheat's own kick, logged and told to the operators, or not at all.
+        // One it dropped again without a flag (standing still where one was dropped) counts.
         let floating = !corrected && ctx.collision.is_some() && {
             let g = &self.guests[i];
             to[1] - g.position[1] >= -0.03125
@@ -4852,7 +4867,7 @@ impl Hub {
         // handlePlayerPositionChange: a client that says it is on the ground while the last move
         // the server resolved came down onto nothing is sent the blocks under it again, so a
         // client that missed a block change cannot stand on air for good.
-        if flags & 1 != 0 && !self.guests[i].rests_on_ground {
+        if (flags & 1 != 0 || again) && !self.guests[i].rests_on_ground {
             self.force_send_player_support_blocks(i, ctx);
         }
         let accepted = Accepted {

@@ -328,7 +328,6 @@ mod tests {
         }
     }
 
-
     /// A whole batch of unload/reload pairs cancels without quadratic scans or losing saved waits.
     #[test]
     fn bulk_unload_reload_cancellations_preserve_waiting_membership() {

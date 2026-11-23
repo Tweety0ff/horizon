@@ -37,7 +37,10 @@ impl ItemCells {
         if !self.cells.contains_key(&key) {
             self.cells.insert(key, self.spare.pop().unwrap_or_default());
         }
-        self.cells.get_mut(&key).expect("item cell inserted").push(i as u32);
+        self.cells
+            .get_mut(&key)
+            .expect("item cell inserted")
+            .push(i as u32);
     }
     pub fn remove(&mut self, i: usize, at: Vec3) {
         let key = Self::cell(at);
@@ -97,11 +100,19 @@ pub fn merge_with_neighbours<I>(
     I: AsRef<[ItemEntity]> + std::ops::IndexMut<usize, Output = ItemEntity> + ?Sized,
 {
     let mut near = Vec::new();
-    merge_with_neighbours_scratch(items, removed, cells, i, age_is_ticked, &mut near, max_stack);
+    merge_with_neighbours_scratch(
+        items,
+        removed,
+        cells,
+        i,
+        age_is_ticked,
+        &mut near,
+        max_stack,
+    );
 }
 
 /// Variant for tick loops that retain their candidate vector between calls.
-pub(crate) fn merge_with_neighbours_scratch<I>(
+pub fn merge_with_neighbours_scratch<I>(
     items: &mut I,
     removed: &mut [bool],
     cells: &mut ItemCells,
@@ -175,7 +186,6 @@ pub(crate) fn merge_with_neighbours_scratch<I>(
     }
 }
 
-
 /// Experience orbs grouped by their bottom-centre position. Exact AABB checks
 /// remain in the caller; cells only reduce the number of candidate entities.
 #[derive(Default)]
@@ -208,7 +218,10 @@ impl OrbCells {
         if !self.cells.contains_key(&key) {
             self.cells.insert(key, self.spare.pop().unwrap_or_default());
         }
-        self.cells.get_mut(&key).expect("orb cell inserted").push(join);
+        self.cells
+            .get_mut(&key)
+            .expect("orb cell inserted")
+            .push(join);
     }
     pub fn remove(&mut self, join: JoinSeq, at: Vec3) {
         let key = Self::cell(at);
@@ -287,4 +300,3 @@ mod reusable_cells_tests {
         assert_eq!(found, vec![orbs[0].join]);
     }
 }
-

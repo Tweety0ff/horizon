@@ -183,7 +183,7 @@ impl Game<'_> {
                 );
                 (no_physics, alive, discarded, entered, landed, original)
             };
-            let (no_physics, alive, discarded, entered, landed, original) =
+            let (no_physics, alive, discarded, mut entered, landed, original) =
                 match moves.take(i, item, &mut at_turn) {
                     Some(moved) => moved,
                     None => at_turn(item),
@@ -801,10 +801,18 @@ impl Game<'_> {
     }
 
     /// The item entity `spawn_item` just added, unless a native mod kept it
-    /// out of the level (`native_entity_join_level`).
+    /// out of the level (`native_entity_join_level`). Kept as it was, a path
+    /// a native mod can declare; the spawn paths now return the entity id, and
+    /// `dropped_item_mut` is the way to reach that entity.
+    #[allow(dead_code)]
     pub(super) fn just_spawned_item(&mut self) -> Option<&mut ItemEntity> {
         let id = self.next_entity;
         self.dropped.last_mut().filter(|d| d.id == id)
+    }
+
+    /// The dropped item entity `id`, if it is still in the level.
+    pub(super) fn dropped_item_mut(&mut self, id: u32) -> Option<&mut ItemEntity> {
+        self.dropped.iter_mut().rev().find(|d| d.id == id)
     }
 
     /// `new ItemEntity(level, x, y, z, stack, dx, dy, dz)`.
@@ -814,18 +822,19 @@ impl Game<'_> {
         position: [f64; 3],
         velocity: [f64; 3],
         pickup_delay: u32,
-    ) {
-        self.add_item_entity(stack, position, Some(velocity), pickup_delay);
+    ) -> Option<u32> {
+        self.add_item_entity(stack, position, Some(velocity), pickup_delay)
+            .map(|(id, _)| id)
     }
 
     /// `new ItemEntity(level, x, y, z, stack)`: the item leaves with its own
-    /// random's motion, which this returns.
+    /// random's motion, which this returns along with its entity id.
     pub(super) fn spawn_item_own(
         &mut self,
         stack: ItemStack,
         position: [f64; 3],
         pickup_delay: u32,
-    ) -> [f64; 3] {
+    ) -> Option<(u32, [f64; 3])> {
         self.add_item_entity(stack, position, None, pickup_delay)
     }
 
@@ -835,9 +844,10 @@ impl Game<'_> {
         stack: ItemStack,
         position: [f64; 3],
         velocity: [f64; 3],
-    ) {
+    ) -> Option<u32> {
         let random = spill::prepare_item_random(None);
-        self.add_item_entity_prepared(stack, position, Some(velocity), 0, Some(random));
+        self.add_item_entity_prepared(stack, position, Some(velocity), 0, Some(random))
+            .map(|(id, _)| id)
     }
 
     pub(super) fn add_item_entity(
@@ -846,7 +856,7 @@ impl Game<'_> {
         position: [f64; 3],
         velocity: Option<[f64; 3]>,
         pickup_delay: u32,
-    ) -> [f64; 3] {
+    ) -> Option<(u32, [f64; 3])> {
         self.add_item_entity_prepared(stack, position, velocity, pickup_delay, None)
     }
 
@@ -975,12 +985,11 @@ impl Game<'_> {
         let uuid = thrown_from_hand.then(|| self.acting_player_uuid());
         // Only `drop(.., false)` tosses ask `item_toss`: a death's scatter (`randomly`) does not.
         let id = if randomly {
-            self.spawn_item(thrown, at, v, 40);
-            self.next_entity
+            self.spawn_item(thrown, at, v, 40)?
         } else {
             self.toss_item(thrown, at, v, uuid)?
         };
-        let item = self.dropped.iter_mut().rev().find(|d| d.id == id)?;
+        let item = self.dropped_item_mut(id)?;
         item.thrower = uuid;
         Some(item.id)
     }
@@ -1135,7 +1144,8 @@ mod escape_tests {
         let stack = ItemStack::new("minecraft:stone", 2);
         game.spawn_item(stack, [8.5, 64.4, 8.5], [0.0, 0.0, 0.0], 10);
         let item = game.dropped.last_mut().unwrap();
-        item.random = horizon_core::random::EntityRandom::own(horizon_core::random::LegacyRandom::new(12345));
+        item.random =
+            horizon_core::random::EntityRandom::own(horizon_core::random::LegacyRandom::new(12345));
         let mut level = game.world.random.clone();
         game.ticked_entities_through = u32::MAX;
         game.tick_items();

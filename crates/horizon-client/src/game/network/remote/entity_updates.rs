@@ -71,9 +71,9 @@ impl Game<'_> {
             self.tridents[i].velocity = v;
             // AbstractArrow.lerpMotion (ThrownTrident keeps it): `life`
             // restarts, and a trident set moving leaves its block.
-            t.in_ground_time = 0;
-            if t.in_ground && v.length_squared() > 0.0 {
-                t.in_ground = false;
+            self.tridents[i].in_ground_time = 0;
+            if self.tridents[i].in_ground && v.length_squared() > 0.0 {
+                self.tridents[i].in_ground = false;
             }
         } else if let Some(i) = self.entity_indices.rockets.find(&self.rockets, id as u32, |r| r.id) {
             self.rockets[i].velocity = v;

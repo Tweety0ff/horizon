@@ -56,7 +56,10 @@ impl ObstacleGrid {
                         if !self.cells.contains_key(&key) {
                             self.cells.insert(key, self.spare.pop().unwrap_or_default());
                         }
-                        self.cells.get_mut(&key).expect("obstacle cell inserted").push(i as u32);
+                        self.cells
+                            .get_mut(&key)
+                            .expect("obstacle cell inserted")
+                            .push(i as u32);
                     }
                 }
             }

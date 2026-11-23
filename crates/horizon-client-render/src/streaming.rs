@@ -409,13 +409,7 @@ fn decoration_queue(
     wanted: impl Iterator<Item = (i32, i32)>,
     distance: impl Fn(i32, i32) -> i64,
 ) -> std::collections::BinaryHeap<std::cmp::Reverse<(u64, i32, i32)>> {
-    decoration_queue_with_scratch(
-        order,
-        &mut Vec::new(),
-        &mut Vec::new(),
-        wanted,
-        distance,
-    )
+    decoration_queue_with_scratch(order, &mut Vec::new(), &mut Vec::new(), wanted, distance)
 }
 fn decoration_queue_with_scratch(
     order: &mut DecorationOrder,
@@ -788,6 +782,8 @@ pub struct Streaming {
     /// Cached face visibility and scratch buffers for synchronous edit meshing (`mesh_immediate`).
     immediate_faces: Faces,
     immediate_scratch: MeshScratch,
+    /// Frames left before nearby sections are meshed synchronously again (`NEARBY_COOLDOWN_FRAMES`).
+    nearby_cooldown: immediate_mesh::NearbyCooldown,
 }
 /// Snapshot only after a scan found no missing candidates. Public range fields
 /// and `World::chunks` can change without going through Streaming, so compare
@@ -938,9 +934,8 @@ impl GenerationScan {
             {
                 let runs = &mut self.scan_runs;
                 runs.clear();
-                for (center, radius) in
-                    std::iter::once((input.ranges.center, input.ranges.radius))
-                        .chain(input.ranges.extra.iter().copied())
+                for (center, radius) in std::iter::once((input.ranges.center, input.ranges.radius))
+                    .chain(input.ranges.extra.iter().copied())
                 {
                     let r = radius + margin.max(reach + 1);
                     runs.extend(
@@ -1419,6 +1414,7 @@ impl Streaming {
             band_ranked: None,
             immediate_faces: None,
             immediate_scratch: MeshScratch::default(),
+            nearby_cooldown: Default::default(),
         }
     }
     /// Shares generation resources, but gives distant work its own worker state.
@@ -2639,11 +2635,7 @@ impl Streaming {
     /// before they are meshed again. Returns the edits left to light in the
     /// frame: those in columns that can't be lit whole yet (the edge of the
     /// loaded area).
-    fn relight_on_workers(
-        &mut self,
-        world: &mut World,
-        positions: &mut Vec<(i32, i32, i32)>,
-    ) {
+    fn relight_on_workers(&mut self, world: &mut World, positions: &mut Vec<(i32, i32, i32)>) {
         let mut touched = std::mem::take(&mut self.light_touched_scratch);
         let mut whole = std::mem::take(&mut self.light_whole_scratch);
         partition_whole_relight_columns(positions, &mut touched, &mut whole, |x, z| {
@@ -2664,9 +2656,7 @@ impl Streaming {
             self.light_log
                 .iter()
                 .filter(|(seq, p)| {
-                    *seq > snapshot
-                        && ((p.0 >> 4) - x).abs() <= 1
-                        && ((p.2 >> 4) - z).abs() <= 1
+                    *seq > snapshot && ((p.0 >> 4) - x).abs() <= 1 && ((p.2 >> 4) - z).abs() <= 1
                 })
                 .map(|(_, p)| *p),
         );
@@ -4837,23 +4827,17 @@ mod tests {
         let mut positions = vec![(3, 70, 4), (15, 64, 15), (16, 80, 0), (31, 64, 9)];
         let mut touched = FxHashSet::default();
         let mut whole = FxHashSet::default();
-        partition_whole_relight_columns(
-            &mut positions,
-            &mut touched,
-            &mut whole,
-            |x, z| (x, z) != (2, 1),
-        );
+        partition_whole_relight_columns(&mut positions, &mut touched, &mut whole, |x, z| {
+            (x, z) != (2, 1)
+        });
         let capacities = (touched.capacity(), whole.capacity());
         assert_eq!(positions, vec![(16, 80, 0), (31, 64, 9)]);
         assert!(capacities.0 > 0 && capacities.1 > 0);
 
         positions = vec![(3, 70, 4), (15, 64, 15), (16, 80, 0), (31, 64, 9)];
-        partition_whole_relight_columns(
-            &mut positions,
-            &mut touched,
-            &mut whole,
-            |x, z| (x, z) != (2, 1),
-        );
+        partition_whole_relight_columns(&mut positions, &mut touched, &mut whole, |x, z| {
+            (x, z) != (2, 1)
+        });
         assert_eq!(positions, vec![(16, 80, 0), (31, 64, 9)]);
         assert_eq!((touched.capacity(), whole.capacity()), capacities);
     }
@@ -5177,11 +5161,16 @@ mod tests {
 
             let expected = baseline_candidates(fixture.input(), 3);
             assert_eq!(expected.len(), 3);
-            assert!(gate
-                .candidates_into(fixture.input(), 3, &mut batch)
-                .is_some());
+            assert!(
+                gate.candidates_into(fixture.input(), 3, &mut batch)
+                    .is_some()
+            );
             assert_eq!(batch, expected);
-            let capacities = (batch.capacity(), gate.plan.capacity(), gate.scan_runs.capacity());
+            let capacities = (
+                batch.capacity(),
+                gate.plan.capacity(),
+                gate.scan_runs.capacity(),
+            );
             assert!(capacities.1 > 0 && capacities.2 > 0);
 
             // A changed view forces another full scan, but each scratch
@@ -5189,12 +5178,17 @@ mod tests {
             fixture.center = (1, -1);
             batch.clear();
             let expected = baseline_candidates(fixture.input(), 3);
-            assert!(gate
-                .candidates_into(fixture.input(), 3, &mut batch)
-                .is_some());
+            assert!(
+                gate.candidates_into(fixture.input(), 3, &mut batch)
+                    .is_some()
+            );
             assert_eq!(batch, expected);
             assert_eq!(
-                (batch.capacity(), gate.plan.capacity(), gate.scan_runs.capacity()),
+                (
+                    batch.capacity(),
+                    gate.plan.capacity(),
+                    gate.scan_runs.capacity()
+                ),
                 capacities
             );
         }

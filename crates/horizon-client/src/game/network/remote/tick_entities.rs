@@ -1,6 +1,7 @@
 //! Abilities, pushing, and ticking the server's entities on the client.
 
 use super::*;
+use crate::game::RemoteMobPrep;
 
 impl Game<'_> {
     /// The last `ClientboundPlayerAbilities` the server sent, on a client.

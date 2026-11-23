@@ -147,8 +147,14 @@ mod tests {
         assert_eq!(pool_cores(Pool::TickHelper, 10, 4), 4);
         assert_eq!(pool_cores(Pool::ChunkDecoder, 10, 4), 10);
         assert_eq!(pool_cores(Pool::SaveCompression, 10, 4), 10);
-        assert_eq!(sizing(false, pool_cores(Pool::TickHelper, 10, 4), Pool::TickHelper), 2);
-        assert_eq!(sizing(true, pool_cores(Pool::TickHelper, 10, 4), Pool::TickHelper), 1);
+        assert_eq!(
+            sizing(false, pool_cores(Pool::TickHelper, 10, 4), Pool::TickHelper),
+            2
+        );
+        assert_eq!(
+            sizing(true, pool_cores(Pool::TickHelper, 10, 4), Pool::TickHelper),
+            1
+        );
     }
 
     /// A plain Jobs pool is the streaming pool's own automatic count, so the table

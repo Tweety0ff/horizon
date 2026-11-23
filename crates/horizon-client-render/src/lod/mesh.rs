@@ -98,14 +98,14 @@ pub(super) struct Mesher {
     pub(super) shader_pack: bool,
 }
 impl Mesher {
-    pub(super) fn mesh(
+    pub(super) fn mesh<'a>(
         &mut self,
         key: TileKey,
-        columns: &[&[Span]],
+        columns: &[&'a [Span]],
         covered: &FxHashSet<(i32, i32)>,
         covered_bounds: Option<[i32; 4]>,
         context: &WorkerContext,
-        neighbors: &[EdgeColumns<'_>; 4],
+        neighbors: &[EdgeColumns<'a>; 4],
         finer: &[TileKey],
     ) -> SectionMesh {
         let Self {
@@ -123,14 +123,7 @@ impl Mesher {
                     Self::material(styles, *looks, *shader_pack, s, d, at, context)
                 };
                 mesh_columns_with_edges::<()>(
-                    key,
-                    columns,
-                    c,
-                    b,
-                    neighbors,
-                    finer,
-                    finer_keys,
-                    material,
+                    key, columns, c, b, neighbors, finer, finer_keys, material,
                 )
             }
             true => {
@@ -138,14 +131,7 @@ impl Mesher {
                     Self::material(styles, *looks, *shader_pack, s, d, at, context)
                 };
                 mesh_columns_with_edges::<[u32; 2]>(
-                    key,
-                    columns,
-                    c,
-                    b,
-                    neighbors,
-                    finer,
-                    finer_keys,
-                    material,
+                    key, columns, c, b, neighbors, finer, finer_keys, material,
                 )
             }
         }
@@ -561,12 +547,12 @@ fn finer_cell_steps(key: TileKey, finer: &[TileKey], stride: i32) -> [i32; CELLS
     steps
 }
 
-fn mesh_columns_with_edges<L: Look>(
+fn mesh_columns_with_edges<'a, L: Look>(
     key: TileKey,
-    columns: &[&[Span]],
+    columns: &[&'a [Span]],
     covered: &FxHashSet<(i32, i32)>,
     covered_bounds: Option<[i32; 4]>,
-    neighbors: &[EdgeColumns<'_>; 4],
+    neighbors: &[EdgeColumns<'a>; 4],
     finer: &[TileKey],
     finer_keys: &FxHashSet<TileKey>,
     mut material: impl FnMut(&Span, Direction, [i32; 2]) -> Material<L>,
@@ -624,12 +610,12 @@ fn mesh_columns_with_edges<L: Look>(
 }
 
 #[inline]
-fn mesh_columns_prepared<L: Look>(
+fn mesh_columns_prepared<'a, L: Look>(
     key: TileKey,
-    columns: &[&[Span]],
+    columns: &[&'a [Span]],
     covered: &FxHashSet<(i32, i32)>,
     covered_bounds: Option<[i32; 4]>,
-    neighbors: &[EdgeColumns<'_>; 4],
+    neighbors: &[EdgeColumns<'a>; 4],
     finer: &[TileKey],
     finer_keys: &FxHashSet<TileKey>,
     mut material: impl FnMut(&Span, Direction, [i32; 2]) -> Material<L>,
@@ -1193,8 +1179,8 @@ impl FilledSpans<'_> {
 /// block. Unknown neighbours, and cells that `whole` rejects (they meet
 /// full-detail or finer terrain), count as open; those cells keep their gaps.
 fn fill_buried_gaps<'a>(
-    columns: &'a [&'a [Span]],
-    neighbors: &'a [EdgeColumns<'a>; 4],
+    columns: &[&'a [Span]],
+    neighbors: &[EdgeColumns<'a>; 4],
     stride: i32,
     whole: impl Fn(usize, usize) -> bool,
     mut fluid: impl FnMut(&Span) -> bool,
@@ -1562,14 +1548,20 @@ mod tests {
                 unknown: false,
             });
         }
-        assert!(!edges.spilled(), "four edge segments fit without a heap allocation");
+        assert!(
+            !edges.spilled(),
+            "four edge segments fit without a heap allocation"
+        );
         edges.push(EdgeColumn {
             start: 4,
             end: 5,
             spans: &[],
             unknown: false,
         });
-        assert!(edges.spilled(), "larger adaptive boundaries may grow safely");
+        assert!(
+            edges.spilled(),
+            "larger adaptive boundaries may grow safely"
+        );
     }
     fn span(min: i16, max: i16, state: u32) -> Span {
         Span {

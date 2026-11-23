@@ -140,6 +140,10 @@ pub struct Player {
     /// `waypoint_transmit_range`: 0 while hidden.
     pub transmit_range: f64,
     pub receive_range: f64,
+    /// Both ranges were read from the player's body. A guest whose body is not made yet has the
+    /// default ranges until it is: its first real read is how vanilla's `addPlayer` saw it on
+    /// joining, not an attribute change.
+    pub ranges_known: bool,
     /// `Entity.firstTick`: the player has not ticked since joining.
     pub first_tick: bool,
     /// The chunk view radius (`ChunkMap.getPlayerViewDistance`).
@@ -186,6 +190,11 @@ struct Memo {
     /// The centre of the player's ChunkTrackingView (`ChunkMap.move`).
     view_center: [i32; 2],
     transmitting: bool,
+    /// The computed `waypoint_transmit_range` and `waypoint_receive_range` the manager last saw:
+    /// vanilla's `onAttributeUpdated` runs on every change of either, not only across zero.
+    transmit_range: f64,
+    receive_range: f64,
+    ranges_known: bool,
     team: Option<(String, Option<i32>)>,
     icon: Icon,
 }
@@ -337,7 +346,7 @@ pub struct Waypoints {
     all_moves_scratch: Vec<u32>,
     all_slots_scratch: Vec<u32>,
     gone_scratch: Vec<u128>,
-    view_scratch: HashMap<u128, View>,
+    view_scratch: HashMap<u128, ([i32; 2], i32)>,
     updates_scratch: HashMap<u128, OnceLock<Option<Arc<Encoded>>>>,
     /// Per-receiver packet vectors, drained into the returned batch and reused next tick.
     job_out_scratch: Vec<Vec<(u32, Sent)>>,
@@ -432,17 +441,12 @@ impl Shared<'_> {
         icon: &Icon,
         target: WaypointTarget,
     ) {
-        let Some(conn) = self
-            .players
-            .get(&receiver)
-            .and_then(|p| p.conn)
-            .or_else(|| {
-                self.away
-                    .iter()
-                    .find(|(uuid, _)| *uuid == receiver)
-                    .map(|&(_, conn)| conn)
-            })
-        else {
+        let Some(conn) = self.player(receiver).and_then(|p| p.conn).or_else(|| {
+            self.away
+                .iter()
+                .find(|(uuid, _)| *uuid == receiver)
+                .map(|&(_, conn)| conn)
+        }) else {
             return;
         };
         out.push((conn, waypoint(source, operation, icon, target).into()));
@@ -892,6 +896,10 @@ impl Waypoints {
     }
     /// `removePlayer`.
     fn remove_player(&mut self, t: &mut Tick, player: u128) {
+        self.remove_player_keeping(t, player, false);
+    }
+    /// `remove_player`, leaving the player's own waypoint tracked when `keep_waypoint`.
+    fn remove_player_keeping(&mut self, t: &mut Tick, player: u128, keep_waypoint: bool) {
         self.epoch += 1;
         for source in self
             .connections
@@ -901,7 +909,9 @@ impl Waypoints {
         {
             t.disconnect(player, source);
         }
-        self.untrack(t, player);
+        if !keep_waypoint {
+            self.untrack(t, player);
+        }
         self.players.retain(|p| *p != player);
     }
     /// `breakAllConnections`.
@@ -989,7 +999,7 @@ impl Waypoints {
                 t.view.insert(*uuid, (memo.view_center, p.view_distance));
             }
         }
-        // Players who left, and the ServerPlayer a respawn replaced.
+        // Receivers first in their existing order, then silent entities by UUID.
         let mut gone = std::mem::take(&mut self.gone_scratch);
         gone.clear();
         gone.extend(
@@ -998,6 +1008,12 @@ impl Waypoints {
                 .copied()
                 .filter(|uuid| t.s.player(*uuid).is_none() || respawned.contains(uuid)),
         );
+        let receivers_gone = gone.len();
+        gone.extend(self.memo.keys().copied().filter(|uuid| {
+            (t.s.player(*uuid).is_none() || respawned.contains(uuid))
+                && !self.players.contains(uuid)
+        }));
+        gone[receivers_gone..].sort_unstable();
         for uuid in gone.drain(..) {
             self.remove_player(&mut t, uuid);
             self.memo.remove(&uuid);
@@ -1023,6 +1039,9 @@ impl Waypoints {
                     position: p.position,
                     view_center: center,
                     transmitting,
+                    transmit_range: p.transmit_range,
+                    receive_range: p.receive_range,
+                    ranges_known: p.ranges_known,
                     team: p.team.clone(),
                     icon: p.icon.clone(),
                 },
@@ -1043,7 +1062,9 @@ impl Waypoints {
         if players.len() >= by_receiver
             && players.iter().all(|p| {
                 let memo = &self.memo[&p.uuid];
-                (p.transmit_range > 0.0) == memo.transmitting
+                p.transmit_range == memo.transmit_range
+                    && p.receive_range == memo.receive_range
+                    && (p.transmit_range > 0.0) == memo.transmitting
                     && p.team == memo.team
                     && p.icon == memo.icon
             })
@@ -1078,12 +1099,34 @@ impl Waypoints {
             }
             // LivingEntity.onAttributeUpdated(WAYPOINT_TRANSMIT_RANGE).
             let transmitting = p.transmit_range > 0.0;
-            if transmitting != self.memo[&p.uuid].transmitting {
-                self.memo.get_mut(&p.uuid).unwrap().transmitting = transmitting;
+            let memo = self.memo.get_mut(&p.uuid).unwrap();
+            let changed = p.transmit_range != memo.transmit_range;
+            memo.transmit_range = p.transmit_range;
+            if transmitting != memo.transmitting {
+                memo.transmitting = transmitting;
                 if transmitting {
                     self.track(&mut t, p.uuid);
                 } else {
                     self.untrack(&mut t, p.uuid);
+                }
+            } else if changed && transmitting {
+                // A new value while still transmitting is `trackWaypoint` again.
+                self.track(&mut t, p.uuid);
+            }
+            // ServerPlayer.onAttributeUpdated(WAYPOINT_RECEIVE_RANGE): a receiver
+            // is added (its connections remade, and `addPlayer` tracks it again if it transmits,
+            // even in the tick the transmit callback tracked it) or removed.
+            let memo = self.memo.get_mut(&p.uuid).unwrap();
+            // The first read of a body's ranges is the player as it joined, not a change: one that
+            // receives nothing just never was a receiver, and its waypoint stays.
+            let initial = p.ranges_known && !memo.ranges_known;
+            memo.ranges_known = p.ranges_known;
+            if p.receive_range != memo.receive_range {
+                memo.receive_range = p.receive_range;
+                if p.receive_range > 0.0 {
+                    self.add_player(&mut t, p.uuid, transmitting);
+                } else {
+                    self.remove_player_keeping(&mut t, p.uuid, initial && transmitting);
                 }
             }
             // ServerScoreboard: a team joined, left or recoloured remakes the connections.
@@ -1149,20 +1192,13 @@ impl Waypoints {
         let mut job_outs = std::mem::take(&mut self.job_out_scratch);
         let mut jobs = std::mem::take(&mut self.jobs_scratch);
         jobs.clear();
-        for (receiver, listed) in self
-            .players
-            .iter()
-            .map(|&receiver| (receiver, true))
-            .chain(
-                moves
-                    .iter()
-                    .filter(|m| m.receives && !self.players.contains(&m.uuid))
-                    .map(|m| (m.uuid, false)),
-            )
-        {
-            let mut out = job_outs
-                .pop()
-                .unwrap_or_else(|| Vec::with_capacity(64));
+        for (receiver, listed) in self.players.iter().map(|&receiver| (receiver, true)).chain(
+            moves
+                .iter()
+                .filter(|m| m.receives && !self.players.contains(&m.uuid))
+                .map(|m| (m.uuid, false)),
+        ) {
+            let mut out = job_outs.pop().unwrap_or_else(|| Vec::with_capacity(64));
             out.clear();
             jobs.push(MoveJob {
                 receiver,
@@ -1240,9 +1276,9 @@ impl Waypoints {
             all_slots.extend(0..sources.len() as u32);
         }
         let epoch = self.epoch + 1;
-        let (s, waypoints, moves) = (&t.s, &self.waypoints, &moves);
-        let (sources, slot, move_of, own) = (&sources, &slot, &move_of, &own);
-        let (changed_moves, changed_slots) = (&changed_moves, &changed_slots);
+        let (s, waypoints, moves_ref) = (&t.s, &self.waypoints, &moves);
+        let (sources_ref, slot_ref, move_of_ref, own_ref) = (&sources, &slot, &move_of, &own);
+        let (changed_moves_ref, changed_slots_ref) = (&changed_moves, &changed_slots);
         let (all_moves_view, all_slots_view) = (&all_moves, &all_slots);
         crate::parallel::par_chunks_mut_with_state(
             &mut jobs,
@@ -1252,7 +1288,7 @@ impl Waypoints {
                 for job in jobs {
                     own_moves.clear();
                     own_slots.clear();
-                    let me = s.players.get(&job.receiver).map(|&p| Receiver {
+                    let me = s.player(job.receiver).map(|p| Receiver {
                         conn: p.conn,
                         position: p.position,
                         range: p.receive_range,
@@ -1262,30 +1298,30 @@ impl Waypoints {
                     // calm tick what changed, the pairs this row has no block connection for, and its own.
                     if sparse {
                         let own_id = s.id(job.receiver);
-                        let watch = job.row.watch_for(epoch, own_id, sources);
+                        let watch = job.row.watch_for(epoch, own_id, sources_ref);
                         for &id in watch {
-                            if let Some(&mi) = move_of.get(id as usize)
+                            if let Some(&mi) = move_of_ref.get(id as usize)
                                 && mi != NONE
                             {
-                                let m = &moves[mi as usize];
+                                let m = &moves_ref[mi as usize];
                                 if m.ticked && m.transmits && !m.block_changed {
                                     own_moves.push(mi);
                                 }
                             }
-                            own_slots.push(slot[id as usize]);
+                            own_slots.push(slot_ref[id as usize]);
                         }
-                        if let Some(&mi) = own.get(&job.receiver)
-                            && changed_moves.binary_search(&mi).is_err()
+                        if let Some(&mi) = own_ref.get(&job.receiver)
+                            && changed_moves_ref.binary_search(&mi).is_err()
                         {
                             own_moves.push(mi);
                         }
-                        own_slots.retain(|k| changed_slots.binary_search(k).is_err());
+                        own_slots.retain(|k| changed_slots_ref.binary_search(k).is_err());
                         if !own_moves.is_empty() {
-                            own_moves.extend_from_slice(changed_moves);
+                            own_moves.extend_from_slice(changed_moves_ref);
                             own_moves.sort_unstable();
                         }
                         if !own_slots.is_empty() {
-                            own_slots.extend_from_slice(changed_slots);
+                            own_slots.extend_from_slice(changed_slots_ref);
                             own_slots.sort_unstable();
                         }
                     }
@@ -1294,12 +1330,12 @@ impl Waypoints {
                     } else {
                         (
                             if own_moves.is_empty() {
-                                changed_moves
+                                changed_moves_ref
                             } else {
                                 &own_moves
                             },
                             if own_slots.is_empty() {
-                                changed_slots
+                                changed_slots_ref
                             } else {
                                 &own_slots
                             },
@@ -1312,16 +1348,16 @@ impl Waypoints {
                         out: &mut job.out,
                     };
                     for &mi in meet {
-                        let m = &moves[mi as usize];
+                        let m = &moves_ref[mi as usize];
                         if m.uuid != job.receiver {
                             // `updateWaypoint`: this receiver's connection to the mover.
                             if job.listed && m.ticked && m.transmits {
                                 // Most movers stay in their block: nothing to send or remake.
                                 let done = me.as_ref().is_some_and(|me| {
                                     Shared::quiet(to.row, &m.source, me)
-                                        || slot
+                                        || slot_ref
                                             .get(m.source.id as usize)
-                                            .and_then(|&i| sources.get(i as usize)?.as_ref())
+                                            .and_then(|&i| sources_ref.get(i as usize)?.as_ref())
                                             .is_some_and(|src| s.step(to.row, src, me, to.out))
                                 });
                                 if !done {
@@ -1333,7 +1369,8 @@ impl Waypoints {
                         // `updatePlayer` before and after the view follows the move.
                         let sweep = |to: &mut Receiving| {
                             for &k in swept {
-                                let (source, known) = (waypoints[k as usize], &sources[k as usize]);
+                                let (source, known) =
+                                    (waypoints[k as usize], &sources_ref[k as usize]);
                                 if let (Some(src), Some(me)) = (known, &me)
                                     && (Shared::quiet(to.row, &src.source, me)
                                         || s.step(to.row, src, me, to.out))
@@ -1354,7 +1391,8 @@ impl Waypoints {
                         }
                     }
                 }
-        });
+            },
+        );
         t.out.reserve(jobs.iter().map(|j| j.out.len()).sum());
         for mut job in jobs.drain(..) {
             t.out.extend(job.out.drain(..));
@@ -1412,6 +1450,7 @@ mod tests {
             spectator: false,
             transmit_range: PLAYER_RANGE,
             receive_range: PLAYER_RANGE,
+            ranges_known: true,
             first_tick: false,
             view_distance: 4,
             team: None,
@@ -1503,7 +1542,10 @@ mod tests {
         waypoints.tick(&[a.clone(), b.clone(), c], &[], true);
         waypoints.tick(&[a.clone(), b.clone()], &[], true);
         let capacity = waypoints.gone_scratch.capacity();
-        assert!(capacity > 0, "removing a player should populate the scratch list");
+        assert!(
+            capacity > 0,
+            "removing a player should populate the scratch list"
+        );
         waypoints.tick(&[a], &[], true);
         assert_eq!(
             waypoints.gone_scratch.capacity(),
@@ -1665,6 +1707,98 @@ mod tests {
         assert_eq!(
             to(&out, 20),
             vec![(waypoint_operation::UNTRACK, WaypointTarget::Empty)]
+        );
+    }
+
+    /// A player who receives nothing is still a source (`onTrackingEnd` calls `removePlayer` for
+    /// every ServerPlayer): leaving the level, or being replaced, untracks it, and it joins afresh.
+    #[test]
+    fn a_player_receiving_nothing_leaves_and_returns_like_any_other() {
+        let a = player(1, 10, [0.5, 64.0, 0.5]);
+        let mut b = player(2, 20, [4.5, 64.0, 0.5]);
+        let untrack = vec![(waypoint_operation::UNTRACK, WaypointTarget::Empty)];
+        let track = vec![(waypoint_operation::TRACK, WaypointTarget::Block([4, 64, 0]))];
+        for respawn in [false, true] {
+            let mut w = Waypoints::default();
+            w.tick(&[a.clone(), b.clone()], &[], true);
+            // Receiving nothing removes B's reception and (vanilla) its waypoint; a new transmit
+            // value tracks it again, and it is a source still.
+            b.receive_range = 0.0;
+            let out = w.tick(&[a.clone(), b.clone()], &[], true);
+            assert_eq!(to(&out, 10), untrack);
+            b.transmit_range = 10.0;
+            let out = w.tick(&[a.clone(), b.clone()], &[], true);
+            assert_eq!(to(&out, 10), track);
+            // B leaves (or respawns): A loses it, though B never was a receiver.
+            let out = if respawn {
+                w.tick_level(&[a.clone(), b.clone()], &[], &[2], true)
+            } else {
+                w.tick_level(std::slice::from_ref(&a), &[(2, 20)], &[], true)
+            };
+            assert_eq!(to(&out, 10), untrack);
+            if respawn {
+                // The new ServerPlayer shows once it has ticked and moved.
+                b.position[0] += 1.0;
+                let out = w.tick(&[a.clone(), b.clone()], &[], true);
+                assert_eq!(
+                    to(&out, 10),
+                    [(waypoint_operation::TRACK, WaypointTarget::Block([5, 64, 0]))]
+                );
+                b.position[0] -= 1.0;
+            } else {
+                assert!(!w.memo.contains_key(&2));
+                // It comes back with nothing changed: joined afresh, tracked, receiving nothing.
+                let out = w.tick(&[a.clone(), b.clone()], &[], true);
+                assert_eq!(to(&out, 10), track);
+                assert!(to(&out, 20).is_empty());
+            }
+            b.receive_range = 60_000_000.0;
+            b.transmit_range = 60_000_000.0;
+        }
+    }
+
+    /// Both ranges change in one tick: the transmit callback tracks B and the receive callback's
+    /// `addPlayer` tracks it again (`trackWaypoint` always sends), so A is told twice.
+    #[test]
+    fn both_ranges_changing_in_one_tick_track_twice() {
+        let a = player(1, 10, [0.5, 64.0, 0.5]);
+        let mut b = player(2, 20, [4.5, 64.0, 0.5]);
+        let mut w = Waypoints::default();
+        w.tick(&[a.clone(), b.clone()], &[], true);
+        b.transmit_range = 5.0e7;
+        b.receive_range = 5.0e7;
+        let out = w.tick(&[a, b], &[], true);
+        let track = (waypoint_operation::TRACK, WaypointTarget::Block([4, 64, 0]));
+        assert_eq!(to(&out, 10), vec![track; 2]);
+    }
+
+    /// A guest first read without a body has the default ranges; when its saved receive range of
+    /// zero arrives, that is how it joined, not a change: it stays a source for the others.
+    #[test]
+    fn a_guests_first_real_ranges_do_not_untrack_it() {
+        let a = player(1, 10, [0.5, 64.0, 0.5]);
+        let mut b = player(2, 20, [4.5, 64.0, 0.5]);
+        b.ranges_known = false;
+        let mut w = Waypoints::default();
+        w.tick(&[a.clone(), b.clone()], &[], true);
+        b.ranges_known = true;
+        b.receive_range = 0.0;
+        let out = w.tick(&[a.clone(), b.clone()], &[], true);
+        assert!(to(&out, 10).is_empty());
+        // It receives nothing now: it only drops A's marker.
+        assert_eq!(
+            to(&out, 20),
+            [(waypoint_operation::UNTRACK, WaypointTarget::Empty)]
+        );
+        // Moving on, A still hears of it.
+        b.position[0] += 1.0;
+        let out = w.tick(&[a, b], &[], true);
+        assert_eq!(
+            to(&out, 10),
+            [(
+                waypoint_operation::UPDATE,
+                WaypointTarget::Block([5, 64, 0])
+            )]
         );
     }
 

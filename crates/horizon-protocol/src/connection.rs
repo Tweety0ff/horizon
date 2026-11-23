@@ -306,7 +306,6 @@ impl Connection {
                 adapter: None,
                 older_client: None,
             },
-
         })
     }
     /// Speak to a server of `version` from now on (before the handshake): packets are renumbered both

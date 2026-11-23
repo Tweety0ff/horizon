@@ -1431,7 +1431,9 @@ impl Entities {
                                 (v.position[0].floor() as i32) >> 4,
                                 (v.position[2].floor() as i32) >> 4,
                             );
-                            for ((&(cx, cz), members), stat) in chunks.iter().zip(members).zip(stats) {
+                            for ((&(cx, cz), members), stat) in
+                                chunks.iter().zip(members).zip(stats)
+                            {
                                 if v.sources.is_none()
                                     && ((cx - vx).abs() > reach || (cz - vz).abs() > reach)
                                 {
@@ -1472,7 +1474,9 @@ impl Entities {
                             // entities that appeared or changed section; a client
                             // tracking much of the level goes through it in order.
                             flags.reserve(probes.len());
-                            for (index, (p, &entity_moved)) in probes.iter().zip(is_moved).enumerate() {
+                            for (index, (p, &entity_moved)) in
+                                probes.iter().zip(is_moved).enumerate()
+                            {
                                 let tracks = v.tracker.seen.contains_key(&p.id);
                                 let flag = if p.id == v.entity_id
                                     || (entity_moved && !sees(v, p, chunks, held))
@@ -1550,7 +1554,8 @@ impl Entities {
                             starts.truncate(room);
                         }
                     }
-            });
+                },
+            );
         }
         self.flags = flags;
         for starts in &starts {
@@ -1714,45 +1719,39 @@ impl Entities {
             .collect();
         let (pairs, is_moved, synced_ranges) = (&*pairs, &*is_moved, &*synced_ranges);
         let lanes = crate::parallel::worker_lanes();
-        crate::parallel::par_chunks_mut_on_with(
-            &mut made,
-            64,
-            lanes,
-            Vec::new,
-            |part, packets| {
-                // One packet buffer per participating worker, reused across every
-                // 64-entity chunk it takes instead of allocating once per chunk.
-                for m in part {
-                    let (s, e) = (&mut *m.state, entities[m.index]);
-                    packets.clear();
-                    // As in `send_in_order`: paired as it joined, its first changes go out with
-                    // the pairing; an idle one sends only its leash.
-                    m.synced = s.added
-                        && e.kind != "minecraft:player"
-                        && !s.arrow
-                        && synced_ranges
-                            .iter()
-                            .any(|&(after, through)| e.id > after && e.id <= through);
-                    if !s.added || m.synced {
-                        if e.idle && !is_moved[m.index] && !e.needs_sync {
-                            s.send_leash(e, packets);
-                        } else {
-                            s.send_changes(e, riding, packets);
-                        }
-                    }
-                    s.added = false;
-                    m.changes.encode(packets);
-                    if pairs[m.index]
-                        && !e.bare
-                        && let Some(kind) = s.kind
-                    {
-                        packets.clear();
-                        s.pairing(e, kind, riding, packets);
-                        m.pairing = Some(Bodies::of(packets));
+        crate::parallel::par_chunks_mut_on_with(&mut made, 64, lanes, Vec::new, |part, packets| {
+            // One packet buffer per participating worker, reused across every
+            // 64-entity chunk it takes instead of allocating once per chunk.
+            for m in part {
+                let (s, e) = (&mut *m.state, entities[m.index]);
+                packets.clear();
+                // As in `send_in_order`: paired as it joined, its first changes go out with
+                // the pairing; an idle one sends only its leash.
+                m.synced = s.added
+                    && e.kind != "minecraft:player"
+                    && !s.arrow
+                    && synced_ranges
+                        .iter()
+                        .any(|&(after, through)| e.id > after && e.id <= through);
+                if !s.added || m.synced {
+                    if e.idle && !is_moved[m.index] && !e.needs_sync {
+                        s.send_leash(e, packets);
+                    } else {
+                        s.send_changes(e, riding, packets);
                     }
                 }
-            },
-        );
+                s.added = false;
+                m.changes.encode(packets);
+                if pairs[m.index]
+                    && !e.bare
+                    && let Some(kind) = s.kind
+                {
+                    packets.clear();
+                    s.pairing(e, kind, riding, packets);
+                    m.pairing = Some(Bodies::of(packets));
+                }
+            }
+        });
         // Nothing to send and nobody to pair with.
         made.retain(|m| !m.changes.all.is_empty() || m.pairing.is_some());
         let made = &made;
@@ -1826,7 +1825,10 @@ mod tests {
             }
             entities_tracker.pair_after_tick(&entities, &riding, &mut [], |_| None);
             let now = entities_tracker.passengers_scratch.capacity();
-            assert!(now >= 2, "nested passenger traversal should reserve stack space");
+            assert!(
+                now >= 2,
+                "nested passenger traversal should reserve stack space"
+            );
             if let Some(previous) = capacity {
                 assert_eq!(now, previous, "the next passenger tree reuses the stack");
             } else {
@@ -2615,7 +2617,10 @@ mod tests {
         first.uuid = 7;
         clients.tick(&mut level, &[&first]);
         let capacity = level.pairing_packets.capacity();
-        assert!(capacity > 0, "pairing should populate the reusable packet buffer");
+        assert!(
+            capacity > 0,
+            "pairing should populate the reusable packet buffer"
+        );
 
         let mut second = state(1.0);
         second.id = 8;

@@ -598,7 +598,11 @@ impl<'a, 'w> Finder<'a, 'w> {
         let types = self.within_bb(x, y, z);
         let type_count = types.iter().filter(|t| t.is_some()).count();
         if type_count == 1 {
-            return types.into_iter().flatten().next().unwrap_or(PathType::Blocked);
+            return types
+                .into_iter()
+                .flatten()
+                .next()
+                .unwrap_or(PathType::Blocked);
         }
         if types[PathType::Fence as usize].is_some() {
             return PathType::Fence;

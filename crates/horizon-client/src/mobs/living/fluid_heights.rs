@@ -34,7 +34,14 @@ pub fn fluids_at(
     bounds: Aabb,
     eye_y: f64,
 ) -> Fluids {
-    fluids_from_at(world, registry, facts, bounds, bounds.min_position().y, eye_y)
+    fluids_from_at(
+        world,
+        registry,
+        facts,
+        bounds,
+        bounds.min_position().y,
+        eye_y,
+    )
 }
 
 fn fluids_from_at(
@@ -67,8 +74,7 @@ fn fluids_from_at(
             (hi.z.ceil() as i32 - 1).max(ez),
         ],
     );
-    if !world.may_hold(cells.0, cells.1, |s| facts.get(s).fluid != Fluid::None)
-    {
+    if !world.may_hold(cells.0, cells.1, |s| facts.get(s).fluid != Fluid::None) {
         return out;
     }
     for x in lo.x.floor() as i32..=(hi.x.ceil() as i32 - 1) {
