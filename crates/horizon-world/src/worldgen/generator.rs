@@ -1848,7 +1848,7 @@ pub(super) struct WorkerState {
     structure_biomes: HashMap<[i32; 3], BiomeId>,
     timings: StageTimings,
     heights: HashMap<(i32, i32, u8), i32>,
-    /// Reused density samples for structure height/column queries.
+    /// Reused density samples for structure height/column and direct surface queries.
     noise_column_density: Vec<f32>,
     /// Decorate with structure pieces only (for structure parity checks).
     pub(super) structures_only: bool,
