@@ -1306,7 +1306,13 @@ where
             false
         });
     }
-    /// iterateNoiseColumn from the top down until `visit` returns true.
+    /// Resize a worker-owned density buffer without allocating when the next column
+/// has the same height. `sample_volume` overwrites the whole slice.
+fn density_scratch(scratch: &mut Vec<f32>, height: usize) -> &mut [f32] {
+    scratch.resize(height, 0.0);
+    scratch
+}
+/// iterateNoiseColumn from the top down until `visit` returns true.
     fn noise_column(
         &self,
         x: i32,
@@ -1362,11 +1368,10 @@ where
                 self.data.registry.default_state("minecraft:air").unwrap(),
             )),
         };
-        density.resize(height as usize, 0.0);
         if self
             .router
             .get(RouterField::FinalDensity)
-            .sample_volume(&mut context, density, volume)
+            .sample_volume(&mut context, density_scratch(density, height as usize), volume)
             .is_err()
         {
             return;
@@ -3181,6 +3186,22 @@ mod region_tests;
 mod tests {
     use super::super::biome_chunks::CACHE_LIMIT;
     use super::*;
+    #[test]
+    fn density_scratch_reuses_its_allocation_for_equal_heights() {
+        let mut scratch = Vec::new();
+        let (pointer, capacity) = {
+            let density = density_scratch(&mut scratch, 384);
+            (density.as_ptr(), scratch.capacity())
+        };
+        {
+            let density = density_scratch(&mut scratch, 384);
+            assert_eq!(density.as_ptr(), pointer);
+            assert_eq!(density.len(), 384);
+        }
+        assert_eq!(scratch.capacity(), capacity);
+        let _ = density_scratch(&mut scratch, 256);
+        assert_eq!(scratch.capacity(), capacity);
+    }
     #[test]
     fn out_from_origin_preserves_order_and_handles_extreme_positive_steps() {
         assert_eq!(out_from_origin(4, 0, 8, 2), [4, 6, 2, 8, 0]);
