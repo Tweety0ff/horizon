@@ -3842,6 +3842,7 @@ mod tests {
 
 #[path = "living/fluid_heights.rs"]
 mod fluid_heights;
+pub use fluid_heights::fluids_at;
 #[allow(dead_code)]
 pub mod section_writes;
 #[cfg(test)]

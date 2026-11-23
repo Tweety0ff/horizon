@@ -213,35 +213,66 @@ impl Game<'_> {
                 std::mem::take(&mut r.tick_water_fx),
             )
         };
+        let players = self.remote.as_ref().map(|r| &r.level_players);
+        let mut prep = std::mem::take(&mut self.remote_prep_scratch);
+        prep.clear();
+        prep.extend(self.mobs.iter().map(|m| {
+            RemoteMobPrep {
+                bounds: m.bounds(),
+                eye_y: m.eye_y(),
+                feet_block: [
+                    m.position.x.floor() as i32,
+                    (m.position.y - 0.0001).floor() as i32,
+                    m.position.z.floor() as i32,
+                ],
+                needs_fluids: running
+                    || players.is_some_and(|p| p.contains_key(&(m.id as i32))),
+                tracks_standing: horizon_client::mobs::cem::tracks_standing(&m.kind.id),
+                fluids: None,
+                standing: None,
+            }
+        }));
+        let world = &self.world;
+        let registry = self.pack.assets.registry;
+        let facts = self.res.facts();
+        let prepare = |part: &mut [RemoteMobPrep]| {
+            for mob in part {
+                if mob.needs_fluids {
+                    mob.fluids = Some(horizon_client::mobs::living::fluids_at(
+                        world,
+                        registry,
+                        facts,
+                        mob.bounds,
+                        mob.eye_y,
+                    ));
+                }
+                if mob.tracks_standing {
+                    let [x, y, z] = mob.feet_block;
+                    mob.standing = Some(facts.get(world.block(x, y, z)).name.to_string());
+                }
+            }
+        };
+        if horizon_client::parallel::parallel_tick() > 0 && prep.len() >= 64 {
+            horizon_client::parallel::par_chunks_mut(&mut prep, 16, prepare);
+        } else {
+            prepare(&mut prep);
+        }
+        fluids.clear();
+        standings.clear();
+        for mob in &mut prep {
+            fluids.push(mob.fluids.take());
+            standings.push(mob.standing.take());
+        }
         let thundering = {
             let w = self.mob_world_base(&[]);
-            let players = self.remote.as_ref().map(|r| &r.level_players);
-            fluids.clear();
-            fluids.extend(self.mobs.iter().map(|m| {
-                (running || players.is_some_and(|p| p.contains_key(&(m.id as i32))))
-                    .then(|| w.fluids(m.bounds(), m.eye_y()))
-            }));
             rain.clear();
             rain.extend(self.mobs.iter().map(|m| {
                 m.species() == horizon_client::mobs::Species::Wolf
                     && horizon_client::mobs::tame::in_rain(m, &w)
             }));
-            // The block under each mob the packs' random-model rules read (a grazing
-            // cow), one hair below the feet like `Entity.getBlockStateOn`; nothing
-            // without rules.
-            standings.clear();
-            standings.extend(self.mobs.iter().map(|m| {
-                horizon_client::mobs::cem::tracks_standing(&m.kind.id).then(|| {
-                    let (x, y, z) = (
-                        m.position.x.floor() as i32,
-                        (m.position.y - 0.0001).floor() as i32,
-                        m.position.z.floor() as i32,
-                    );
-                    w.block_name(x, y, z).to_owned()
-                })
-            }));
             w.thundering
         };
+        self.remote_prep_scratch = prep;
         // The window's own player already splashes from its motion tick.
         let own = self.remote.as_ref().map(|r| r.entity_id);
         for i in 0..self.mobs.len() {

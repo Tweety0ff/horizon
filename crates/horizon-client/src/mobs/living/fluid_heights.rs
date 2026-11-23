@@ -5,29 +5,47 @@ use super::Fluids;
 use crate::blocks::Fluid;
 use horizon_core::geometry::{Aabb, Vec3};
 
-impl MobWorld<'_> {
-    /// FluidState.getHeight: a full block under the same fluid, else amount / 9.
-    pub fn fluid_height(&self, x: i32, y: i32, z: i32) -> (Fluid, f64) {
-        let f = self.facts.get(self.world.block(x, y, z));
-        if f.fluid == Fluid::None {
-            return (Fluid::None, 0.0);
-        }
-        let above = self.facts.get(self.world.block(x, y + 1, z));
-        if above.fluid == f.fluid {
-            return (f.fluid, 1.0);
-        }
-        (f.fluid, f64::from(f.fluid_level) / 9.0)
+
+/// FluidState.getHeight: a full block under the same fluid, else amount / 9.
+fn fluid_height_at(
+    world: &crate::world::World,
+    facts: &crate::blocks::BlockFacts,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> (Fluid, f64) {
+    let f = facts.get(world.block(x, y, z));
+    if f.fluid == Fluid::None {
+        return (Fluid::None, 0.0);
     }
-    /// Entity.updateFluidHeightAndDoFluidPushing heights over the deflated box,
-    /// measured from the box's own bottom.
-    pub fn fluids(&self, bounds: Aabb, eye_y: f64) -> Fluids {
-        self.fluids_from(bounds, bounds.min_position().y, eye_y)
+    let above = facts.get(world.block(x, y + 1, z));
+    if above.fluid == f.fluid {
+        return (f.fluid, 1.0);
     }
-    /// [`Self::fluids`] for a fluid interaction box another than the entity's
-    /// (a boat passenger's): `EntityFluidInteraction.update` finds the fluids
-    /// in `bounds` deflated by 0.001 and measures each depth from `bottom`, the
-    /// entity's own box bottom (`getBoundingBox().minY`).
-    pub fn fluids_from(&self, bounds: Aabb, bottom: f64, eye_y: f64) -> Fluids {
+    (f.fluid, f64::from(f.fluid_level) / 9.0)
+}
+
+/// Read-only fluid-height preparation for a mob's collision box. It is separate
+/// from `MobWorld` so the remote client tick can share this query on workers
+/// without sending mutable mobs or mod hooks to another thread.
+pub fn fluids_at(
+    world: &crate::world::World,
+    registry: &horizon_world::registry::BlockRegistry,
+    facts: &crate::blocks::BlockFacts,
+    bounds: Aabb,
+    eye_y: f64,
+) -> Fluids {
+    fluids_from_at(world, registry, facts, bounds, bounds.min_position().y, eye_y)
+}
+
+fn fluids_from_at(
+    world: &crate::world::World,
+    registry: &horizon_world::registry::BlockRegistry,
+    facts: &crate::blocks::BlockFacts,
+    bounds: Aabb,
+    bottom: f64,
+    eye_y: f64,
+) -> Fluids {
         let b = bounds.deflate(Vec3::new(0.001, 0.001, 0.001));
         let (lo, hi) = (b.min_position(), b.max_position());
         let mut out = Fluids::default();
@@ -52,14 +70,14 @@ impl MobWorld<'_> {
         );
         if !self
             .world
-            .may_hold(cells.0, cells.1, |s| self.facts.get(s).fluid != Fluid::None)
+            .may_hold(cells.0, cells.1, |s| facts.get(s).fluid != Fluid::None)
         {
             return out;
         }
         for x in lo.x.floor() as i32..=(hi.x.ceil() as i32 - 1) {
             for y in lo.y.floor() as i32..=(hi.y.ceil() as i32 - 1) {
                 for z in lo.z.floor() as i32..=(hi.z.ceil() as i32 - 1) {
-                    let (fluid, h) = self.fluid_height(x, y, z);
+                    let (fluid, h) = fluid_height_at(world, facts, x, y, z);
                     if fluid == Fluid::None {
                         continue;
                     }
@@ -86,7 +104,7 @@ impl MobWorld<'_> {
         // the box in the entity's column, between its bottom and its height
         // for the camera, for water and for lava.
         for y in lo.y.floor() as i32..=(hi.y.ceil() as i32 - 1) {
-            let (fluid, h) = self.fluid_height(ex, y, ez);
+            let (fluid, h) = fluid_height_at(world, facts, ex, y, ez);
             // `updateFluidOnEyes` tracks every fluid tag: water and lava.
             let eyes = match fluid {
                 Fluid::Water => &mut out.eye_in_water,
@@ -96,13 +114,13 @@ impl MobWorld<'_> {
             if f64::from(y) + h < lo.y || eye_y < f64::from(y) {
                 continue;
             }
-            let state = self.world.block(ex, y, ez);
+            let state = world.block(ex, y, ez);
             let source = self
                 .registry
                 .state(state)
                 .and_then(|s| s.properties.get("level"))
                 .is_none_or(|l| l == "0");
-            let above = self.facts.get(self.world.block(ex, y + 1, ez));
+            let above = facts.get(world.block(ex, y + 1, ez));
             let camera = if source && above.sturdy_full & 1 != 0 {
                 1.0
             } else {
@@ -113,6 +131,19 @@ impl MobWorld<'_> {
             }
         }
         out
+}
+
+impl MobWorld<'_> {
+    pub fn fluid_height(&self, x: i32, y: i32, z: i32) -> (Fluid, f64) {
+        fluid_height_at(self.world, self.facts, x, y, z)
+    }
+    /// Entity.updateFluidHeightAndDoFluidPushing heights over the deflated box.
+    pub fn fluids(&self, bounds: Aabb, eye_y: f64) -> Fluids {
+        fluids_at(self.world, self.registry, self.facts, bounds, eye_y)
+    }
+    /// The same query for a passenger interaction box with its own bottom.
+    pub fn fluids_from(&self, bounds: Aabb, bottom: f64, eye_y: f64) -> Fluids {
+        fluids_from_at(self.world, self.registry, self.facts, bounds, bottom, eye_y)
     }
 }
 

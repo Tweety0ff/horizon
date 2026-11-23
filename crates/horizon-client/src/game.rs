@@ -897,6 +897,16 @@ struct TickScratch {
     later: Vec<BlockPos>,
 }
 
+struct RemoteMobPrep {
+    bounds: Aabb,
+    eye_y: f64,
+    feet_block: [i32; 3],
+    needs_fluids: bool,
+    tracks_standing: bool,
+    fluids: Option<horizon_client::mobs::living::Fluids>,
+    standing: Option<String>,
+}
+
 struct Game<'a> {
     /// Shared with an integrated server; `collision` and `motion` borrow from it.
     res: Arc<Resources>,
@@ -1252,6 +1262,7 @@ struct Game<'a> {
     remote_followed_scratch: Vec<([f64; 3], [f64; 3])>,
     remote_sleepers_scratch: Vec<Aabb>,
     remote_turn_scratch: HashMap<i32, (f32, u32)>,
+    remote_prep_scratch: Vec<RemoteMobPrep>,
     next_entity: u32,
     /// The last entity id when this level's entity pass began: an item with a
     /// later one was added during that pass and first ticks on the next
@@ -10750,6 +10761,7 @@ impl<'a> Game<'a> {
             remote_followed_scratch: Vec::new(),
             remote_sleepers_scratch: Vec::new(),
             remote_turn_scratch: HashMap::new(),
+            remote_prep_scratch: Vec::new(),
             next_entity: 0,
             ticked_entities_through: u32::MAX,
             contact_drops: 0..0,
